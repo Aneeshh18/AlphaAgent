@@ -1,0 +1,298 @@
+{
+  "provider": {
+    "builtin:bigmodel-coding-plan": {
+      "name": "Bigmodel - Coding Plan",
+      "kind": "anthropic",
+      "options": {
+        "apiKey": "",
+        "baseURL": "https://open.bigmodel.cn/api/anthropic"
+      },
+      "enabled": false,
+      "source": "custom",
+      "models": {
+        "GLM-5.2": {
+          "limit": {
+            "context": 1000000
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        },
+        "GLM-5-Turbo": {
+          "name": "glm-5-turbo",
+          "reasoning": {
+            "enabled": true,
+            "variants": [
+              "enabled",
+              "off"
+            ],
+            "defaultVariant": "enabled"
+          },
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        }
+      },
+      "systemDisabledReason": "oauth_provider_inactive"
+    },
+    "builtin:bigmodel-start-plan": {
+      "name": "BigModel- Coding Plan",
+      "kind": "anthropic",
+      "options": {
+        "apiKey": "",
+        "baseURL": "https://zcode.z.ai/api/v1/zcode-plan/anthropic"
+      },
+      "enabled": false,
+      "source": "custom",
+      "models": {
+        "GLM-5.2": {
+          "limit": {
+            "context": 1000000
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        },
+        "GLM-5-Turbo": {
+          "name": "glm-5-turbo",
+          "reasoning": {
+            "enabled": true,
+            "variants": [
+              "enabled",
+              "off"
+            ],
+            "defaultVariant": "enabled"
+          },
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        }
+      },
+      "systemDisabledReason": "oauth_provider_inactive"
+    },
+    "builtin:zai-coding-plan": {
+      "name": "Z.ai - Coding Plan",
+      "kind": "anthropic",
+      "options": {
+        "apiKey": "4b4af327bddb4232bdb6159ad2f84051.coVQWp1Qo8kVgH0V",
+        "baseURL": "https://api.z.ai/api/anthropic",
+        "apiKeyRequired": true
+      },
+      "enabled": false,
+      "source": "custom",
+      "models": {
+        "GLM-5.2": {
+          "limit": {
+            "context": 1000000
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        },
+        "GLM-5-Turbo": {
+          "name": "glm-5-turbo",
+          "reasoning": {
+            "enabled": true,
+            "variants": [
+              "enabled",
+              "off"
+            ],
+            "defaultVariant": "enabled"
+          },
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        }
+      },
+      "systemDisabledReason": "coding_plan_not_entitled"
+    },
+    "builtin:zai-start-plan": {
+      "name": "Z.ai - Coding Plan",
+      "kind": "anthropic",
+      "options": {
+        "apiKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoiOTYyOGFlMzYtZGMyMS00ZjAzLTgyODUtMjk5MmIwMGVhYTE3Iiwic3ViIjoiOTYyOGFlMzYtZGMyMS00ZjAzLTgyODUtMjk5MmIwMGVhYTE3IiwiaWF0IjoxNzgzNTE1NDE5fQ.VRHcZkmpXZKwuUBrigZM67wVGbPA8cdNsr0vNFV7TTs",
+        "baseURL": "https://zcode.z.ai/api/v1/zcode-plan/anthropic",
+        "apiKeyRequired": true
+      },
+      "enabled": false,
+      "source": "custom",
+      "models": {
+        "GLM-5.2": {
+          "limit": {
+            "context": 1000000
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        },
+        "GLM-5-Turbo": {
+          "name": "glm-5-turbo",
+          "reasoning": {
+            "enabled": true,
+            "variants": [
+              "enabled",
+              "off"
+            ],
+            "defaultVariant": "enabled"
+          },
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        }
+      },
+      "systemDisabledReason": "coding_plan_not_entitled"
+    },
+    "builtin:bigmodel": {
+      "name": "Bigmodel - API Key",
+      "kind": "anthropic",
+      "options": {
+        "apiKey": "",
+        "baseURL": "https://open.bigmodel.cn/api/anthropic"
+      },
+      "enabled": false,
+      "source": "custom",
+      "models": {
+        "GLM-5.2": {
+          "limit": {
+            "context": 1000000
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        },
+        "GLM-5-Turbo": {
+          "name": "glm-5-turbo",
+          "reasoning": {
+            "enabled": true,
+            "variants": [
+              "enabled",
+              "off"
+            ],
+            "defaultVariant": "enabled"
+          },
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        }
+      },
+      "systemDisabledReason": "oauth_provider_inactive"
+    },
+    "builtin:zai": {
+      "name": "Z.ai - API Key",
+      "kind": "anthropic",
+      "options": {
+        "apiKey": "",
+        "baseURL": "https://api.z.ai/api/anthropic"
+      },
+      "source": "custom",
+      "models": {
+        "GLM-5.2": {
+          "limit": {
+            "context": 1000000
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        },
+        "GLM-5-Turbo": {
+          "name": "glm-5-turbo",
+          "reasoning": {
+            "enabled": true,
+            "variants": [
+              "enabled",
+              "off"
+            ],
+            "defaultVariant": "enabled"
+          },
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

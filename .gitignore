@@ -1,0 +1,36 @@
+# --- Secrets & env ---
+.env
+.env.*
+!.env.example
+
+# --- Data artifacts (never commit data; it is huge + often licensed) ---
+data/
+*.duckdb
+*.duckdb.wal
+*.parquet
+*.parquet.tmp
+*.csv
+*.json.gz
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# --- Project runtime artifacts ---
+logs/
+*.log
+snapshots/
