@@ -7,9 +7,6 @@ point-in-time semantics and preventing logic drift between modules.
 
 from __future__ import annotations
 
-from datetime import date
-from typing import Any
-
 from aios.storage.store import Store
 
 
@@ -30,32 +27,13 @@ def metric_value(
     return r.get("value")
 
 
-def deduped_history(
-    store: Store, ticker: str, as_of: str, metric: str
-) -> list[dict]:
+def deduped_history(store: Store, ticker: str, as_of: str, metric: str) -> list[dict]:
     """PIT-deduped history for a metric: latest quarter_value per period_end.
 
     Dedupes by period_end keeping the most recent as_of_date (latest restatement).
     Sorted ascending by period_end. Only rows known as-of `as_of`.
     """
-    sql = """
-        WITH ranked AS (
-            SELECT period_end, fiscal_period, quarter_value,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY period_end
-                       ORDER BY as_of_date DESC
-                   ) AS rn
-            FROM fundamentals
-            WHERE ticker = ?
-              AND metric = ?
-              AND as_of_date <= CAST(? AS DATE)
-              AND quarter_value IS NOT NULL
-        )
-        SELECT period_end, fiscal_period, quarter_value FROM ranked
-        WHERE rn = 1
-        ORDER BY period_end ASC
-    """
-    return store.query(sql, (ticker, metric, str(as_of)))
+    return store.fundamental_history(ticker, as_of, metric)
 
 
 def ttm_sum(store: Store, ticker: str, as_of: str, metric: str) -> float | None:
@@ -76,17 +54,17 @@ def ttm_sum(store: Store, ticker: str, as_of: str, metric: str) -> float | None:
     annual_val = latest_annual["quarter_value"]
 
     post_annual = [
-        r for r in hist
-        if r["period_end"] > annual_end
-        and not str(r["fiscal_period"]).startswith("FY")
+        r
+        for r in hist
+        if r["period_end"] > annual_end and not str(r["fiscal_period"]).startswith("FY")
     ]
     if not post_annual:
         return annual_val
 
     pre_annual_quarters = [
-        r for r in hist
-        if r["period_end"] <= annual_end
-        and not str(r["fiscal_period"]).startswith("FY")
+        r
+        for r in hist
+        if r["period_end"] <= annual_end and not str(r["fiscal_period"]).startswith("FY")
     ]
     n = len(post_annual)
     if len(pre_annual_quarters) < n:
@@ -109,17 +87,10 @@ def shift_year(as_of: str) -> str:
 
 def latest_price(store: Store, ticker: str, as_of: str) -> float | None:
     """Most recent close price on or before `as_of` (PIT-correct market data)."""
-    rows = store.query(
-        """
-        SELECT close FROM prices
-        WHERE ticker = ? AND date <= CAST(? AS DATE)
-        ORDER BY date DESC LIMIT 1
-        """,
-        (ticker, str(as_of)),
-    )
-    if not rows:
+    row = store.latest_price(ticker, as_of)
+    if row is None:
         return None
-    c = rows[0]["close"]
+    c = row["close"]
     return float(c) if c is not None else None
 
 
@@ -177,9 +148,7 @@ FINANCIALS_SIC_PREFIXES = (
 
 def is_financials(store: Store, ticker: str) -> bool:
     """Detect if a ticker is a bank/financial institution via SIC code."""
-    rows = store.query(
-        "SELECT sic_code FROM securities WHERE ticker = ?", (ticker.upper(),)
-    )
+    rows = store.query("SELECT sic_code FROM securities WHERE ticker = ?", (ticker.upper(),))
     if not rows or not rows[0].get("sic_code"):
         return False
     sic = str(rows[0]["sic_code"]).strip()

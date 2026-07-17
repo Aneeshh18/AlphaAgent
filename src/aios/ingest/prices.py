@@ -13,18 +13,20 @@ adjustment reconciliation is a downstream concern, not an ingest one.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Any
+from urllib.parse import urlencode
+from uuid import uuid4
 
 import pandas as pd
 from structlog import get_logger
 
 from aios.ingest.http_client import get_http
-from aios.storage.store import get_store
+from aios.storage.store import Store, get_store
 
 log = get_logger(__name__)
 
-STOOQ_URL = "https://stooq.com/q/d/l/?s={sym}&i=d"
+STOOQ_URL = "https://stooq.com/q/d/l/"
 
 
 # ----------------------------------------------------------------------
@@ -59,19 +61,21 @@ def fetch_yfinance(ticker: str, start: str | None = None, end: str | None = None
 
     rows: list[dict] = []
     for ts, r in df.iterrows():
-        rows.append({
-            "ticker": ticker.upper(),
-            "date": ts.date().isoformat() if hasattr(ts, "date") else str(ts)[:10],
-            "open": _f(r.get("Open")),
-            "high": _f(r.get("High")),
-            "low": _f(r.get("Low")),
-            "close": _f(r.get("Close")),
-            "adj_close": _f(r.get("Adj Close")),
-            "volume": int(r["Volume"]) if pd.notna(r.get("Volume")) else None,
-            "dividends": _f(r.get("Dividends")) or 0.0,
-            "split_ratio": _f(r.get("Stock Splits")) or 1.0,
-            "source": "yfinance",
-        })
+        rows.append(
+            {
+                "ticker": ticker.upper(),
+                "date": ts.date().isoformat() if hasattr(ts, "date") else str(ts)[:10],
+                "open": _f(r.get("Open")),
+                "high": _f(r.get("High")),
+                "low": _f(r.get("Low")),
+                "close": _f(r.get("Close")),
+                "adj_close": _f(r.get("Adj Close")),
+                "volume": int(r["Volume"]) if pd.notna(r.get("Volume")) else None,
+                "dividends": _f(r.get("Dividends")) or 0.0,
+                "split_ratio": _f(r.get("Stock Splits")) or 1.0,
+                "source": "yfinance",
+            }
+        )
     log.info("prices.yfinance_fetched", ticker=ticker, rows=len(rows))
     return rows
 
@@ -85,10 +89,19 @@ def _stooq_symbol(ticker: str) -> str:
     return t.lower()
 
 
-def fetch_stooq(ticker: str) -> list[dict]:
+def fetch_stooq(
+    ticker: str,
+    start: str | None = None,
+    end: str | None = None,
+) -> list[dict]:
     """Fetch EOD prices via Stooq CSV download (no key). Returns row dicts."""
     sym = _stooq_symbol(ticker)
-    url = STOOQ_URL.format(sym=sym)
+    params = {"s": sym, "i": "d"}
+    if start:
+        params["d1"] = start.replace("-", "")
+    if end:
+        params["d2"] = end.replace("-", "")
+    url = f"{STOOQ_URL}?{urlencode(params)}"
     csv_text = get_http().get_text(url)
     if not csv_text or "No data" in csv_text:
         log.warning("prices.stooq_empty", ticker=ticker)
@@ -102,19 +115,21 @@ def fetch_stooq(ticker: str) -> list[dict]:
 
     rows: list[dict] = []
     for _, r in df.iterrows():
-        rows.append({
-            "ticker": ticker.upper(),
-            "date": str(r["Date"]),
-            "open": _f(r.get("Open")),
-            "high": _f(r.get("High")),
-            "low": _f(r.get("Low")),
-            "close": _f(r.get("Close")),
-            "adj_close": None,  # Stooq is unadjusted; mark None
-            "volume": int(r["Volume"]) if pd.notna(r.get("Volume")) else None,
-            "dividends": 0.0,
-            "split_ratio": 1.0,
-            "source": "stooq",
-        })
+        rows.append(
+            {
+                "ticker": ticker.upper(),
+                "date": str(r["Date"]),
+                "open": _f(r.get("Open")),
+                "high": _f(r.get("High")),
+                "low": _f(r.get("Low")),
+                "close": _f(r.get("Close")),
+                "adj_close": None,  # Stooq is unadjusted; mark None
+                "volume": int(r["Volume"]) if pd.notna(r.get("Volume")) else None,
+                "dividends": 0.0,
+                "split_ratio": 1.0,
+                "source": "stooq",
+            }
+        )
     log.info("prices.stooq_fetched", ticker=ticker, rows=len(rows))
     return rows
 
@@ -133,20 +148,220 @@ def fetch_prices(ticker: str, start: str | None = None, end: str | None = None) 
         return rows
     log.warning("prices.fallback_to_stooq", ticker=ticker)
     try:
-        return fetch_stooq(ticker)
+        return fetch_stooq(ticker, start=start, end=end)
     except Exception as e:  # pragma: no cover
         log.error("prices.stooq_failed", ticker=ticker, error=str(e))
         return []
 
 
+def fetch_provider_prices(
+    provider: str,
+    provider_symbol: str,
+    start: str,
+    end: str,
+) -> list[dict]:
+    """Fetch one explicitly reviewed provider mapping without cross-provider fallback."""
+    provider = provider.lower()
+    if provider == "yfinance":
+        return fetch_yfinance(provider_symbol, start=start, end=end)
+    if provider == "stooq":
+        return fetch_stooq(provider_symbol, start=start, end=end)
+    raise ValueError(f"unsupported price provider {provider!r}")
+
+
+def relabel_provider_price_rows(
+    rows: list[dict],
+    mapping: dict,
+    ticker_assignments: list[dict],
+) -> list[dict]:
+    """Apply hard provider cutoffs and restore the market ticker for each date.
+
+    A provider may expose all predecessor history under today's symbol. The
+    returned label is therefore never trusted as the stored ticker. Every row
+    must land inside both the reviewed provider window and exactly one dated
+    security assignment, otherwise the import is refused.
+    """
+    if mapping.get("mapping_status") != "verified":
+        raise ValueError("only verified provider mappings may produce prices")
+    security_id = str(mapping.get("security_id") or "").strip()
+    provider = str(mapping.get("provider") or "").strip().lower()
+    provider_symbol = str(mapping.get("provider_symbol") or "").strip().upper()
+    if not security_id or not provider or not provider_symbol:
+        raise ValueError("provider mapping is missing an identity field")
+    data_start = _as_date(mapping["data_start"])
+    data_end = _as_date(mapping["data_end"]) if mapping.get("data_end") else None
+
+    normalized_assignments = [
+        {
+            "ticker": str(assignment["ticker"]).upper(),
+            "effective_start": _as_date(assignment["effective_start"]),
+            "effective_end": (
+                _as_date(assignment["effective_end"])
+                if assignment.get("effective_end")
+                else None
+            ),
+        }
+        for assignment in ticker_assignments
+    ]
+    output: list[dict] = []
+    for row in rows:
+        row_date = _as_date(row["date"])
+        if row_date < data_start or (data_end is not None and row_date >= data_end):
+            continue
+        active_tickers = {
+            assignment["ticker"]
+            for assignment in normalized_assignments
+            if assignment["effective_start"] <= row_date
+            and (
+                assignment["effective_end"] is None
+                or assignment["effective_end"] > row_date
+            )
+        }
+        if len(active_tickers) != 1:
+            raise ValueError(
+                "provider price cannot be mapped to exactly one market ticker: "
+                f"{security_id}@{row_date}"
+            )
+        output.append(
+            {
+                **row,
+                "ticker": active_tickers.pop(),
+                "security_id": security_id,
+                "provider_symbol": provider_symbol,
+                "source": provider,
+            }
+        )
+    return output
+
+
+def ingest_security_prices(
+    security_id: str,
+    *,
+    provider: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    store: Store | None = None,
+) -> int:
+    """Fetch prices through reviewed mappings and store dated market tickers."""
+    db = store or get_store()
+    started_at = datetime.now()
+    run_id = str(uuid4())
+    source = f"identity-price:{provider or 'reviewed'}"
+    try:
+        mappings = db.provider_symbol_mappings(
+            security_id,
+            provider=provider,
+            start=start,
+            end=end,
+        )
+        if not mappings:
+            raise ValueError(f"no verified provider mapping for {security_id!r}")
+        if provider is None:
+            providers = {mapping["provider"] for mapping in mappings}
+            selected = "yfinance" if "yfinance" in providers else sorted(providers)[0]
+            mappings = [mapping for mapping in mappings if mapping["provider"] == selected]
+            source = f"identity-price:{selected}"
+
+        latest = db.latest_security_price_date(security_id)
+        incremental_start = latest - timedelta(days=5) if latest is not None else None
+        all_rows: list[dict] = []
+        for mapping in mappings:
+            mapping_start = _as_date(mapping["data_start"])
+            mapping_end = (
+                _as_date(mapping["data_end"])
+                if mapping.get("data_end")
+                else date.today()
+            )
+            segment_start = max(
+                value
+                for value in (
+                    mapping_start,
+                    _as_date(start) if start else None,
+                    incremental_start if start is None else None,
+                )
+                if value is not None
+            )
+            segment_end = min(
+                value
+                for value in (
+                    mapping_end,
+                    _as_date(end) if end else None,
+                )
+                if value is not None
+            )
+            if segment_start >= segment_end:
+                continue
+            raw_rows = fetch_provider_prices(
+                mapping["provider"],
+                mapping["provider_symbol"],
+                segment_start.isoformat(),
+                segment_end.isoformat(),
+            )
+            assignments = db.security_ticker_assignments(
+                security_id,
+                start=segment_start,
+                end=segment_end,
+            )
+            all_rows.extend(
+                relabel_provider_price_rows(raw_rows, mapping, assignments)
+            )
+        inserted = db.upsert_prices(all_rows) if all_rows else 0
+        db.record_ingest(
+            run_id=run_id,
+            source=source,
+            table_name="prices",
+            rows_inserted=inserted,
+            started_at=started_at,
+            status="success" if inserted else "warning",
+            error=None if inserted else "provider returned no rows in verified intervals",
+        )
+        return inserted
+    except Exception as exc:
+        db.record_ingest(
+            run_id=run_id,
+            source=source,
+            table_name="prices",
+            started_at=started_at,
+            status="failed",
+            error=str(exc),
+        )
+        raise
+
+
 def ingest_prices(ticker: str, start: str | None = None, end: str | None = None) -> int:
     """Fetch + store daily prices for one ticker. Returns rows stored."""
-    rows = fetch_prices(ticker, start=start, end=end)
-    if not rows:
-        return 0
-    n = get_store().upsert_prices(rows)
-    log.info("prices.ingest_done", ticker=ticker, rows=n)
-    return n
+    store = get_store()
+    started_at = datetime.now()
+    run_id = str(uuid4())
+    try:
+        fetch_start = start
+        if fetch_start is None:
+            latest = store.latest_price_date(ticker)
+            if latest is not None:
+                # Re-fetch a short overlap so recent corrections, dividends,
+                # and exchange-date revisions can replace existing rows.
+                fetch_start = (latest - timedelta(days=5)).isoformat()
+        rows = fetch_prices(ticker, start=fetch_start, end=end)
+        n = store.upsert_prices(rows) if rows else 0
+        store.record_ingest(
+            run_id=run_id,
+            source="yfinance_or_stooq",
+            table_name="prices",
+            rows_inserted=n,
+            started_at=started_at,
+        )
+        log.info("prices.ingest_done", ticker=ticker, rows=n, run_id=run_id)
+        return n
+    except Exception as e:
+        store.record_ingest(
+            run_id=run_id,
+            source="yfinance_or_stooq",
+            table_name="prices",
+            started_at=started_at,
+            status="failed",
+            error=str(e),
+        )
+        raise
 
 
 def _f(x: Any) -> float | None:
@@ -161,3 +376,9 @@ def _f(x: Any) -> float | None:
         return float(x)
     except (TypeError, ValueError):
         return None
+
+
+def _as_date(value: date | str) -> date:
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value))

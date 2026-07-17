@@ -12,6 +12,9 @@ data/
 *.csv
 *.json.gz
 
+# Small, audited source manifests are code-like examples, not bulk market data.
+!examples/*.csv
+
 # --- Python ---
 __pycache__/
 *.py[cod]
@@ -29,6 +32,9 @@ venv/
 .idea/
 .DS_Store
 *.swp
+
+# --- Local AI tooling (may contain provider credentials/cache) ---
+.zcode/
 
 # --- Project runtime artifacts ---
 logs/

@@ -20,6 +20,7 @@ import time
 from typing import Any
 
 import httpx
+from structlog import get_logger
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -28,7 +29,6 @@ from tenacity import (
 )
 
 from aios.config import settings
-from structlog import get_logger
 
 log = get_logger(__name__)
 
@@ -117,7 +117,9 @@ class HttpClient:
             sleep_for = random.uniform(2.0, 5.0)
             log.warning("http.429_throttle", url=url, sleep=sleep_for)
             time.sleep(sleep_for)
-            raise httpx.HTTPStatusError("429 Too Many Requests", request=resp.request, response=resp)
+            raise httpx.HTTPStatusError(
+                "429 Too Many Requests", request=resp.request, response=resp
+            )
         # 5xx → retry
         if resp.status_code >= 500:
             raise httpx.HTTPStatusError(

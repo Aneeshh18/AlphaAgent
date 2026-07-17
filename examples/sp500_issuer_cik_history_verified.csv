@@ -1,0 +1,7 @@
+issuer_id,canonical_name,canonical_ticker,cik,effective_start,effective_end,verified_date,source
+aios:issuer:cencora,"Cencora, Inc.",COR,1140859,2023-08-01,,2026-07-16,https://www.sec.gov/Archives/edgar/data/1140859/000110465923096698/tm2324358d1_8k.htm
+aios:issuer:dayforce,Dayforce Inc.,DAY,1725057,2023-08-01,,2026-07-16,https://www.sec.gov/Archives/edgar/data/1725057/000095017024088237/0000950170-24-088237-index.htm
+aios:issuer:healthpeak,"Healthpeak Properties, Inc.",DOC,765880,2023-08-01,,2026-07-16,https://www.sec.gov/Archives/edgar/data/765880/000162828024018706/peak-20240331.htm
+aios:issuer:corpay,"Corpay, Inc.",CPAY,1175454,2023-08-01,,2026-07-16,https://data.sec.gov/submissions/CIK0001175454.json
+aios:issuer:westrock,WestRock Company,WRK,1732845,2023-08-01,2024-07-08,2026-07-16,https://www.sec.gov/Archives/edgar/data/1732845/000095014224001577/eh240491738_8k.htm
+aios:issuer:smurfit-westrock,Smurfit Westrock plc,SW,2005951,2024-07-08,,2026-07-16,https://www.sec.gov/Archives/edgar/data/2005951/000110465924102260/tm2424555d1_8k.htm

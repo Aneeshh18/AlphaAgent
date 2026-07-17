@@ -23,18 +23,28 @@ date from the submissions index as as_of_date per filing period.
 
 from __future__ import annotations
 
-from datetime import date
-from typing import Any
+from datetime import date, datetime
+from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from structlog import get_logger
 
 from aios.ingest.http_client import get_http
+
+if TYPE_CHECKING:
+    from aios.storage.store import Store
 
 log = get_logger(__name__)
 
 TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+
+# The SEC's current ticker file maps XOM to ExxonMobil Holdings Corp, which has
+# no public-company XBRL facts. The listed issuer is Exxon Mobil Corp (CIK
+# 0000034088). Keep source anomalies explicit and reviewable rather than
+# silently accepting an empty facts response.
+CIK_OVERRIDES: dict[str, int] = {"XOM": 34088}
 
 # Curated metric set we care about for factor computation.
 # Maps our canonical metric name → list of XBRL concepts to try (in priority order;
@@ -105,6 +115,7 @@ def load_ticker_cik_map() -> dict[str, int]:
     for entry in raw.values():
         ticker = str(entry["ticker"]).upper()
         out[ticker] = int(entry["cik_str"])
+    out.update(CIK_OVERRIDES)
     log.info("edgar.ticker_map_loaded", count=len(out))
     return out
 
@@ -201,8 +212,15 @@ def _merge_concepts(
 # These need quarter_value derivation. Balance-sheet / instant metrics and
 # per-share metrics are point-in-time or already per-period → no differencing.
 FLOW_METRICS = {
-    "revenue", "net_income", "operating_income", "gross_profit",
-    "rd_expense", "interest_expense", "depreciation", "cfo", "capex",
+    "revenue",
+    "net_income",
+    "operating_income",
+    "gross_profit",
+    "rd_expense",
+    "interest_expense",
+    "depreciation",
+    "cfo",
+    "capex",
     "dividends_paid",
 }
 
@@ -264,11 +282,18 @@ def _single_period_value(raw_rows: list[dict[str, Any]]) -> dict[int, float | No
     return out
 
 
-def extract_fundamentals(ticker: str, cik: int) -> list[dict]:
+def extract_fundamentals(
+    ticker: str,
+    cik: int,
+    *,
+    issuer_id: str | None = None,
+    security_id: str | None = None,
+) -> tuple[list[dict], dict[str, Any]]:
     """Full extract: return a list of fundamental row dicts (PIT-tagged).
 
-    Each row: {ticker, period_end, as_of_date, fiscal_period, statement,
-               metric, value, quarter_value, unit, source}
+    Each row: {ticker, issuer_id, security_id, period_end, as_of_date,
+               fiscal_period, statement, metric, value, quarter_value, unit,
+               source}
 
     Point-in-time key: as_of_date = the per-row 'filed' date from EDGAR.
     This is the date the report became public — exactly when the market could
@@ -310,7 +335,7 @@ def extract_fundamentals(ticker: str, cik: int) -> list[dict]:
             end = r.get("end")
             val = r.get("val")
             filed = r.get("filed")  # per-row filing date — THE pit key
-            fp = r.get("fp")        # 'FY','Q1'... or None for instant concepts
+            fp = r.get("fp")  # 'FY','Q1'... or None for instant concepts
             fy = r.get("fy")
 
             if val is None or end is None or filed is None:
@@ -334,31 +359,120 @@ def extract_fundamentals(ticker: str, cik: int) -> list[dict]:
             if quarter_value is None and metric not in FLOW_METRICS:
                 quarter_value = float(val)
 
-            rows.append({
-                "ticker": ticker,
-                "period_end": period_end.isoformat(),
-                "as_of_date": as_of.isoformat(),
-                "fiscal_period": fiscal_period,
-                "statement": _statement_for(metric),
-                "metric": metric,
-                "value": float(val),
-                "quarter_value": quarter_value,
-                "unit": r.get("unit", "USD"),
-                "source": "edgar",
-            })
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "issuer_id": issuer_id,
+                    "security_id": security_id,
+                    "period_end": period_end.isoformat(),
+                    "as_of_date": as_of.isoformat(),
+                    "fiscal_period": fiscal_period,
+                    "statement": _statement_for(metric),
+                    "metric": metric,
+                    "value": float(val),
+                    "quarter_value": quarter_value,
+                    "unit": r.get("unit", "USD"),
+                    "source": "edgar",
+                }
+            )
 
     log.info("edgar.fundamentals_extracted", ticker=ticker, rows=len(rows))
     return rows, _extract_company_meta(facts, ticker)
 
 
+def ingest_issuer(issuer_id: str, *, store: Store | None = None) -> int:
+    """Fetch SEC facts by reviewed issuer/CIK identity, not a current ticker map."""
+    from aios.storage.store import get_store
+
+    db = store or get_store()
+    started_at = datetime.now()
+    run_id = str(uuid4())
+    try:
+        reference = db.issuer_reference(issuer_id)
+        if reference is None:
+            raise ValueError(f"No reviewed SEC CIK for issuer {issuer_id!r}.")
+        securities = db.query(
+            """
+            SELECT DISTINCT security_id
+            FROM security_issuer_assignments
+            WHERE issuer_id = ?
+            """,
+            (issuer_id,),
+        )
+        security_id = securities[0]["security_id"] if len(securities) == 1 else None
+        ticker = str(reference["canonical_ticker"]).upper()
+        cik = int(reference["cik"])
+        rows, meta = extract_fundamentals(
+            ticker,
+            cik,
+            issuer_id=issuer_id,
+            security_id=security_id,
+        )
+        inserted = db.upsert_fundamentals(rows)
+        db.upsert_securities(
+            [
+                {
+                    "ticker": ticker,
+                    "cik": cik,
+                    "name": meta.get("name") or reference["canonical_name"],
+                    "exchange": meta.get("exchange"),
+                    "sector": meta.get("sic_description"),
+                    "industry": meta.get("sic_description"),
+                    "market_cap_bucket": None,
+                    "sic_code": meta.get("sic_code"),
+                }
+            ]
+        )
+        db.record_ingest(
+            run_id=run_id,
+            source="edgar:issuer-cik-history",
+            table_name="fundamentals",
+            rows_inserted=inserted,
+            started_at=started_at,
+            status="success" if inserted else "warning",
+            error=None if inserted else "SEC returned no fundamental rows",
+        )
+        log.info(
+            "edgar.ingest_issuer_done",
+            issuer_id=issuer_id,
+            ticker=ticker,
+            rows=inserted,
+            run_id=run_id,
+        )
+        return inserted
+    except Exception as exc:
+        db.record_ingest(
+            run_id=run_id,
+            source="edgar:issuer-cik-history",
+            table_name="fundamentals",
+            started_at=started_at,
+            status="failed",
+            error=str(exc),
+        )
+        raise
+
+
 def _statement_for(metric: str) -> str:
     income = {
-        "revenue", "net_income", "operating_income", "gross_profit",
-        "eps_basic", "eps_diluted", "rd_expense", "interest_expense", "depreciation",
+        "revenue",
+        "net_income",
+        "operating_income",
+        "gross_profit",
+        "eps_basic",
+        "eps_diluted",
+        "rd_expense",
+        "interest_expense",
+        "depreciation",
     }
     balance = {
-        "total_assets", "total_liabilities", "stockholders_equity",
-        "current_assets", "current_liabilities", "cash", "debt_total", "shares_out",
+        "total_assets",
+        "total_liabilities",
+        "stockholders_equity",
+        "current_assets",
+        "current_liabilities",
+        "cash",
+        "debt_total",
+        "shares_out",
     }
     cashflow = {"cfo", "capex", "dividends_paid"}
     if metric in income:
@@ -393,25 +507,52 @@ def ingest_ticker(ticker: str, cik_map: dict[str, int] | None = None) -> int:
     """
     from aios.storage.store import get_store
 
-    if cik_map is None:
-        cik_map = load_ticker_cik_map()
+    store = get_store()
+    started_at = datetime.now()
+    run_id = str(uuid4())
     ticker_up = ticker.upper()
-    if ticker_up not in cik_map:
-        raise ValueError(f"Ticker {ticker_up} not found in SEC ticker map.")
-    cik = cik_map[ticker_up]
-    rows, meta = extract_fundamentals(ticker_up, cik)
-    n = get_store().upsert_fundamentals(rows)
+    try:
+        if cik_map is None:
+            cik_map = load_ticker_cik_map()
+        if ticker_up not in cik_map:
+            raise ValueError(f"Ticker {ticker_up} not found in SEC ticker map.")
+        cik = cik_map[ticker_up]
+        rows, meta = extract_fundamentals(ticker_up, cik)
+        n = store.upsert_fundamentals(rows)
 
-    # Upsert the security row WITH metadata (SIC code enables sector detection).
-    get_store().upsert_securities([{
-        "ticker": ticker_up,
-        "cik": cik,
-        "name": meta.get("name"),
-        "exchange": meta.get("exchange"),
-        "sector": meta.get("sic_description"),
-        "industry": meta.get("sic_description"),
-        "market_cap_bucket": None,
-        "sic_code": meta.get("sic_code"),
-    }])
-    log.info("edgar.ingest_ticker_done", ticker=ticker_up, rows=n)
-    return n
+        # Upsert the security row WITH metadata (SIC enables sector detection).
+        store.upsert_securities(
+            [
+                {
+                    "ticker": ticker_up,
+                    "cik": cik,
+                    "name": meta.get("name"),
+                    "exchange": meta.get("exchange"),
+                    "sector": meta.get("sic_description"),
+                    "industry": meta.get("sic_description"),
+                    "market_cap_bucket": None,
+                    "sic_code": meta.get("sic_code"),
+                }
+            ]
+        )
+        store.record_ingest(
+            run_id=run_id,
+            source="edgar",
+            table_name="fundamentals",
+            rows_inserted=n,
+            started_at=started_at,
+            status="success" if n else "warning",
+            error=None if n else "SEC returned no fundamental rows",
+        )
+        log.info("edgar.ingest_ticker_done", ticker=ticker_up, rows=n, run_id=run_id)
+        return n
+    except Exception as e:
+        store.record_ingest(
+            run_id=run_id,
+            source="edgar",
+            table_name="fundamentals",
+            started_at=started_at,
+            status="failed",
+            error=str(e),
+        )
+        raise

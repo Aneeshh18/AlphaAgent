@@ -9,16 +9,33 @@ yield-curve CSV. The macro table is filled with what we can get.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta
+from http.client import IncompleteRead, RemoteDisconnected
 from typing import Any
+from urllib.error import URLError
+from uuid import uuid4
 
 from structlog import get_logger
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
 from aios.config import settings
 from aios.ingest.http_client import get_http
 from aios.storage.store import get_store
 
 log = get_logger(__name__)
+
+# FRED limits XML/JSON observation requests to 2,000 vintage dates. Keep a
+# margin below that hard cap so this remains safe if endpoint accounting changes.
+FRED_VINTAGE_CHUNK_SIZE = 1_900
+FRED_INCREMENTAL_OVERLAP_DAYS = 31
+TREASURY_YIELD_SERIES = {"DGS2", "DGS10", "DGS30"}
+FRED_TRANSIENT_ERRORS = (
+    IncompleteRead,
+    RemoteDisconnected,
+    URLError,
+    TimeoutError,
+    ConnectionError,
+)
 
 # The core macro series. group → series_id → {label, unit, freq}
 MACRO_SERIES: dict[str, dict[str, str]] = {
@@ -50,8 +67,21 @@ MACRO_SERIES: dict[str, dict[str, str]] = {
 }
 
 
-def fetch_series_fred(series_id: str) -> list[dict]:
-    """Fetch one series via fredapi. Requires FRED_API_KEY."""
+class MacroIngestError(RuntimeError):
+    """Raised after all macro sources are attempted and one or more failed."""
+
+
+def fetch_series_fred(
+    series_id: str,
+    realtime_start: date | str | None = None,
+    realtime_end: date | str | None = None,
+) -> list[dict]:
+    """Fetch every available FRED vintage for one series.
+
+    ``date`` is the economic observation date; ``release_date`` is FRED's
+    ``realtime_start`` — the date that vintage became public. Keeping both is
+    required to answer historical questions without revision look-ahead.
+    """
     if not settings.fred_api_key:
         log.warning("fred.no_api_key", series_id=series_id)
         return []
@@ -62,17 +92,46 @@ def fetch_series_fred(series_id: str) -> list[dict]:
     except ImportError as e:  # pragma: no cover
         raise RuntimeError("fredapi not installed") from e
 
-    s = fred.get_series(series_id)
+    vintage_dates = _bounded_vintage_dates(
+        _fetch_vintage_dates(fred, series_id),
+        realtime_start=realtime_start,
+        realtime_end=realtime_end,
+    )
+    if not vintage_dates:
+        log.info("fred.series_no_vintages", series_id=series_id)
+        return []
+
     meta = MACRO_SERIES.get(series_id, {})
-    rows: list[dict] = []
-    for ts, val in s.dropna().items():
-        rows.append({
-            "series_id": series_id,
-            "date": ts.date().isoformat() if hasattr(ts, "date") else str(ts)[:10],
-            "value": float(val),
-            "unit": meta.get("unit", "na"),
-            "source": "fred",
-        })
+    rows_by_key: dict[tuple[str, str], dict] = {}
+    chunks = list(_chunks(vintage_dates, FRED_VINTAGE_CHUNK_SIZE))
+    for chunk_number, vintage_chunk in enumerate(chunks, start=1):
+        window_start = vintage_chunk[0].isoformat()
+        window_end = vintage_chunk[-1].isoformat()
+        observations = _fetch_release_window(fred, series_id, window_start, window_end)
+        for _, observation in observations.dropna(subset=["value"]).iterrows():
+            observation_date = _date_string(observation["date"])
+            release_date = _date_string(observation["realtime_start"])
+            rows_by_key[(observation_date, release_date)] = {
+                "series_id": series_id,
+                "date": observation_date,
+                "release_date": release_date,
+                "value": float(observation["value"]),
+                "unit": meta.get("unit", "na"),
+                "source": "fred",
+            }
+        log.info(
+            "fred.series_chunk_fetched",
+            series_id=series_id,
+            chunk=chunk_number,
+            chunks=len(chunks),
+            realtime_start=window_start,
+            realtime_end=window_end,
+        )
+
+    rows = sorted(
+        rows_by_key.values(),
+        key=lambda row: (row["date"], row["release_date"]),
+    )
     log.info("fred.series_fetched", series_id=series_id, rows=len(rows))
     return rows
 
@@ -106,13 +165,20 @@ def fetch_treasury_yield_curve() -> list[dict]:
             series_id = _tenor_to_series(col)
             if not series_id:
                 continue
-            rows.append({
-                "series_id": series_id,
-                "date": d,
-                "value": float(val),
-                "unit": "pct",
-                "source": "treasury",
-            })
+            rows.append(
+                {
+                    "series_id": series_id,
+                    "date": d,
+                    # Treasury's historical CSV does not expose a separate
+                    # release timestamp. Its daily rate is treated as
+                    # available at the end of the observation date; callers
+                    # must make decisions after that close (or next session).
+                    "release_date": d,
+                    "value": float(val),
+                    "unit": "pct",
+                    "source": "treasury",
+                }
+            )
     log.info("treasury.yields_fetched", rows=len(rows))
     return rows
 
@@ -124,22 +190,133 @@ def _tenor_to_series(col: str) -> str | None:
     return mapping.get(col)
 
 
+def _date_string(value: object) -> str:
+    """Convert pandas/FRED date-like values to an ISO calendar date."""
+    if hasattr(value, "date"):
+        value = value.date()
+    return str(value)[:10]
+
+
+@retry(
+    retry=retry_if_exception_type(FRED_TRANSIENT_ERRORS),
+    stop=stop_after_attempt(4),
+    wait=wait_exponential_jitter(initial=0.5, max=8.0),
+    reraise=True,
+)
+def _fetch_vintage_dates(fred: Any, series_id: str) -> list[Any]:
+    """Fetch a series' release dates with bounded transient retries."""
+    return fred.get_series_vintage_dates(series_id)
+
+
+@retry(
+    retry=retry_if_exception_type(FRED_TRANSIENT_ERRORS),
+    stop=stop_after_attempt(4),
+    wait=wait_exponential_jitter(initial=0.5, max=8.0),
+    reraise=True,
+)
+def _fetch_release_window(
+    fred: Any,
+    series_id: str,
+    realtime_start: str,
+    realtime_end: str,
+) -> Any:
+    """Fetch one legal-size vintage window with bounded transient retries."""
+    return fred.get_series_all_releases(
+        series_id,
+        realtime_start=realtime_start,
+        realtime_end=realtime_end,
+    )
+
+
+def _as_date(value: date | str) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value)[:10])
+
+
+def _bounded_vintage_dates(
+    vintage_dates: list[Any],
+    realtime_start: date | str | None,
+    realtime_end: date | str | None,
+) -> list[date]:
+    """Normalize, deduplicate, and bound FRED vintage dates."""
+    start = _as_date(realtime_start) if realtime_start else None
+    end = _as_date(realtime_end) if realtime_end else date.today()
+    end = min(end, date.today())
+    if start and start > end:
+        raise ValueError(f"realtime_start {start} is after realtime_end {end}")
+    return sorted(
+        {
+            vintage_date
+            for raw_date in vintage_dates
+            if (vintage_date := _as_date(raw_date)) <= end
+            and (start is None or vintage_date >= start)
+        }
+    )
+
+
+def _chunks(values: list[date], size: int) -> list[list[date]]:
+    """Split values into non-overlapping chunks of at most `size`."""
+    if size < 1:
+        raise ValueError("chunk size must be positive")
+    return [values[offset : offset + size] for offset in range(0, len(values), size)]
+
+
 def ingest_macro(series_ids: list[str] | None = None) -> int:
     """Fetch + store macro series. Defaults to all MACRO_SERIES + Treasury fallback."""
+    store = get_store()
+    started_at = datetime.now()
+    run_id = str(uuid4())
     total = 0
+    failures: dict[str, str] = {}
     ids = series_ids or list(MACRO_SERIES.keys())
     for sid in ids:
-        rows = fetch_series_fred(sid)
-        if rows:
-            total += get_store().upsert_macro(rows)
+        try:
+            latest_release = store.latest_macro_release_date(sid, source="fred")
+            realtime_start = (
+                latest_release - timedelta(days=FRED_INCREMENTAL_OVERLAP_DAYS)
+                if latest_release
+                else None
+            )
+            rows = fetch_series_fred(sid, realtime_start=realtime_start)
+            if rows:
+                total += store.upsert_macro(rows)
+        except Exception as exc:
+            failures[sid] = str(exc)
+            log.error("fred.series_failed", series_id=sid, error=str(exc))
 
-    # Always also pull the no-key Treasury curve as a fallback/cross-check for yields.
-    try:
-        trows = fetch_treasury_yield_curve()
-        if trows:
-            total += get_store().upsert_macro(trows)
-    except Exception as e:  # pragma: no cover
-        log.warning("treasury.fallback_skipped", error=str(e))
+    # Treasury is a true fallback: avoid a redundant automated request when
+    # FRED is configured and all requested yield series succeeded.
+    needs_treasury = not settings.fred_api_key or bool(TREASURY_YIELD_SERIES & failures.keys())
+    if needs_treasury:
+        try:
+            trows = fetch_treasury_yield_curve()
+            if trows:
+                total += store.upsert_macro(trows)
+            else:
+                failures.setdefault("treasury", "no rows returned")
+        except Exception as exc:  # pragma: no cover
+            failures["treasury"] = str(exc)
+            log.error("treasury.fallback_failed", error=str(exc))
+    else:
+        log.info("treasury.fallback_not_needed")
 
-    log.info("macro.ingest_done", series=len(ids), rows=total)
+    error = "; ".join(f"{source}: {message}" for source, message in failures.items()) or None
+    status = "failed" if failures else "success"
+    store.record_ingest(
+        run_id=run_id,
+        source="fred_or_treasury",
+        table_name="macro",
+        rows_inserted=total,
+        started_at=started_at,
+        status=status,
+        error=error,
+    )
+    if failures:
+        raise MacroIngestError(
+            f"Macro ingest completed with {len(failures)} failed source(s): {error}"
+        )
+    log.info("macro.ingest_done", series=len(ids), rows=total, run_id=run_id)
     return total

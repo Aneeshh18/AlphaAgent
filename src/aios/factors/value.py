@@ -25,6 +25,7 @@ from datetime import date
 from structlog import get_logger
 
 from aios.factors import common as fc
+from aios.factors.policy import MIN_VALUE_MULTIPLES
 from aios.storage.store import Store, get_store
 
 log = get_logger(__name__)
@@ -48,6 +49,7 @@ class ValueSnapshot:
     p_b_pct: float | None = None
     # Composite
     value_score: float | None = None  # 0–100
+    multiples_available: int = 0
     # Raw inputs for transparency
     price: float | None = None
     market_cap: float | None = None
@@ -188,7 +190,10 @@ def compute_value_ranked(
     for s in snaps.values():
         pcts = [s.pe_pct, s.ev_ebitda_pct, s.p_fcf_pct, s.ev_sales_pct, s.p_b_pct]
         pcts = [p for p in pcts if p is not None]
-        if pcts:
+        s.multiples_available = len(pcts)
+        if len(pcts) >= MIN_VALUE_MULTIPLES:
             s.value_score = (sum(pcts) / len(pcts)) * 100
+        else:
+            s.missing.append(f"minimum_value_multiples:{MIN_VALUE_MULTIPLES}")
 
     return snaps

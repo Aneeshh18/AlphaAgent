@@ -1,0 +1,7 @@
+security_id,issuer_id,effective_start,effective_end,verified_date,source
+aios:security:cencora-common,aios:issuer:cencora,2023-08-01,2025-01-01,2026-07-16,https://investor.cencora.com/news/news-details/2023/AmerisourceBergen-Reports-Fiscal-2023-Third-Quarter-Results/default.aspx
+aios:security:dayforce-common,aios:issuer:dayforce,2023-08-01,2025-01-01,2026-07-16,https://investors.dayforce.com/news-and-events/press-releases/press-release-details/2024/Ceridian-to-change-ticker-symbol-to-DAY-on-NYSE-and-TSX-effective-February-1/default.aspx
+aios:security:healthpeak-common,aios:issuer:healthpeak,2023-08-01,2025-01-01,2026-07-16,https://www.sec.gov/Archives/edgar/data/765880/000110465924029661/tm247564d1_ex99-1.htm
+aios:security:corpay-common,aios:issuer:corpay,2023-08-01,2025-01-01,2026-07-16,https://investor.corpay.com/news-releases/news-release-details/fleetcor-announces-rebranding-corpay/
+aios:bounded:sp500:wrk,aios:issuer:westrock,2023-08-01,2024-07-08,2026-07-16,https://www.sec.gov/Archives/edgar/data/1732845/000095014224001577/eh240491738_8k.htm
+aios:bounded:sp500:sw,aios:issuer:smurfit-westrock,2024-07-08,2025-01-01,2026-07-16,https://www.sec.gov/Archives/edgar/data/2005951/000110465924102260/tm2424555d1_8k.htm
