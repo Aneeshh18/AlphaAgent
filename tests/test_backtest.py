@@ -6,6 +6,7 @@ import pytest
 
 from aios.backtest import engine
 from aios.factors.composite import CompositeRow
+from aios.macro.regime import MacroRegimeSnapshot
 from aios.storage.store import Store
 
 
@@ -53,13 +54,30 @@ def _seed_prices(store: Store) -> None:
     store.upsert_prices(rows)
 
 
+def _snapshot(as_of: str | date, *, ready: bool = True) -> MacroRegimeSnapshot:
+    return MacroRegimeSnapshot(
+        as_of=str(as_of),
+        regime="reflation" if ready else "unknown",
+        growth_state="expanding" if ready else "unknown",
+        inflation_state="high" if ready else "unknown",
+        curve_state="normal",
+        stress_state="normal" if ready else "unknown",
+        missing=[] if ready else ["growth"],
+    )
+
+
+def _use_pit_regime(monkeypatch) -> None:
+    monkeypatch.setattr(engine, "compute_regime", lambda as_of, store: _snapshot(as_of))
+
+
 def test_backtest_uses_next_session_and_compares_regime_policy(monkeypatch, tmp_path):
     store = Store(tmp_path / "backtest.duckdb")
     try:
         _seed_prices(store)
+        _use_pit_regime(monkeypatch)
         calls: list[str] = []
 
-        def fake_compute(tickers, as_of, store):
+        def fake_compute(tickers, as_of, store, regime_snapshot=None):
             calls.append(str(as_of))
             return [_row("A", 100, 0), _row("B", 0, 100)]
 
@@ -86,6 +104,14 @@ def test_backtest_uses_next_session_and_compares_regime_policy(monkeypatch, tmp_
         assert first.baseline_return == pytest.approx(0.10)
         assert result.regime_metrics.cumulative_return == pytest.approx(-0.19)
         assert result.baseline_metrics.cumulative_return == pytest.approx(0.21)
+        assert [trade.side for trade in result.periods[0].regime_trades] == ["buy"]
+        assert result.periods[1].regime_trades == ()
+        assert result.regime_metrics.total_turnover == pytest.approx(1.0)
+        assert result.regime_metrics.max_drawdown == pytest.approx(-0.19)
+        assert result.baseline_metrics.max_drawdown == pytest.approx(0.0)
+        assert result.regime_metrics.daily_observations == 5
+        assert len(result.regime_equity_curve) == 5
+        assert result.to_dict()["regime_equity_curve"][-1]["net_equity"] == pytest.approx(81_000.0)
     finally:
         store.close()
 
@@ -97,8 +123,13 @@ def test_backtest_skips_non_pit_regime_by_default(monkeypatch, tmp_path):
 
         monkeypatch.setattr(
             engine,
+            "compute_regime",
+            lambda as_of, store: _snapshot(as_of, ready=False),
+        )
+        monkeypatch.setattr(
+            engine,
             "compute_composite",
-            lambda tickers, as_of, store: [
+            lambda tickers, as_of, store, regime_snapshot=None: [
                 _row("A", 100, 0, regime="unknown", pit_ready=False),
                 _row("B", 0, 100, regime="unknown", pit_ready=False),
             ],
@@ -151,6 +182,7 @@ def test_backtest_uses_historical_membership_and_benchmark(monkeypatch, tmp_path
     store = Store(tmp_path / "backtest-membership.duckdb")
     try:
         _seed_prices(store)
+        _use_pit_regime(monkeypatch)
         store.upsert_universe_membership(
             [
                 {
@@ -179,10 +211,39 @@ def test_backtest_uses_historical_membership_and_benchmark(monkeypatch, tmp_path
                 for ticker in ("A", "B")
             ]
         )
+        store.execute(
+            """
+            UPDATE prices
+            SET security_id = CASE ticker
+                WHEN 'A' THEN 'aios:security:a'
+                WHEN 'B' THEN 'aios:security:b'
+            END
+            WHERE ticker IN ('A', 'B')
+            """
+        )
+        monkeypatch.setattr(store, "data_quality_report", lambda: [])
         monkeypatch.setattr(
             engine,
             "compute_composite",
-            lambda tickers, as_of, store: [_row("A", 100, 0), _row("B", 0, 100)],
+            lambda tickers, as_of, store, regime_snapshot=None: [
+                _row("A", 100, 0),
+                _row("B", 0, 100),
+            ],
+        )
+        monkeypatch.setattr(
+            store,
+            "universe_data_coverage",
+            lambda universe_id, as_of: [
+                {
+                    "ticker": ticker,
+                    "security_id": f"aios:security:{ticker.lower()}",
+                    "has_price_history": True,
+                    "has_pit_fundamentals": True,
+                    "latest_price_date": as_of,
+                    "latest_fundamental_date": date(2024, 2, 1),
+                }
+                for ticker in ("A", "B")
+            ],
         )
 
         result = engine.run_qv_policy_backtest(
@@ -196,7 +257,101 @@ def test_backtest_uses_historical_membership_and_benchmark(monkeypatch, tmp_path
 
         assert result.tickers == ("A", "B")
         assert result.config.universe_id == "demo"
+        assert result.config.calendar_ticker == "A"
         assert result.benchmark_metrics["A"].completed_periods == 2
+        assert result.benchmark_metrics["A"].daily_observations == 5
+        assert result.benchmark_metrics["A"].cumulative_return == pytest.approx(0.21)
+        assert len(result.benchmark_equity_curves["A"]) == 5
+        assert all(
+            period.price_basis == "raw_close_with_explicit_splits_and_dividends"
+            for period in result.benchmark_periods["A"]
+        )
         assert result.regime_metrics.total_transaction_costs == 0
+        assert all(period.raw_complete_tickers == 2 for period in result.periods)
     finally:
         store.close()
+
+
+def test_skipped_policy_period_is_excluded_from_all_paired_metrics(monkeypatch, tmp_path):
+    store = Store(tmp_path / "backtest-paired.duckdb")
+    try:
+        store.upsert_prices(
+            [
+                {
+                    "ticker": ticker,
+                    "date": observation_date,
+                    "close": price,
+                    "adj_close": price,
+                    "source": "test",
+                }
+                for ticker, observation_date, price in (
+                    ("A", "2024-03-29", 100.0),
+                    ("A", "2024-04-01", 100.0),
+                    ("A", "2024-06-28", 110.0),
+                    ("B", "2024-03-29", 100.0),
+                    ("B", "2024-04-01", 100.0),
+                )
+            ]
+        )
+        _use_pit_regime(monkeypatch)
+        monkeypatch.setattr(
+            engine,
+            "compute_composite",
+            lambda tickers, as_of, store, regime_snapshot=None: [
+                _row("A", 100, 0),
+                _row("B", 0, 100),
+            ],
+        )
+
+        result = engine.run_qv_policy_backtest(
+            "2024-01-01",
+            "2024-06-28",
+            tickers=["A", "B"],
+            top_n=1,
+            allow_current_universe=True,
+            benchmark_tickers=["A"],
+            store=store,
+        )
+
+        assert result.periods[0].status == "skipped_missing_prices"
+        assert result.comparison_periods == 0
+        assert result.regime_metrics.completed_periods == 0
+        assert result.baseline_metrics.completed_periods == 0
+        assert result.benchmark_metrics["A"].completed_periods == 0
+        assert result.benchmark_periods["A"][0].status == "skipped_unpaired_strategy_period"
+    finally:
+        store.close()
+
+
+def test_factor_audit_records_stale_and_missing_evidence():
+    rows = [_row("A", 75, 60), _row("B", 55, 50)]
+    coverage = [
+        {
+            "ticker": "A",
+            "security_id": "security-a",
+            "has_price_history": True,
+            "has_pit_fundamentals": True,
+            "latest_price_date": date(2024, 3, 28),
+            "latest_fundamental_date": date(2024, 2, 1),
+        },
+        {
+            "ticker": "B",
+            "security_id": "security-b",
+            "has_price_history": True,
+            "has_pit_fundamentals": False,
+            "latest_price_date": date(2024, 3, 29),
+            "latest_fundamental_date": None,
+        },
+    ]
+
+    audit = engine._build_factor_audit(
+        rows,
+        coverage,
+        date(2024, 3, 29),
+        excluded_tickers={"A"},
+    )
+
+    assert [row.eligible for row in audit] == [False, False]
+    assert "explicit_policy_exclusion" in audit[0].reasons
+    assert "stale_price:2024-03-28" in audit[0].reasons
+    assert "missing_pit_fundamentals" in audit[1].reasons

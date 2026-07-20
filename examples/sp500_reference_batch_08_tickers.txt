@@ -1,0 +1,27 @@
+# Batch 08: next 25 uncovered unchanged full-window S&P 500 securities.
+# Certified identity window: 2023-08-01 through 2025-01-01 (exclusive end).
+ENPH
+EOG
+EPAM
+EQIX
+EQR
+EQT
+ES
+ESS
+ETN
+ETR
+EVRG
+EW
+EXC
+EXPD
+EXPE
+EXR
+F
+FANG
+FAST
+FCX
+FDS
+FDX
+FE
+FFIV
+FI

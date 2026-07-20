@@ -70,6 +70,7 @@ class HttpClient:
         "query1.finance.yahoo.com": 2.0,
         "query2.finance.yahoo.com": 2.0,
         "stooq.com": 2.0,
+        "api.tiingo.com": 1.0,
         "fred.stlouisfed.org": 4.0,
         "api.stlouisfed.org": 4.0,
     }

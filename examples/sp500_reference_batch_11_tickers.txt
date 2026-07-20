@@ -1,0 +1,27 @@
+# Batch 11: next 25 uncovered unchanged full-window S&P 500 securities.
+# Certified identity window: 2023-08-01 through 2025-01-01 (exclusive end).
+IFF
+INCY
+INTC
+INTU
+INVH
+IP
+IPG
+IQV
+IR
+IRM
+ISRG
+IT
+ITW
+IVZ
+J
+JBHT
+JCI
+JKHY
+JNJ
+JNPR
+JPM
+K
+KDP
+KEY
+KEYS

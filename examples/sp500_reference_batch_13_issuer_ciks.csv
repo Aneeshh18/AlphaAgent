@@ -1,0 +1,25 @@
+issuer_id,canonical_name,canonical_ticker,cik,effective_start,effective_end,verified_date,source
+aios:issuer:sec:0001141391,Mastercard Inc,MA,0001141391,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001141391.json
+aios:issuer:sec:0000912595,MID AMERICA APARTMENT COMMUNITIES INC.,MAA,0000912595,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000912595.json
+aios:issuer:sec:0001048286,MARRIOTT INTERNATIONAL INC /MD/,MAR,0001048286,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001048286.json
+aios:issuer:sec:0000062996,MASCO CORP /DE/,MAS,0000062996,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000062996.json
+aios:issuer:sec:0000063908,MCDONALDS CORP,MCD,0000063908,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000063908.json
+aios:issuer:sec:0000827054,MICROCHIP TECHNOLOGY INC,MCHP,0000827054,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000827054.json
+aios:issuer:sec:0000927653,MCKESSON CORP,MCK,0000927653,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000927653.json
+aios:issuer:sec:0001059556,MOODYS CORP /DE/,MCO,0001059556,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001059556.json
+aios:issuer:sec:0001103982,"Mondelez International, Inc.",MDLZ,0001103982,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001103982.json
+aios:issuer:sec:0001613103,Medtronic plc,MDT,0001613103,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001613103.json
+aios:issuer:sec:0001099219,METLIFE INC,MET,0001099219,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001099219.json
+aios:issuer:sec:0001326801,"Meta Platforms, Inc.",META,0001326801,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001326801.json
+aios:issuer:sec:0000789570,MGM Resorts International,MGM,0000789570,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000789570.json
+aios:issuer:sec:0000851968,MOHAWK INDUSTRIES INC,MHK,0000851968,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000851968.json
+aios:issuer:sec:0000063754,MCCORMICK & CO INC,MKC,0000063754,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000063754.json
+aios:issuer:sec:0001278021,MARKETAXESS HOLDINGS INC,MKTX,0001278021,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001278021.json
+aios:issuer:sec:0000916076,MARTIN MARIETTA MATERIALS INC,MLM,0000916076,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000916076.json
+aios:issuer:sec:0000066740,3M CO,MMM,0000066740,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000066740.json
+aios:issuer:sec:0000865752,Monster Beverage Corp,MNST,0000865752,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000865752.json
+aios:issuer:sec:0000764180,"ALTRIA GROUP, INC.",MO,0000764180,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000764180.json
+aios:issuer:sec:0001179929,"MOLINA HEALTHCARE, INC.",MOH,0001179929,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001179929.json
+aios:issuer:sec:0001285785,MOSAIC CO,MOS,0001285785,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001285785.json
+aios:issuer:sec:0001510295,Marathon Petroleum Corp,MPC,0001510295,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001510295.json
+aios:issuer:sec:0001280452,MONOLITHIC POWER SYSTEMS INC,MPWR,0001280452,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001280452.json

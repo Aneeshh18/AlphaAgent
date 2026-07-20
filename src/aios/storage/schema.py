@@ -98,6 +98,26 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     PRIMARY KEY (ticker, period_end, as_of_date, metric)
 );
 
+-- Invalid source rows are moved here instead of being destroyed. They are
+-- excluded from every PIT query but remain available for provenance review.
+CREATE TABLE IF NOT EXISTS fundamentals_quarantine (
+    ticker          VARCHAR NOT NULL,
+    issuer_id       VARCHAR,
+    security_id     VARCHAR,
+    period_end      DATE NOT NULL,
+    as_of_date      DATE NOT NULL,
+    fiscal_period   VARCHAR,
+    statement       VARCHAR,
+    metric          VARCHAR NOT NULL,
+    value           DOUBLE,
+    quarter_value   DOUBLE,
+    unit            VARCHAR,
+    source          VARCHAR,
+    fetched_at      TIMESTAMP,
+    quarantine_reason VARCHAR NOT NULL,
+    quarantined_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- ======================================================================
 -- Macro indicators: one row per series, observation date, and release vintage.
 -- ======================================================================

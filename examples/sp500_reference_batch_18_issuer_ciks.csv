@@ -1,0 +1,26 @@
+issuer_id,canonical_name,canonical_ticker,cik,effective_start,effective_end,verified_date,source
+aios:issuer:sec:0000016918,"CONSTELLATION BRANDS, INC.",STZ,0000016918,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000016918.json
+aios:issuer:sec:0000093556,"STANLEY BLACK & DECKER, INC.",SWK,0000093556,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000093556.json
+aios:issuer:sec:0000004127,"SKYWORKS SOLUTIONS, INC.",SWKS,0000004127,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000004127.json
+aios:issuer:sec:0001601712,Synchrony Financial,SYF,0001601712,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001601712.json
+aios:issuer:sec:0000310764,STRYKER CORP,SYK,0000310764,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000310764.json
+aios:issuer:sec:0000096021,SYSCO CORP,SYY,0000096021,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000096021.json
+aios:issuer:sec:0000732717,AT&T INC.,T,0000732717,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000732717.json
+aios:issuer:sec:0000024545,MOLSON COORS BEVERAGE CO,TAP,0000024545,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000024545.json
+aios:issuer:sec:0001260221,TransDigm Group INC,TDG,0001260221,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001260221.json
+aios:issuer:sec:0001094285,TELEDYNE TECHNOLOGIES INC,TDY,0001094285,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001094285.json
+aios:issuer:sec:0000842023,BIO-TECHNE Corp,TECH,0000842023,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000842023.json
+aios:issuer:sec:0001385157,TE Connectivity plc,TEL,0001385157,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001385157.json
+aios:issuer:sec:0000097210,"TERADYNE, INC",TER,0000097210,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000097210.json
+aios:issuer:sec:0000092230,TRUIST FINANCIAL CORP,TFC,0000092230,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000092230.json
+aios:issuer:sec:0000096943,TELEFLEX INC,TFX,0000096943,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000096943.json
+aios:issuer:sec:0000027419,TARGET CORP,TGT,0000027419,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000027419.json
+aios:issuer:sec:0000109198,TJX COMPANIES INC /DE/,TJX,0000109198,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000109198.json
+aios:issuer:sec:0000097745,THERMO FISHER SCIENTIFIC INC.,TMO,0000097745,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000097745.json
+aios:issuer:sec:0001283699,"T-Mobile US, Inc.",TMUS,0001283699,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001283699.json
+aios:issuer:sec:0001116132,"TAPESTRY, INC.",TPR,0001116132,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001116132.json
+aios:issuer:sec:0001389170,Targa Resources Corp.,TRGP,0001389170,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001389170.json
+aios:issuer:sec:0000864749,TRIMBLE INC.,TRMB,0000864749,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000864749.json
+aios:issuer:sec:0001113169,PRICE T ROWE GROUP INC,TROW,0001113169,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001113169.json
+aios:issuer:sec:0000086312,"TRAVELERS COMPANIES, INC.",TRV,0000086312,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000086312.json
+aios:issuer:sec:0000916365,TRACTOR SUPPLY CO /DE/,TSCO,0000916365,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000916365.json

@@ -1,0 +1,3 @@
+security_id,issuer_id,effective_start,effective_end,verified_date,source
+aios:bounded:sp500:wba,aios:issuer:sec:0001618921,2023-08-01,2025-01-01,2026-07-18,https://www.sec.gov/Archives/edgar/data/1618921/000161892123000062/wba-20230831.htm
+aios:bounded:sp500:xom,aios:issuer:sec:0000034088,2023-08-01,2025-01-01,2026-07-18,https://www.sec.gov/Archives/edgar/data/34088/000003408824000018/xom-20231231.htm

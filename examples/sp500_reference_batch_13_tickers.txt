@@ -1,0 +1,27 @@
+# Batch 13: next 25 uncovered unchanged full-window S&P 500 securities.
+# Certified identity window: 2023-08-01 through 2025-01-01 (exclusive end).
+MA
+MAA
+MAR
+MAS
+MCD
+MCHP
+MCK
+MCO
+MDLZ
+MDT
+MET
+META
+MGM
+MHK
+MKC
+MKTX
+MLM
+MMC
+MMM
+MNST
+MO
+MOH
+MOS
+MPC
+MPWR

@@ -1,0 +1,28 @@
+# Batch 09: next 25 uncovered unchanged full-window S&P 500 securities.
+# Includes reviewed dual-class pairs FOX/FOXA and GOOG/GOOGL.
+# Certified identity window: 2023-08-01 through 2025-01-01 (exclusive end).
+FICO
+FIS
+FITB
+FMC
+FOX
+FOXA
+FRT
+FSLR
+FTNT
+FTV
+GD
+GE
+GEHC
+GEN
+GILD
+GIS
+GL
+GLW
+GM
+GNRC
+GOOG
+GOOGL
+GPC
+GPN
+GRMN

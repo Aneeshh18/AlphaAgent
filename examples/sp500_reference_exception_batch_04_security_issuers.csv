@@ -1,0 +1,3 @@
+security_id,issuer_id,effective_start,effective_end,verified_date,source
+aios:bounded:sp500:hes,aios:issuer:sec:0000004447,2023-08-01,2025-01-01,2026-07-17,https://www.sec.gov/Archives/edgar/data/4447/000162828024006845/hes-20231231.htm
+aios:bounded:sp500:holx,aios:issuer:sec:0000859737,2023-08-01,2025-01-01,2026-07-17,https://www.sec.gov/Archives/edgar/data/859737/000085973723000023/holx-20230930.htm

@@ -1,0 +1,26 @@
+issuer_id,canonical_name,canonical_ticker,cik,effective_start,effective_end,verified_date,source
+aios:issuer:sec:0000320193,Apple Inc.,AAPL,0000320193,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000320193.json
+aios:issuer:sec:0001018724,AMAZON COM INC,AMZN,0001018724,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001018724.json
+aios:issuer:sec:0000012927,BOEING CO,BA,0000012927,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000012927.json
+aios:issuer:sec:0000070858,BANK OF AMERICA CORP /DE/,BAC,0000070858,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000070858.json
+aios:issuer:sec:0000018230,CATERPILLAR INC,CAT,0000018230,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000018230.json
+aios:issuer:sec:0001166691,COMCAST CORP,CMCSA,0001166691,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001166691.json
+aios:issuer:sec:0001402057,CDW Corp,CDW,0001402057,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001402057.json
+aios:issuer:sec:0001306830,Celanese Corp,CE,0001306830,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001306830.json
+aios:issuer:sec:0001868275,Constellation Energy Corp,CEG,0001868275,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001868275.json
+aios:issuer:sec:0001324404,"CF Industries Holdings, Inc.",CF,0001324404,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001324404.json
+aios:issuer:sec:0000759944,CITIZENS FINANCIAL GROUP INC/RI,CFG,0000759944,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000759944.json
+aios:issuer:sec:0000313927,CHURCH & DWIGHT CO INC /DE/,CHD,0000313927,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000313927.json
+aios:issuer:sec:0001043277,"C. H. ROBINSON WORLDWIDE, INC.",CHRW,0001043277,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001043277.json
+aios:issuer:sec:0001091667,"CHARTER COMMUNICATIONS, INC. /MO/",CHTR,0001091667,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001091667.json
+aios:issuer:sec:0001739940,Cigna Group,CI,0001739940,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001739940.json
+aios:issuer:sec:0000020286,CINCINNATI FINANCIAL CORP,CINF,0000020286,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000020286.json
+aios:issuer:sec:0000021665,COLGATE PALMOLIVE CO,CL,0000021665,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000021665.json
+aios:issuer:sec:0000021076,CLOROX CO /DE/,CLX,0000021076,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000021076.json
+aios:issuer:sec:0001156375,CME GROUP INC.,CME,0001156375,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001156375.json
+aios:issuer:sec:0001058090,CHIPOTLE MEXICAN GRILL INC,CMG,0001058090,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001058090.json
+aios:issuer:sec:0000026172,CUMMINS INC,CMI,0000026172,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000026172.json
+aios:issuer:sec:0000811156,CMS ENERGY CORP,CMS,0000811156,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000811156.json
+aios:issuer:sec:0001071739,CENTENE CORP,CNC,0001071739,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001071739.json
+aios:issuer:sec:0001130310,CENTERPOINT ENERGY INC,CNP,0001130310,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001130310.json
+aios:issuer:sec:0000927628,CAPITAL ONE FINANCIAL CORP,COF,0000927628,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000927628.json

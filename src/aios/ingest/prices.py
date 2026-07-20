@@ -1,12 +1,13 @@
-"""Daily EOD price fetcher: yfinance (primary) + Stooq (fallback).
+"""Daily EOD prices: yfinance, optional Tiingo, and Stooq fallback.
 
 DESIGN
 ------
-Both sources produce rows in the SAME schema so the storage layer never cares
-which one supplied a given day. If yfinance returns nothing (throttled /
-broken), we try Stooq. We log which source each row came from for auditability.
+All sources produce rows in the SAME schema so the storage layer never cares
+which one supplied a given day. If yfinance returns nothing (throttled or
+broken), we try configured Tiingo and then Stooq. We retain the source on every
+row for auditability.
 
-yfinance gives us adjusted prices + dividends + splits in one call.
+yfinance and Tiingo give us adjusted prices + dividends + splits.
 Stooq gives raw OHLCV (unadjusted) — we store it raw and flag source='stooq';
 adjustment reconciliation is a downstream concern, not an ingest one.
 """
@@ -15,18 +16,20 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from uuid import uuid4
 
 import pandas as pd
 from structlog import get_logger
 
+from aios.config import settings
 from aios.ingest.http_client import get_http
 from aios.storage.store import Store, get_store
 
 log = get_logger(__name__)
 
 STOOQ_URL = "https://stooq.com/q/d/l/"
+TIINGO_EOD_URL = "https://api.tiingo.com/tiingo/daily/{symbol}/prices"
 
 
 # ----------------------------------------------------------------------
@@ -135,10 +138,65 @@ def fetch_stooq(
 
 
 # ----------------------------------------------------------------------
+# Tiingo EOD (optional user-token provider)
+# ----------------------------------------------------------------------
+def fetch_tiingo(
+    ticker: str,
+    start: str | None = None,
+    end: str | None = None,
+) -> list[dict]:
+    """Fetch explicit Tiingo EOD history without placing the token in the URL."""
+    token = settings.tiingo_api_key.strip()
+    if not token:
+        raise ValueError("TIINGO_API_KEY is required for the Tiingo provider")
+    params: dict[str, str] = {}
+    if start:
+        params["startDate"] = start
+    if end:
+        params["endDate"] = end
+    query = f"?{urlencode(params)}" if params else ""
+    url = TIINGO_EOD_URL.format(symbol=quote(ticker.upper(), safe="-")) + query
+    payload = get_http().get_json(
+        url,
+        headers={"Authorization": f"Token {token}"},
+    )
+    if not isinstance(payload, list):
+        raise ValueError("Tiingo EOD response is not a row array")
+
+    end_date = date.fromisoformat(end) if end else None
+    rows: list[dict] = []
+    for raw in payload:
+        if not isinstance(raw, dict) or not raw.get("date"):
+            continue
+        row_date = date.fromisoformat(str(raw["date"])[:10])
+        if end_date is not None and row_date >= end_date:
+            continue
+        rows.append(
+            {
+                "ticker": ticker.upper(),
+                "date": row_date.isoformat(),
+                "open": _f(raw.get("open")),
+                "high": _f(raw.get("high")),
+                "low": _f(raw.get("low")),
+                "close": _f(raw.get("close")),
+                "adj_close": _f(raw.get("adjClose")),
+                "volume": (
+                    int(raw["volume"]) if raw.get("volume") is not None else None
+                ),
+                "dividends": _f(raw.get("divCash")) or 0.0,
+                "split_ratio": _f(raw.get("splitFactor")) or 1.0,
+                "source": "tiingo",
+            }
+        )
+    log.info("prices.tiingo_fetched", ticker=ticker, rows=len(rows))
+    return rows
+
+
+# ----------------------------------------------------------------------
 # Unified fetch + store
 # ----------------------------------------------------------------------
 def fetch_prices(ticker: str, start: str | None = None, end: str | None = None) -> list[dict]:
-    """Try yfinance first; fall back to Stooq on empty/failure."""
+    """Try yfinance, configured Tiingo, then Stooq on empty/failure."""
     try:
         rows = fetch_yfinance(ticker, start=start, end=end)
     except Exception as e:
@@ -146,6 +204,15 @@ def fetch_prices(ticker: str, start: str | None = None, end: str | None = None) 
         rows = []
     if rows:
         return rows
+    if settings.tiingo_api_key.strip():
+        log.warning("prices.fallback_to_tiingo", ticker=ticker)
+        try:
+            rows = fetch_tiingo(ticker, start=start, end=end)
+        except Exception as e:
+            log.warning("prices.tiingo_failed", ticker=ticker, error=str(e))
+            rows = []
+        if rows:
+            return rows
     log.warning("prices.fallback_to_stooq", ticker=ticker)
     try:
         return fetch_stooq(ticker, start=start, end=end)
@@ -166,6 +233,8 @@ def fetch_provider_prices(
         return fetch_yfinance(provider_symbol, start=start, end=end)
     if provider == "stooq":
         return fetch_stooq(provider_symbol, start=start, end=end)
+    if provider == "tiingo":
+        return fetch_tiingo(provider_symbol, start=start, end=end)
     raise ValueError(f"unsupported price provider {provider!r}")
 
 

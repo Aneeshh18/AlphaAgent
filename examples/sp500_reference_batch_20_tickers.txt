@@ -1,0 +1,26 @@
+# Batch 20: final unchanged full-window securities without continuous reviewed owners.
+# Certified identity window: 2023-08-01 through 2025-01-01 (exclusive end).
+VZ
+WAB
+WAT
+WBA
+WBD
+WDC
+WEC
+WELL
+WFC
+WM
+WMB
+WMT
+WRB
+WST
+WTW
+WY
+WYNN
+XEL
+XOM
+XYL
+YUM
+ZBH
+ZBRA
+ZTS

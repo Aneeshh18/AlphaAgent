@@ -1,0 +1,27 @@
+# Batch 03: unchanged full-window S&P 500 securities missing complete local inputs.
+# Certified identity window: 2023-08-01 through 2025-01-01 (exclusive end).
+A
+ACGL
+AFL
+AIG
+AIZ
+AJG
+ALL
+AMCR
+AMP
+ANSS
+AON
+APA
+APTV
+ARE
+ATO
+AVB
+AVGO
+AVY
+AXON
+AXP
+AZO
+BALL
+BAX
+BBY
+BDX

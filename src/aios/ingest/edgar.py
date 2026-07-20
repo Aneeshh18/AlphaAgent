@@ -23,9 +23,13 @@ date from the submissions index as as_of_date per filing period.
 
 from __future__ import annotations
 
+import json
+import re
 from datetime import date, datetime
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+from zipfile import BadZipFile, ZipFile, ZipInfo
 
 from structlog import get_logger
 
@@ -38,7 +42,9 @@ log = get_logger(__name__)
 
 TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+SUBMISSIONS_FILE_URL = "https://data.sec.gov/submissions/{name}"
 FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+COMPANYFACTS_BULK_URL = "https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip"
 
 # The SEC's current ticker file maps XOM to ExxonMobil Holdings Corp, which has
 # no public-company XBRL facts. The listed issuer is Exxon Mobil Corp (CIK
@@ -126,10 +132,106 @@ def fetch_submissions(cik: int) -> dict[str, Any]:
     return get_http().get_json(url)
 
 
+def fetch_submission_file(name: str) -> dict[str, Any]:
+    """Fetch one older filing-history shard named by a submissions payload."""
+    if not re.fullmatch(r"CIK\d{10}-submissions-\d{3}\.json", name):
+        raise ValueError(f"invalid SEC submissions history filename {name!r}")
+    return get_http().get_json(SUBMISSIONS_FILE_URL.format(name=name))
+
+
 def fetch_facts(cik: int) -> dict[str, Any]:
     """Fetch the full XBRL Company Facts blob for a CIK."""
     url = FACTS_URL.format(cik=_cik_zero_padded(cik))
     return get_http().get_json(url)
+
+
+class CompanyFactsArchive:
+    """Read selected CIK payloads from one local official Company Facts ZIP.
+
+    The archive is intentionally supplied by path instead of downloaded by the
+    ingest command: it is large, nightly rather than real-time, and belongs in
+    gitignored data storage. Members are selected only by the reviewed CIK and
+    their embedded CIK is checked before any facts reach the database.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self._archive: ZipFile | None = None
+        self._members: dict[str, list[ZipInfo]] = {}
+
+    def __enter__(self) -> CompanyFactsArchive:
+        if not self.path.is_file():
+            raise ValueError(f"Company Facts ZIP is not a file: {self.path}")
+        try:
+            archive = ZipFile(self.path)
+        except (BadZipFile, OSError) as exc:
+            raise ValueError(f"invalid Company Facts ZIP: {self.path}") from exc
+
+        members: dict[str, list[ZipInfo]] = {}
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            basename = PurePosixPath(info.filename).name
+            if basename.startswith("CIK") and basename.endswith(".json"):
+                members.setdefault(basename, []).append(info)
+        self._archive = archive
+        self._members = members
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if self._archive is not None:
+            self._archive.close()
+        self._archive = None
+        self._members = {}
+
+    def validate_ciks(self, ciks: list[int]) -> None:
+        """Fail before reference import when a requested CIK member is absent."""
+        for cik in ciks:
+            self._member_for(cik)
+
+    def read(self, cik: int) -> dict[str, Any]:
+        """Return one validated Company Facts payload by reviewed CIK."""
+        archive = self._require_open()
+        info = self._member_for(cik)
+        try:
+            payload = json.loads(archive.read(info))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ValueError(
+                f"Company Facts ZIP member for CIK {cik:010d} is invalid JSON"
+            ) from exc
+        return _validate_companyfacts_payload(payload, cik)
+
+    def _require_open(self) -> ZipFile:
+        if self._archive is None:
+            raise RuntimeError("Company Facts ZIP is not open")
+        return self._archive
+
+    def _member_for(self, cik: int) -> ZipInfo:
+        self._require_open()
+        name = f"CIK{_cik_zero_padded(cik)}.json"
+        matches = self._members.get(name, [])
+        if not matches:
+            raise ValueError(f"Company Facts ZIP has no member for CIK {cik:010d}")
+        if len(matches) != 1:
+            raise ValueError(f"Company Facts ZIP has duplicate members for CIK {cik:010d}")
+        return matches[0]
+
+
+def _validate_companyfacts_payload(payload: Any, cik: int) -> dict[str, Any]:
+    """Reject malformed or cross-issuer Company Facts payloads."""
+    if not isinstance(payload, dict):
+        raise ValueError("Company Facts payload is not an object")
+    try:
+        payload_cik = int(payload["cik"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Company Facts payload has no valid CIK") from exc
+    if payload_cik != cik:
+        raise ValueError(
+            f"Company Facts payload CIK {payload_cik:010d} does not match reviewed CIK {cik:010d}"
+        )
+    if not isinstance(payload.get("facts"), dict):
+        raise ValueError("Company Facts payload has no facts object")
+    return dict(payload)
 
 
 def _filing_dates_by_period(submissions: dict[str, Any]) -> dict[str, date]:
@@ -288,6 +390,7 @@ def extract_fundamentals(
     *,
     issuer_id: str | None = None,
     security_id: str | None = None,
+    facts_payload: dict[str, Any] | None = None,
 ) -> tuple[list[dict], dict[str, Any]]:
     """Full extract: return a list of fundamental row dicts (PIT-tagged).
 
@@ -304,9 +407,13 @@ def extract_fundamentals(
                     shortest-span row within a filing for a given period-end;
                     instant/EPS metrics: equals value).
     """
-    facts = fetch_facts(cik)
+    facts = _validate_companyfacts_payload(
+        fetch_facts(cik) if facts_payload is None else facts_payload,
+        cik,
+    )
     us_gaap = facts.get("facts", {}).get("us-gaap", {})
     rows: list[dict] = []
+    rejected_future_periods = 0
 
     # Fetch submissions for company metadata (name, SIC, exchange) — cached so
     # the single-filing-date path doesn't refetch. Stash on facts for _extract_company_meta.
@@ -343,6 +450,9 @@ def extract_fundamentals(
 
             period_end = date.fromisoformat(end)
             as_of = date.fromisoformat(filed)
+            if period_end > as_of:
+                rejected_future_periods += 1
+                continue
 
             # Fiscal period label.
             if fp == "FY" and fy:
@@ -376,17 +486,33 @@ def extract_fundamentals(
                 }
             )
 
+    meta = _extract_company_meta(facts, ticker)
+    meta["rows_rejected_future_period"] = rejected_future_periods
+    if rejected_future_periods:
+        log.warning(
+            "edgar.future_period_rows_rejected",
+            ticker=ticker,
+            rows=rejected_future_periods,
+        )
     log.info("edgar.fundamentals_extracted", ticker=ticker, rows=len(rows))
-    return rows, _extract_company_meta(facts, ticker)
+    return rows, meta
 
 
-def ingest_issuer(issuer_id: str, *, store: Store | None = None) -> int:
+def ingest_issuer(
+    issuer_id: str,
+    *,
+    store: Store | None = None,
+    facts_payload: dict[str, Any] | None = None,
+) -> int:
     """Fetch SEC facts by reviewed issuer/CIK identity, not a current ticker map."""
     from aios.storage.store import get_store
 
     db = store or get_store()
     started_at = datetime.now()
     run_id = str(uuid4())
+    ingest_source = (
+        "edgar:companyfacts-bulk" if facts_payload is not None else "edgar:issuer-cik-history"
+    )
     try:
         reference = db.issuer_reference(issuer_id)
         if reference is None:
@@ -402,13 +528,19 @@ def ingest_issuer(issuer_id: str, *, store: Store | None = None) -> int:
         security_id = securities[0]["security_id"] if len(securities) == 1 else None
         ticker = str(reference["canonical_ticker"]).upper()
         cik = int(reference["cik"])
-        rows, meta = extract_fundamentals(
-            ticker,
-            cik,
+        extract_kwargs: dict[str, Any] = {
+            "issuer_id": issuer_id,
+            "security_id": security_id,
+        }
+        if facts_payload is not None:
+            extract_kwargs["facts_payload"] = facts_payload
+        rows, meta = extract_fundamentals(ticker, cik, **extract_kwargs)
+        rejected = int(meta.get("rows_rejected_future_period") or 0)
+        inserted, stale_labels_removed = db.refresh_issuer_fundamentals(
+            rows,
             issuer_id=issuer_id,
-            security_id=security_id,
+            canonical_ticker=ticker,
         )
-        inserted = db.upsert_fundamentals(rows)
         db.upsert_securities(
             [
                 {
@@ -425,25 +557,31 @@ def ingest_issuer(issuer_id: str, *, store: Store | None = None) -> int:
         )
         db.record_ingest(
             run_id=run_id,
-            source="edgar:issuer-cik-history",
+            source=ingest_source,
             table_name="fundamentals",
             rows_inserted=inserted,
+            rows_rejected=rejected,
             started_at=started_at,
-            status="success" if inserted else "warning",
-            error=None if inserted else "SEC returned no fundamental rows",
+            status="success" if inserted and not rejected else "warning",
+            error=(
+                f"Rejected {rejected} rows with period_end after filing date"
+                if rejected
+                else (None if inserted else "SEC returned no fundamental rows")
+            ),
         )
         log.info(
             "edgar.ingest_issuer_done",
             issuer_id=issuer_id,
             ticker=ticker,
             rows=inserted,
+            stale_labels_removed=stale_labels_removed,
             run_id=run_id,
         )
         return inserted
     except Exception as exc:
         db.record_ingest(
             run_id=run_id,
-            source="edgar:issuer-cik-history",
+            source=ingest_source,
             table_name="fundamentals",
             started_at=started_at,
             status="failed",
@@ -518,6 +656,7 @@ def ingest_ticker(ticker: str, cik_map: dict[str, int] | None = None) -> int:
             raise ValueError(f"Ticker {ticker_up} not found in SEC ticker map.")
         cik = cik_map[ticker_up]
         rows, meta = extract_fundamentals(ticker_up, cik)
+        rejected = int(meta.get("rows_rejected_future_period") or 0)
         n = store.upsert_fundamentals(rows)
 
         # Upsert the security row WITH metadata (SIC enables sector detection).
@@ -540,9 +679,14 @@ def ingest_ticker(ticker: str, cik_map: dict[str, int] | None = None) -> int:
             source="edgar",
             table_name="fundamentals",
             rows_inserted=n,
+            rows_rejected=rejected,
             started_at=started_at,
-            status="success" if n else "warning",
-            error=None if n else "SEC returned no fundamental rows",
+            status="success" if n and not rejected else "warning",
+            error=(
+                f"Rejected {rejected} rows with period_end after filing date"
+                if rejected
+                else (None if n else "SEC returned no fundamental rows")
+            ),
         )
         log.info("edgar.ingest_ticker_done", ticker=ticker_up, rows=n, run_id=run_id)
         return n

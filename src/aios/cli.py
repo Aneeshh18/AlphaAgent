@@ -12,6 +12,9 @@ Commands
   aios build-security-identities — assign stable IDs to certified intervals
   aios import-security-identities — import audited stable identity assignments
   aios import-reference-identities — import issuer/CIK/provider mappings
+  aios build-reference-batch — certify unchanged-ticker issuer/provider mappings
+  aios build-reference-window-batch — certify per-ticker bounded windows
+  aios ingest-reference-batch — import and ingest one certified identity batch
   aios universe-coverage — audit member-level price and PIT fundamental coverage
   aios macro-regime  — classify the release-aware macro regime for a date
   aios backtest-qv   — validate regime weights against a fixed 60/40 policy
@@ -21,15 +24,21 @@ Commands
   aios audit         — show recent ingest outcomes
   aios validate      — run read-only data quality checks
   aios cleanup-legacy-ebitda — remove known-invalid legacy EBITDA rows
+  aios quarantine-invalid-fundamentals — isolate impossible fiscal-period rows
   aios cleanup-legacy-macro — remove replaced, unversioned macro copies
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
+import platform
+import subprocess
 import sys
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Annotated
+from uuid import uuid4
 
 import duckdb
 import typer
@@ -48,9 +57,7 @@ app = typer.Typer(
 )
 console = Console()
 TICKERS_FILE_ARGUMENT = typer.Argument(..., help="Text file, one ticker per line")
-UNIVERSE_FILE_ARGUMENT = typer.Argument(
-    ..., help="CSV with effective and known membership dates."
-)
+UNIVERSE_FILE_ARGUMENT = typer.Argument(..., help="CSV with effective and known membership dates.")
 SECURITY_IDENTITY_FILE_ARGUMENT = typer.Argument(
     ..., help="Audited security identity assignment CSV."
 )
@@ -250,9 +257,7 @@ def build_universe_membership(
     except (OSError, ValueError) as exc:
         console.print(f"[red]Universe build refused:[/red] {exc}")
         raise typer.Exit(code=1) from exc
-    console.print(
-        f"[green]Universe build done:[/green] {len(rows)} intervals written to {output}."
-    )
+    console.print(f"[green]Universe build done:[/green] {len(rows)} intervals written to {output}.")
     console.print(
         f"Certified window: {coverage_start} through {coverage_end}; "
         "rows close after the certified end date."
@@ -381,6 +386,188 @@ def import_reference_identities(
     )
 
 
+@app.command("build-reference-batch")
+def build_reference_batch(
+    tickers_file: Path = TICKERS_FILE_ARGUMENT,
+    batch_name: Annotated[
+        str,
+        typer.Option("--batch-name", help="Safe file prefix for this reviewed batch."),
+    ] = "reference_batch",
+    start: Annotated[
+        str,
+        typer.Option(help="Certified inclusive start date, YYYY-MM-DD."),
+    ] = "2023-08-01",
+    end: Annotated[
+        str,
+        typer.Option(help="Certified exclusive end date, YYYY-MM-DD."),
+    ] = "2025-01-01",
+    output_dir: Annotated[
+        Path,
+        typer.Option("--output-dir", help="Directory for manifests and review CSV."),
+    ] = Path("data/reference_batches"),
+    universe_id: Annotated[str, typer.Option("--universe-id")] = "sp500",
+    provider: Annotated[str, typer.Option(help="Explicit price provider to certify.")] = (
+        "yfinance"
+    ),
+    verified_date: Annotated[
+        str | None,
+        typer.Option(help="Evidence review date; defaults to today."),
+    ] = None,
+) -> None:
+    """Certify only unchanged, full-window securities from independent sources."""
+    from aios.ingest.reference_batch import (
+        build_stable_reference_batch,
+        load_batch_tickers,
+        write_reference_batch,
+    )
+
+    try:
+        tickers = load_batch_tickers(tickers_file)
+        result = build_stable_reference_batch(
+            tickers,
+            universe_id=universe_id,
+            start=start,
+            end=end,
+            provider=provider,
+            verified_date=verified_date,
+        )
+        paths = write_reference_batch(
+            result,
+            output_dir=output_dir,
+            batch_name=batch_name,
+        )
+    except Exception as exc:
+        console.print(f"[red]Reference batch build refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(
+        f"[green]Reference batch built:[/green] {result['accepted']} accepted, "
+        f"{result['rejected']} rejected."
+    )
+    for label, path in paths.items():
+        console.print(f"  {label}: {path}")
+    if result["rejected"]:
+        for row in result["review_rows"]:
+            if row["review_status"] == "rejected":
+                console.print(f"  [yellow]{row['ticker']}:[/yellow] {row['reason']}")
+        raise typer.Exit(code=1)
+
+
+@app.command("build-reference-window-batch")
+def build_reference_window_batch(
+    windows_file: Annotated[
+        Path,
+        typer.Argument(help="CSV with one ticker,start,end window per row."),
+    ],
+    batch_name: Annotated[
+        str,
+        typer.Option("--batch-name", help="Safe file prefix for this reviewed batch."),
+    ] = "reference_window_batch",
+    output_dir: Annotated[
+        Path,
+        typer.Option("--output-dir", help="Directory for manifests and review CSV."),
+    ] = Path("data/reference_batches"),
+    universe_id: Annotated[str, typer.Option("--universe-id")] = "sp500",
+    provider: Annotated[str, typer.Option(help="Explicit price provider to certify.")] = (
+        "yfinance"
+    ),
+    verified_date: Annotated[
+        str | None,
+        typer.Option(help="Evidence review date; defaults to today."),
+    ] = None,
+) -> None:
+    """Certify strict identities over independently bounded ticker windows."""
+    from aios.ingest.reference_batch import (
+        build_stable_reference_window_batch,
+        load_batch_windows,
+        write_reference_batch,
+    )
+
+    try:
+        windows = load_batch_windows(windows_file)
+        result = build_stable_reference_window_batch(
+            windows,
+            universe_id=universe_id,
+            provider=provider,
+            verified_date=verified_date,
+        )
+        paths = write_reference_batch(
+            result,
+            output_dir=output_dir,
+            batch_name=batch_name,
+        )
+    except Exception as exc:
+        console.print(f"[red]Reference window batch build refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(
+        f"[green]Reference window batch built:[/green] {result['accepted']} accepted, "
+        f"{result['rejected']} rejected."
+    )
+    for label, path in paths.items():
+        console.print(f"  {label}: {path}")
+    if result["rejected"]:
+        for row in result["review_rows"]:
+            if row["review_status"] == "rejected":
+                console.print(f"  [yellow]{row['ticker']}:[/yellow] {row['reason']}")
+        raise typer.Exit(code=1)
+
+
+@app.command("ingest-reference-batch")
+def ingest_reference_batch(
+    issuer_ciks: Annotated[
+        Path,
+        typer.Option("--issuer-ciks", help="Certified issuer/CIK batch CSV."),
+    ],
+    security_issuers: Annotated[
+        Path,
+        typer.Option("--security-issuers", help="Certified security-owner batch CSV."),
+    ],
+    provider_symbols: Annotated[
+        Path,
+        typer.Option("--provider-symbols", help="Certified provider-symbol batch CSV."),
+    ],
+    start: Annotated[str, typer.Option(help="Inclusive ingest start, YYYY-MM-DD.")],
+    end: Annotated[str, typer.Option(help="Exclusive ingest end, YYYY-MM-DD.")],
+    companyfacts_zip: Annotated[
+        Path | None,
+        typer.Option(
+            "--companyfacts-zip",
+            help="Optional local official SEC companyfacts.zip for bulk facts reads.",
+        ),
+    ] = None,
+) -> None:
+    """Atomically import a reviewed batch, then ingest each identity independently."""
+    from aios.ingest.reference_batch import ingest_reviewed_reference_batch
+
+    try:
+        summary = ingest_reviewed_reference_batch(
+            issuer_ciks,
+            security_issuers,
+            provider_symbols,
+            start=start,
+            end=end,
+            companyfacts_zip_path=companyfacts_zip,
+        )
+    except Exception as exc:
+        console.print(f"[red]Reference batch ingest failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    counts = summary["reference_counts"]
+    console.print(
+        "[green]Reference batch ingest done:[/green] "
+        f"{counts['issuers']} issuers, {counts['security_issuers']} owners, "
+        f"{counts['provider_symbols']} provider mappings; "
+        f"{summary['fundamental_rows']} fundamental rows and "
+        f"{summary['price_rows']} price rows."
+    )
+    if companyfacts_zip is not None:
+        console.print(f"  Company Facts source: {summary['companyfacts_source']}")
+    if summary["failures"]:
+        for failure in summary["failures"]:
+            console.print(f"  [red]{failure['kind']} {failure['id']}:[/red] {failure['error']}")
+        raise typer.Exit(code=1)
+
+
 @app.command("universe-coverage")
 def universe_coverage(
     universe_id: Annotated[str, typer.Option("--universe-id")] = "sp500",
@@ -413,11 +600,7 @@ def universe_coverage(
 
     price_count = sum(bool(row["has_price_history"]) for row in rows)
     fundamental_count = sum(bool(row["has_pit_fundamentals"]) for row in rows)
-    complete = [
-        row
-        for row in rows
-        if row["has_price_history"] and row["has_pit_fundamentals"]
-    ]
+    complete = [row for row in rows if row["has_price_history"] and row["has_pit_fundamentals"]]
     missing = [row for row in rows if row not in complete]
     summary = Table(title=f"{universe_id} data coverage on {decision_date}")
     summary.add_column("members", justify="right")
@@ -544,6 +727,32 @@ def backtest_qv(
             help="Benchmark ticker; repeat for multiple benchmarks (e.g. SPY).",
         ),
     ] = None,
+    calendar: str | None = typer.Option(
+        None,
+        "--calendar",
+        help="Ticker whose sessions define quarter ends and all execution dates (e.g. SPY).",
+    ),
+    explain_tickers: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--explain-ticker",
+            help="Show member/eligibility evidence for a ticker; repeat as needed.",
+        ),
+    ] = None,
+    excluded_tickers: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--exclude-ticker",
+            help="Explicitly exclude a ticker from factor eligibility; repeat as needed.",
+        ),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            help="Write a reproducible JSON audit artifact to this path.",
+        ),
+    ] = None,
     initial_capital: float = typer.Option(
         100_000.0,
         min=1.0,
@@ -596,6 +805,8 @@ def backtest_qv(
             universe_id=universe_id,
             allow_current_universe=allow_current_universe,
             benchmark_tickers=benchmarks,
+            calendar_ticker=calendar,
+            excluded_tickers=excluded_tickers,
             initial_capital=initial_capital,
             transaction_costs=TransactionCostPolicy(
                 commission_bps=commission_bps,
@@ -614,8 +825,13 @@ def backtest_qv(
 
     console.rule(f"[bold]QV policy backtest: {start} → {end}[/bold]")
     console.print(
-        f"Universe: {len(result.tickers)} tickers • quarterly • top {top_n} equal-weight • "
+        f"Universe union: {len(result.tickers)} tickers • quarterly • "
+        f"top {top_n} equal-weight • "
         f"comparison periods: {result.comparison_periods}"
+    )
+    console.print(
+        f"Calendar: {result.config.calendar_ticker or 'inferred from stored prices'} • "
+        "execution: carry holdings → rebalance deltas at next session close"
     )
     console.print(
         "Assumptions: "
@@ -640,6 +856,7 @@ def backtest_qv(
     summary.add_column("costs", justify="right")
     summary.add_column("taxes", justify="right")
     summary.add_column("turnover", justify="right")
+    summary.add_column("daily obs", justify="right")
     for name, metrics in (
         ("regime-aware", result.regime_metrics),
         ("baseline 60/40", result.baseline_metrics),
@@ -656,25 +873,82 @@ def backtest_qv(
             f"{metrics.total_transaction_costs:,.2f}",
             f"{metrics.total_taxes:,.2f}",
             f"{metrics.total_turnover:.2f}x",
+            str(metrics.daily_observations),
         )
     console.print(summary)
 
+    coverage_table = Table(title="Decision-level PIT eligibility audit")
+    coverage_table.add_column("decision")
+    coverage_table.add_column("members", justify="right")
+    coverage_table.add_column("raw complete", justify="right")
+    coverage_table.add_column("Q scored", justify="right")
+    coverage_table.add_column("V scored", justify="right")
+    coverage_table.add_column("eligible", justify="right")
+    coverage_table.add_column("regime")
+    coverage_table.add_column("Q/V weights")
+    coverage_table.add_column("status")
+    for period in result.periods:
+        coverage_table.add_row(
+            period.decision_date,
+            str(len(period.member_tickers)),
+            ("N/A" if period.raw_complete_tickers is None else str(period.raw_complete_tickers)),
+            str(period.quality_scored_tickers),
+            str(period.value_scored_tickers),
+            str(period.eligible_tickers),
+            period.regime,
+            f"{period.quality_weight:.0%}/{period.value_weight:.0%}",
+            period.status,
+        )
+    console.print(coverage_table)
+
+    selections = Table(title="Selected holdings by policy")
+    selections.add_column("decision")
+    selections.add_column("regime-aware")
+    selections.add_column("baseline 60/40")
+    for period in result.periods:
+        selections.add_row(
+            period.decision_date,
+            ", ".join(period.regime_selected) or "—",
+            ", ".join(period.baseline_selected) or "—",
+        )
+    console.print(selections)
+
     if result.benchmark_metrics:
         benchmark_table = Table(
-            title="Benchmark total returns (adjusted close; no strategy costs/taxes)"
+            title="Persistent benchmark returns (raw close + actions; no costs/taxes)"
         )
         benchmark_table.add_column("benchmark")
         benchmark_table.add_column("periods", justify="right")
         benchmark_table.add_column("cumulative", justify="right")
         benchmark_table.add_column("annualized", justify="right")
+        benchmark_table.add_column("volatility", justify="right")
+        benchmark_table.add_column("max drawdown", justify="right")
         for ticker, metrics in result.benchmark_metrics.items():
             benchmark_table.add_row(
                 ticker,
                 str(metrics.completed_periods),
                 _pct(metrics.cumulative_return),
                 _pct(metrics.annualized_return),
+                _pct(metrics.annualized_volatility),
+                _pct(metrics.max_drawdown),
             )
         console.print(benchmark_table)
+
+    explanations = _backtest_ticker_explanations(result, explain_tickers or [])
+    if explanations:
+        explain_table = Table(title="Requested ticker evidence")
+        explain_table.add_column("decision")
+        explain_table.add_column("ticker")
+        explain_table.add_column("status")
+        explain_table.add_column("reason/evidence")
+        for item in explanations:
+            explain_table.add_row(
+                item["decision_date"],
+                item["ticker"],
+                item["status"],
+                ", ".join(item["reasons"]) or "eligible factor evidence",
+            )
+        console.print(explain_table)
 
     skipped = [period for period in result.periods if period.status != "complete"]
     if skipped:
@@ -688,6 +962,139 @@ def backtest_qv(
             console.print(f"  … and {len(skipped) - 5} more")
     for warning in result.warnings:
         console.print(f"[yellow]Warning:[/yellow] {warning}")
+    if output is not None:
+        audit_path = _write_backtest_audit(output, result, explanations)
+        console.print(f"[green]Audit artifact:[/green] {audit_path}")
+
+
+def _backtest_ticker_explanations(result, tickers: list[str]) -> list[dict]:
+    """Explain requested tickers without inventing reasons for non-members."""
+    requested = sorted({ticker.strip().upper() for ticker in tickers if ticker.strip()})
+    explanations: list[dict] = []
+    for period in result.periods:
+        audit_by_ticker = {row.ticker: row for row in period.factor_audit}
+        members = set(period.member_tickers)
+        regime_selected = set(period.regime_selected)
+        baseline_selected = set(period.baseline_selected)
+        for ticker in requested:
+            if ticker not in members:
+                status = "not_member"
+                reasons = ["not_in_pit_universe_on_decision_date"]
+            else:
+                audit = audit_by_ticker.get(ticker)
+                if audit is None:
+                    status = "excluded"
+                    reasons = ["factor_row_unavailable"]
+                elif not audit.eligible:
+                    status = "excluded"
+                    reasons = list(audit.reasons)
+                elif ticker in regime_selected or ticker in baseline_selected:
+                    selected_by = []
+                    if ticker in regime_selected:
+                        selected_by.append("regime")
+                    if ticker in baseline_selected:
+                        selected_by.append("baseline")
+                    status = "selected"
+                    reasons = [f"selected_by:{'+'.join(selected_by)}"]
+                else:
+                    status = "eligible_not_selected"
+                    reasons = ["rank_below_top_n"]
+            explanations.append(
+                {
+                    "decision_date": period.decision_date,
+                    "ticker": ticker,
+                    "status": status,
+                    "reasons": reasons,
+                }
+            )
+    return explanations
+
+
+def _write_backtest_audit(output: Path, result, explanations: list[dict]) -> Path:
+    """Atomically write a provenance-rich, secret-free backtest audit."""
+    path = output.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db_path = settings.duckdb_path
+    if not db_path.is_absolute():
+        db_path = settings.project_root / db_path
+    commit = _git_output(["git", "rev-parse", "HEAD"])
+    status = _git_output(["git", "status", "--porcelain"])
+    diff = _git_bytes(["git", "diff", "--binary", "HEAD", "--"])
+    untracked_count, untracked_sha256 = _untracked_tree_fingerprint()
+    payload = {
+        "schema_version": 2,
+        "run_id": str(uuid4()),
+        "generated_at": datetime.now(UTC).isoformat(),
+        "application_version": __version__,
+        "command": list(sys.argv),
+        "runtime": {
+            "python": sys.version,
+            "platform": platform.platform(),
+        },
+        "repository": {
+            "commit": commit or None,
+            "dirty": bool(status),
+            "tracked_diff_sha256": hashlib.sha256(diff).hexdigest(),
+            "untracked_file_count": untracked_count,
+            "untracked_tree_sha256": untracked_sha256,
+        },
+        "database": {
+            "path": str(db_path.resolve()),
+            "sha256": _sha256_file(db_path) if db_path.exists() else None,
+        },
+        "ticker_explanations": explanations,
+        "result": result.to_dict(),
+    }
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
+def _git_output(command: list[str]) -> str:
+    return _git_bytes(command).decode(errors="replace").strip()
+
+
+def _git_bytes(command: list[str]) -> bytes:
+    completed = subprocess.run(
+        command,
+        cwd=settings.project_root,
+        check=False,
+        capture_output=True,
+    )
+    return completed.stdout if completed.returncode == 0 else b""
+
+
+def _untracked_tree_fingerprint() -> tuple[int, str]:
+    paths = [
+        Path(value.decode(errors="surrogateescape"))
+        for value in _git_bytes(["git", "ls-files", "-z", "--others", "--exclude-standard"]).split(
+            b"\0"
+        )
+        if value
+    ]
+    digest = hashlib.sha256()
+    files = 0
+    for relative in sorted(paths, key=lambda path: path.as_posix()):
+        absolute = settings.project_root / relative
+        if not absolute.is_file():
+            continue
+        files += 1
+        digest.update(relative.as_posix().encode())
+        digest.update(b"\0")
+        with absolute.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return files, digest.hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _ingest_one(
@@ -899,6 +1306,16 @@ def cleanup_legacy_ebitda(
     removed = get_store().purge_legacy_ebitda(ticker)
     scope = ticker.upper() if ticker else "all tickers"
     console.print(f"[green]Removed {removed} legacy EBITDA rows for {scope}.[/green]")
+
+
+@app.command("quarantine-invalid-fundamentals")
+def quarantine_invalid_fundamentals() -> None:
+    """Move period_end-after-filing rows into a provenance quarantine table."""
+    moved = get_store().quarantine_invalid_fundamental_periods()
+    console.print(
+        f"[green]Quarantined {moved} impossible fundamental rows; "
+        "the source evidence remains in fundamentals_quarantine.[/green]"
+    )
 
 
 @app.command("cleanup-legacy-macro")

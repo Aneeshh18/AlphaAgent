@@ -1,0 +1,3 @@
+# Exception Batch 06: MMC to MRSH same-security provider alias rejected by Batch 13.
+# Certified identity window: 2023-08-01 through 2025-01-01 (exclusive end).
+MMC

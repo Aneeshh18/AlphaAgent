@@ -1,0 +1,27 @@
+# Batch 02: unchanged full-window tickers with no local coverage at selection.
+# Certified window: 2023-08-01 through 2024-12-31 (end-exclusive 2025-01-01).
+ABBV
+ABT
+ACN
+ADBE
+ADI
+ADM
+ADP
+ADSK
+AEE
+AEP
+AES
+AKAM
+ALB
+ALGN
+ALLE
+AMAT
+AMD
+AME
+AMGN
+AMT
+ANET
+AOS
+APD
+APH
+AWK

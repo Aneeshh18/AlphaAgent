@@ -1,0 +1,4 @@
+security_id,issuer_id,effective_start,effective_end,verified_date,source
+aios:bounded:sp500:anss,aios:issuer:sec:0001013462,2023-08-01,2025-01-01,2026-07-17,https://www.sec.gov/Archives/edgar/data/1013462/000101346224000007/anss-20231231.htm
+aios:bounded:sp500:ctra,aios:issuer:sec:0000858470,2023-08-01,2025-01-01,2026-07-17,https://www.sec.gov/Archives/edgar/data/858470/000085847024000019/cog-20231231.htm
+aios:bounded:sp500:dfs,aios:issuer:sec:0001393612,2023-08-01,2025-01-01,2026-07-17,https://www.sec.gov/Archives/edgar/data/1393612/000139361224000010/dfs-20231231.htm

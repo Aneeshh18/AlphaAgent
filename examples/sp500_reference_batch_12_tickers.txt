@@ -1,0 +1,27 @@
+# Batch 12: next 25 uncovered unchanged full-window S&P 500 securities.
+# Certified identity window: 2023-08-01 through 2025-01-01 (exclusive end).
+KHC
+KIM
+KLAC
+KMB
+KMI
+KMX
+KO
+KR
+L
+LDOS
+LEN
+LH
+LHX
+LIN
+LKQ
+LLY
+LMT
+LNT
+LOW
+LRCX
+LUV
+LVS
+LW
+LYB
+LYV

@@ -1,0 +1,8 @@
+# Previously rejected identities resolved with primary-source manual review.
+ANSS
+BF.B
+BG
+BK
+BLK
+BRK.B
+C

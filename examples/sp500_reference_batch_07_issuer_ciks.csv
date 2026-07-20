@@ -1,0 +1,26 @@
+issuer_id,canonical_name,canonical_ticker,cik,effective_start,effective_end,verified_date,source
+aios:issuer:sec:0000882184,HORTON D R INC /DE/,DHI,0000882184,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000882184.json
+aios:issuer:sec:0000313616,DANAHER CORP /DE/,DHR,0000313616,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000313616.json
+aios:issuer:sec:0001744489,Walt Disney Co,DIS,0001744489,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001744489.json
+aios:issuer:sec:0001297996,"DIGITAL REALTY TRUST, INC.",DLR,0001297996,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001297996.json
+aios:issuer:sec:0000935703,"DOLLAR TREE, INC.",DLTR,0000935703,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000935703.json
+aios:issuer:sec:0000029905,DOVER Corp,DOV,0000029905,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000029905.json
+aios:issuer:sec:0001751788,DOW INC.,DOW,0001751788,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001751788.json
+aios:issuer:sec:0001286681,DOMINOS PIZZA INC,DPZ,0001286681,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001286681.json
+aios:issuer:sec:0000940944,DARDEN RESTAURANTS INC,DRI,0000940944,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000940944.json
+aios:issuer:sec:0000936340,DTE ENERGY CO,DTE,0000936340,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000936340.json
+aios:issuer:sec:0001326160,Duke Energy CORP,DUK,0001326160,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001326160.json
+aios:issuer:sec:0000927066,DAVITA INC.,DVA,0000927066,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000927066.json
+aios:issuer:sec:0001090012,DEVON ENERGY CORP/DE,DVN,0001090012,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001090012.json
+aios:issuer:sec:0001093557,DEXCOM INC,DXCM,0001093557,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001093557.json
+aios:issuer:sec:0000712515,ELECTRONIC ARTS INC.,EA,0000712515,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000712515.json
+aios:issuer:sec:0001065088,EBAY INC,EBAY,0001065088,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001065088.json
+aios:issuer:sec:0000031462,ECOLAB INC.,ECL,0000031462,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000031462.json
+aios:issuer:sec:0001047862,CONSOLIDATED EDISON INC,ED,0001047862,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001047862.json
+aios:issuer:sec:0000033185,EQUIFAX INC,EFX,0000033185,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000033185.json
+aios:issuer:sec:0001095073,"EVEREST GROUP, LTD.",EG,0001095073,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001095073.json
+aios:issuer:sec:0000827052,EDISON INTERNATIONAL,EIX,0000827052,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000827052.json
+aios:issuer:sec:0001001250,ESTEE LAUDER COMPANIES INC,EL,0001001250,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001001250.json
+aios:issuer:sec:0001156039,"Elevance Health, Inc.",ELV,0001156039,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001156039.json
+aios:issuer:sec:0000915389,EASTMAN CHEMICAL CO,EMN,0000915389,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000915389.json
+aios:issuer:sec:0000032604,EMERSON ELECTRIC CO,EMR,0000032604,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000032604.json

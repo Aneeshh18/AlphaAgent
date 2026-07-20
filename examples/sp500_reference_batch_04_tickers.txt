@@ -1,0 +1,27 @@
+# Batch 04: next uncovered unchanged full-window S&P 500 securities.
+# Prior reviewed exception ANSS is excluded; new mismatches must fail closed.
+BEN
+BF.B
+BG
+BIIB
+BK
+BKNG
+BKR
+BLK
+BMY
+BR
+BRK.B
+BRO
+BSX
+BWA
+BXP
+C
+CAG
+CAH
+CARR
+CB
+CBOE
+CBRE
+CCI
+CCL
+CDNS

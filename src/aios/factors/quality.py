@@ -29,11 +29,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date
 
-from structlog import get_logger
-
+from aios.factors import common as fc
 from aios.storage.store import Store, get_store
-
-log = get_logger(__name__)
 
 ASSUMED_TAX_RATE = 0.21  # US federal corporate rate; documented simplification.
 
@@ -66,100 +63,6 @@ class QualitySnapshot:
     _bank_roe: float | None = None
     _bank_equity_ratio: float | None = None
     _bank_net_margin: float | None = None
-
-
-def _metric_value(
-    store: Store, ticker: str, as_of: str, metric: str, use_quarter: bool
-) -> float | None:
-    """Get the latest value of a metric known as_of `as_of`.
-
-    use_quarter=True for flow metrics (we use quarter_value), False for
-    instant/balance metrics (we use the raw value).
-    """
-    rows = store.pit_fundamentals(ticker, as_of, metrics=[metric])
-    if not rows:
-        return None
-    r = rows[0]
-    if use_quarter:
-        return r.get("quarter_value")
-    return r.get("value")
-
-
-def _deduped_history(store: Store, ticker: str, as_of: str, metric: str) -> list[dict]:
-    """Return PIT-deduped history for a metric: latest quarter_value per period_end.
-
-    Dedupes by period_end keeping the most recent as_of_date (latest restatement),
-    all known as-of `as_of`. Sorted ascending by period_end.
-    """
-    return store.fundamental_history(ticker, as_of, metric)
-
-
-def _ttm_sum(store: Store, ticker: str, as_of: str, metric: str) -> float | None:
-    """Trailing-twelve-months value of a flow metric, PIT-correct.
-
-    THE TTM PITFALL (this is why the naive "sum last 4 quarters" is wrong):
-    Companies report both a fiscal-year ANNUAL row AND its constituent quarters.
-    For Apple: FY2024 annual (ends 2024-09-28) = $123B, but Q1+Q2+Q3 of that
-    same year are ALSO stored as separate rows. Summing "last 4 distinct
-    period_ends" → annual + 3 of its own quarters = double-counted (~2x too big).
-
-    CORRECT TTM (standard finance formula):
-      TTM = latest_annual
-            + Σ(quarters AFTER the annual, in the new fiscal year so far)
-            - Σ(matching quarters from the PRIOR fiscal year)
-
-    Example (as of early 2025, after FY2024 annual filed):
-      TTM = FY2024_full_year + Q1_2025 - Q1_2024
-    The "+Q1_2025" rolls the year forward one quarter; "-Q1_2024" drops the
-    matching old quarter so we keep exactly 12 months.
-
-    If no annual is known yet, fall back to summing the latest 4 consecutive
-    quarters (works when only intra-year data exists).
-    """
-    hist = _deduped_history(store, ticker, as_of, metric)
-    if len(hist) < 4:
-        return None
-
-    # Identify the latest ANNUAL period (fiscal_period like 'FY20xx').
-    annual_rows = [r for r in hist if str(r["fiscal_period"]).startswith("FY")]
-    if not annual_rows:
-        # No annual reported yet: sum last 4 quarters (best effort).
-        last4 = hist[-4:]
-        return sum(r["quarter_value"] for r in last4)
-
-    latest_annual = annual_rows[-1]
-    annual_end = latest_annual["period_end"]
-    annual_val = latest_annual["quarter_value"]
-
-    # Quarters strictly AFTER the annual period_end = new fiscal year so far.
-    post_annual = [
-        r
-        for r in hist
-        if r["period_end"] > annual_end and not str(r["fiscal_period"]).startswith("FY")
-    ]
-    # If we have post-annual quarters, we need the matching prior-year ones.
-    if not post_annual:
-        # The annual IS the TTM (no new quarters filed since annual).
-        return annual_val
-
-    # Build the prior-year matching set: quarters ending just before the annual.
-    # The count of prior-year quarters to subtract = len(post_annual).
-    pre_annual_quarters = [
-        r
-        for r in hist
-        if r["period_end"] <= annual_end and not str(r["fiscal_period"]).startswith("FY")
-    ]
-    # Take the last N quarters before/at the annual (N = number of post_annual).
-    n = len(post_annual)
-    matching_prior = pre_annual_quarters[-n:] if len(pre_annual_quarters) >= n else None
-    if matching_prior is None:
-        # Not enough prior-year history to do clean TTM; fall back to annual.
-        return annual_val
-
-    add = sum(r["quarter_value"] for r in post_annual)
-    sub = sum(r["quarter_value"] for r in matching_prior)
-    ttm = annual_val + add - sub
-    return ttm
 
 
 # ----------------------------------------------------------------------
@@ -208,28 +111,32 @@ def _piotroski_f_score(
 
     # --- Profitability (4) ---
     # 1. ROA > 0
-    evaluated += 1
-    if cur_roa is not None and cur_roa > 0:
-        score += 1
+    if cur_roa is not None:
+        evaluated += 1
+        if cur_roa > 0:
+            score += 1
     # 2. CFO > 0
-    evaluated += 1
-    if ttm_cfo is not None and ttm_cfo > 0:
-        score += 1
+    if ttm_cfo is not None:
+        evaluated += 1
+        if ttm_cfo > 0:
+            score += 1
     # 3. Rising ROA
-    evaluated += 1
-    if cur_roa is not None and prior_roa is not None and cur_roa > prior_roa:
-        score += 1
+    if cur_roa is not None and prior_roa is not None:
+        evaluated += 1
+        if cur_roa > prior_roa:
+            score += 1
     # 4. Earnings quality: CFO > Net Income
-    evaluated += 1
-    if ttm_cfo is not None and ttm_net_income is not None and ttm_cfo > ttm_net_income:
-        score += 1
+    if ttm_cfo is not None and ttm_net_income is not None:
+        evaluated += 1
+        if ttm_cfo > ttm_net_income:
+            score += 1
 
     # --- Leverage / Funding (3) — need prior-year balance sheet ---
-    prior_debt = _metric_value(store, ticker, prior_as_of, "debt_total", use_quarter=False)
-    prior_assets = _metric_value(store, ticker, prior_as_of, "total_assets", use_quarter=False)
-    prior_ca = _metric_value(store, ticker, prior_as_of, "current_assets", use_quarter=False)
-    prior_cl = _metric_value(store, ticker, prior_as_of, "current_liabilities", use_quarter=False)
-    prior_shares = _metric_value(store, ticker, prior_as_of, "shares_out", use_quarter=False)
+    prior_debt = fc.metric_value(store, ticker, prior_as_of, "debt_total", False)
+    prior_assets = fc.metric_value(store, ticker, prior_as_of, "total_assets", False)
+    prior_ca = fc.metric_value(store, ticker, prior_as_of, "current_assets", False)
+    prior_cl = fc.metric_value(store, ticker, prior_as_of, "current_liabilities", False)
+    prior_shares = fc.metric_value(store, ticker, prior_as_of, "shares_out", False)
 
     # 5. Lower leverage (debt/assets falling)
     if (
@@ -263,15 +170,15 @@ def _piotroski_f_score(
             score += 1
 
     # --- Efficiency (2) — need prior-year revenue/gross profit ---
-    prior_ttm_revenue = _ttm_sum(store, ticker, prior_as_of, "revenue")
-    prior_ttm_gp = _ttm_sum(store, ticker, prior_as_of, "gross_profit")
+    prior_ttm_revenue = fc.ttm_sum(store, ticker, prior_as_of, "revenue")
+    prior_ttm_gp = fc.ttm_sum(store, ticker, prior_as_of, "gross_profit")
     # 8. Rising gross margin
     if (
-        ttm_gross_profit
-        and ttm_revenue
+        ttm_gross_profit is not None
+        and ttm_revenue is not None
         and ttm_revenue > 0
-        and prior_ttm_gp
-        and prior_ttm_revenue
+        and prior_ttm_gp is not None
+        and prior_ttm_revenue is not None
         and prior_ttm_revenue > 0
     ):
         evaluated += 1
@@ -279,18 +186,18 @@ def _piotroski_f_score(
             score += 1
     # 9. Rising asset turnover (revenue / assets)
     if (
-        ttm_revenue
-        and total_assets
+        ttm_revenue is not None
+        and total_assets is not None
         and total_assets > 0
-        and prior_ttm_revenue
-        and prior_assets
+        and prior_ttm_revenue is not None
+        and prior_assets is not None
         and prior_assets > 0
     ):
         evaluated += 1
         if (ttm_revenue / total_assets) > (prior_ttm_revenue / prior_assets):
             score += 1
 
-    return score, evaluated
+    return (score if evaluated else None), evaluated
 
 
 def _altman_z(
@@ -347,26 +254,25 @@ def compute_quality(
     store = store or get_store()
     as_of = str(as_of)
     snap = QualitySnapshot(ticker=ticker.upper(), as_of=as_of)
+    if fc.is_financials(store, ticker):
+        return compute_quality_financials(ticker, as_of, store, snap)
+
     missing: list[str] = []
 
     # --- TTM flow metrics (sum of last 4 quarters) ---
-    snap.ttm_revenue = _ttm_sum(store, ticker, as_of, "revenue")
-    snap.ttm_operating_income = _ttm_sum(store, ticker, as_of, "operating_income")
-    snap.ttm_cfo = _ttm_sum(store, ticker, as_of, "cfo")
-    snap.ttm_capex = _ttm_sum(store, ticker, as_of, "capex")
-    snap.ttm_gross_profit = _ttm_sum(store, ticker, as_of, "gross_profit")
+    snap.ttm_revenue = fc.ttm_sum(store, ticker, as_of, "revenue")
+    snap.ttm_operating_income = fc.ttm_sum(store, ticker, as_of, "operating_income")
+    snap.ttm_cfo = fc.ttm_sum(store, ticker, as_of, "cfo")
+    snap.ttm_capex = fc.ttm_sum(store, ticker, as_of, "capex")
+    snap.ttm_gross_profit = fc.ttm_sum(store, ticker, as_of, "gross_profit")
 
     # --- Balance-sheet (instant) metrics: latest known ---
-    total_assets = _metric_value(store, ticker, as_of, "total_assets", use_quarter=False)
-    stockholders_equity = _metric_value(
-        store, ticker, as_of, "stockholders_equity", use_quarter=False
-    )
-    debt_total = _metric_value(store, ticker, as_of, "debt_total", use_quarter=False)
-    current_assets = _metric_value(store, ticker, as_of, "current_assets", use_quarter=False)
-    current_liabilities = _metric_value(
-        store, ticker, as_of, "current_liabilities", use_quarter=False
-    )
-    shares_out = _metric_value(store, ticker, as_of, "shares_out", use_quarter=False)
+    total_assets = fc.metric_value(store, ticker, as_of, "total_assets", False)
+    stockholders_equity = fc.metric_value(store, ticker, as_of, "stockholders_equity", False)
+    debt_total = fc.metric_value(store, ticker, as_of, "debt_total", False)
+    current_assets = fc.metric_value(store, ticker, as_of, "current_assets", False)
+    current_liabilities = fc.metric_value(store, ticker, as_of, "current_liabilities", False)
+    shares_out = fc.metric_value(store, ticker, as_of, "shares_out", False)
 
     for name, val in {
         "ttm_revenue": snap.ttm_revenue,
@@ -391,11 +297,9 @@ def compute_quality(
     ):
         ic_now = debt_total + stockholders_equity
         # Prior-year balance sheet for averaging
-        prior_as_of = _shift_year(as_of)
-        prior_debt = _metric_value(store, ticker, prior_as_of, "debt_total", use_quarter=False)
-        prior_equity = _metric_value(
-            store, ticker, prior_as_of, "stockholders_equity", use_quarter=False
-        )
+        prior_as_of = fc.shift_year(as_of)
+        prior_debt = fc.metric_value(store, ticker, prior_as_of, "debt_total", False)
+        prior_equity = fc.metric_value(store, ticker, prior_as_of, "stockholders_equity", False)
         ic_prior = None
         if prior_debt is not None and prior_equity is not None:
             ic_prior = prior_debt + prior_equity
@@ -420,14 +324,16 @@ def compute_quality(
         snap.gross_margin = snap.ttm_gross_profit / snap.ttm_revenue
 
     # --- Piotroski F-Score (full 9 criteria) ---
-    ttm_net_income = _ttm_sum(store, ticker, as_of, "net_income")
-    prior_as_of = _shift_year(as_of)
+    ttm_net_income = fc.ttm_sum(store, ticker, as_of, "net_income")
+    prior_as_of = fc.shift_year(as_of)
     if total_assets and total_assets > 0 and ttm_net_income is not None:
         cur_roa = ttm_net_income / total_assets
-        prior_ni = _ttm_sum(store, ticker, prior_as_of, "net_income")
-        prior_assets = _metric_value(store, ticker, prior_as_of, "total_assets", use_quarter=False)
+        prior_ni = fc.ttm_sum(store, ticker, prior_as_of, "net_income")
+        prior_assets = fc.metric_value(store, ticker, prior_as_of, "total_assets", False)
         prior_roa = (
-            prior_ni / prior_assets if prior_ni and prior_assets and prior_assets > 0 else None
+            prior_ni / prior_assets
+            if prior_ni is not None and prior_assets is not None and prior_assets > 0
+            else None
         )
         snap.piotroski_f, snap.piotroski_evaluated = _piotroski_f_score(
             store,
@@ -449,27 +355,7 @@ def compute_quality(
 
     snap.inputs_complete = len(missing) == 0
     snap.missing = missing
-    log.info(
-        "quality.computed",
-        ticker=ticker,
-        as_of=as_of,
-        roic=snap.roic,
-        fcf_margin=snap.fcf_margin,
-        gross_margin=snap.gross_margin,
-        piotroski=snap.piotroski_f,
-        complete=snap.inputs_complete,
-        missing=missing,
-    )
     return snap
-
-
-def _shift_year(as_of: str) -> str:
-    """Subtract one year from a YYYY-MM-DD date string (rough, for PIT lookback)."""
-    try:
-        y, m, d = as_of.split("-")
-        return f"{int(y) - 1}-{m}-{d}"
-    except Exception:
-        return as_of
 
 
 # ----------------------------------------------------------------------
@@ -495,9 +381,7 @@ def compute_quality_financials(
 
     ROIC is left as None (intentionally) — it's not meaningful for banks.
     """
-    from aios.factors import common as fc
-
-    prior_as_of = _shift_year(as_of)
+    prior_as_of = fc.shift_year(as_of)
     missing: list[str] = []
 
     ttm_net_income = fc.ttm_sum(store, ticker, as_of, "net_income")
@@ -506,29 +390,33 @@ def compute_quality_financials(
     total_assets = fc.metric_value(store, ticker, as_of, "total_assets", False)
 
     snap.ttm_revenue = ttm_revenue
+    for name, value in {
+        "ttm_net_income": ttm_net_income,
+        "ttm_revenue": ttm_revenue,
+        "stockholders_equity": equity,
+        "total_assets": total_assets,
+    }.items():
+        if value is None:
+            missing.append(name)
 
     # ROE — the primary bank profitability metric
     if ttm_net_income is not None and equity and equity > 0:
         snap.roic = None  # explicitly not meaningful for banks
         snap._bank_roe = ttm_net_income / equity  # stashed; composite reads it
-    elif equity is None:
-        missing.append("stockholders_equity")
 
     # Equity ratio (capital strength)
     if equity is not None and total_assets and total_assets > 0:
         snap._bank_equity_ratio = equity / total_assets
-    elif total_assets is None:
-        missing.append("total_assets")
 
     # Net margin
     if ttm_net_income is not None and ttm_revenue and ttm_revenue > 0:
         snap._bank_net_margin = ttm_net_income / ttm_revenue
 
     # FCF margin — still meaningful for banks (operating cash flow matters)
-    ttm_cfo = fc.ttm_sum(store, ticker, as_of, "cfo")
-    ttm_capex = fc.ttm_sum(store, ticker, as_of, "capex")
-    if ttm_cfo is not None and ttm_capex is not None and ttm_revenue and ttm_revenue > 0:
-        snap.fcf_margin = (ttm_cfo - abs(ttm_capex)) / ttm_revenue
+    snap.ttm_cfo = fc.ttm_sum(store, ticker, as_of, "cfo")
+    snap.ttm_capex = fc.ttm_sum(store, ticker, as_of, "capex")
+    if snap.ttm_cfo is not None and snap.ttm_capex is not None and ttm_revenue and ttm_revenue > 0:
+        snap.fcf_margin = (snap.ttm_cfo - abs(snap.ttm_capex)) / ttm_revenue
 
     # Piotroski (profitability subset still applies to banks)
     if total_assets and total_assets > 0 and ttm_net_income is not None:
@@ -536,7 +424,9 @@ def compute_quality_financials(
         prior_ni = fc.ttm_sum(store, ticker, prior_as_of, "net_income")
         prior_assets = fc.metric_value(store, ticker, prior_as_of, "total_assets", False)
         prior_roa = (
-            prior_ni / prior_assets if prior_ni and prior_assets and prior_assets > 0 else None
+            prior_ni / prior_assets
+            if prior_ni is not None and prior_assets is not None and prior_assets > 0
+            else None
         )
         snap.piotroski_f, snap.piotroski_evaluated = _piotroski_f_score(
             store,
@@ -544,7 +434,7 @@ def compute_quality_financials(
             as_of,
             prior_as_of,
             ttm_net_income,
-            ttm_cfo,
+            snap.ttm_cfo,
             None,
             ttm_revenue,
             cur_roa,
@@ -559,13 +449,4 @@ def compute_quality_financials(
     snap.inputs_complete = len(missing) == 0
     snap.missing = missing
     snap._is_financials = True
-    log.info(
-        "quality.computed.financials",
-        ticker=ticker,
-        as_of=as_of,
-        roe=snap._bank_roe,
-        equity_ratio=snap._bank_equity_ratio,
-        net_margin=snap._bank_net_margin,
-        complete=snap.inputs_complete,
-    )
     return snap

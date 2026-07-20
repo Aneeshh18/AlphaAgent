@@ -51,7 +51,7 @@ PROVIDER_SYMBOL_COLUMNS = {
     "verified_date",
     "source",
 }
-ALLOWED_PROVIDERS = {"yfinance", "stooq"}
+ALLOWED_PROVIDERS = {"yfinance", "stooq", "tiingo"}
 ALLOWED_MAPPING_STATUSES = {"verified", "unavailable", "blocked_wrong_security"}
 
 

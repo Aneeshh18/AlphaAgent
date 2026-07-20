@@ -4,6 +4,7 @@ from aios.backtest.costs import TaxPolicy, TransactionCostPolicy
 from aios.backtest.engine import (
     BacktestMetrics,
     BacktestPeriod,
+    EquityCurvePoint,
     QVBacktestConfig,
     QVBacktestResult,
     run_qv_policy_backtest,
@@ -12,6 +13,7 @@ from aios.backtest.engine import (
 __all__ = [
     "BacktestMetrics",
     "BacktestPeriod",
+    "EquityCurvePoint",
     "QVBacktestConfig",
     "QVBacktestResult",
     "TaxPolicy",

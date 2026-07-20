@@ -11,8 +11,9 @@ import pytest
 from tenacity import wait_none
 
 from aios.factors import composite as composite_factor
+from aios.factors import quality as quality_factor
 from aios.factors import value as value_factor
-from aios.factors.common import ttm_sum
+from aios.factors.common import deduped_history, factor_cache_scope, metric_value, ttm_sum
 from aios.factors.policy import BASELINE_FACTOR_WEIGHTS, REGIME_FACTOR_WEIGHTS
 from aios.factors.quality import QualitySnapshot
 from aios.factors.value import ValueSnapshot, compute_value_raw
@@ -62,6 +63,76 @@ def test_pit_fundamentals_selects_only_known_latest_row(tmp_path):
 
         assert before_restatement[0]["value"] == 100
         assert after_restatement[0]["value"] == 110
+    finally:
+        store.close()
+
+
+def test_factor_cache_batches_reads_and_expires_after_decision_scope(monkeypatch, tmp_path):
+    store = Store(tmp_path / "factor-cache.duckdb")
+    try:
+        store.upsert_fundamentals(
+            [
+                _fundamental(
+                    "TEST",
+                    "2023-12-31",
+                    "2024-02-01",
+                    "revenue",
+                    100,
+                    fiscal_period="FY2023",
+                ),
+                _fundamental(
+                    "TEST",
+                    "2023-12-31",
+                    "2024-02-01",
+                    "total_assets",
+                    500,
+                    fiscal_period="FY2023",
+                ),
+            ]
+        )
+        snapshot_calls = 0
+        original_snapshot = store.pit_factor_fundamentals
+
+        def counted_snapshot(ticker, as_of, metrics):
+            nonlocal snapshot_calls
+            snapshot_calls += 1
+            return original_snapshot(ticker, as_of, metrics)
+
+        monkeypatch.setattr(store, "pit_factor_fundamentals", counted_snapshot)
+
+        with factor_cache_scope(store):
+            assert metric_value(store, "TEST", "2024-12-31", "revenue", True) == 100
+            assert metric_value(store, "TEST", "2024-12-31", "total_assets", False) == 500
+            assert deduped_history(store, "TEST", "2024-12-31", "revenue") == [
+                {
+                    "period_end": date(2023, 12, 31),
+                    "fiscal_period": "FY2023",
+                    "quarter_value": 100.0,
+                }
+            ]
+            assert ttm_sum(store, "TEST", "2024-12-31", "revenue") == 100
+            assert snapshot_calls == 1
+
+        # A later filing inserted between decisions must be visible in the next
+        # scope; no cache survives the previous decision.
+        store.upsert_fundamentals(
+            [
+                _fundamental(
+                    "TEST",
+                    "2023-12-31",
+                    "2024-03-01",
+                    "revenue",
+                    110,
+                    fiscal_period="FY2023",
+                )
+            ]
+        )
+        with factor_cache_scope(store):
+            assert metric_value(store, "TEST", "2024-12-31", "revenue", True) == 110
+            assert (
+                deduped_history(store, "TEST", "2024-12-31", "revenue")[0]["quarter_value"] == 110
+            )
+            assert snapshot_calls == 2
     finally:
         store.close()
 
@@ -147,6 +218,50 @@ def test_sec_ticker_override_wins_over_bad_master_map(monkeypatch):
     monkeypatch.setattr(edgar, "get_http", lambda: FakeHttp())
 
     assert edgar.load_ticker_cik_map()["XOM"] == 34088
+
+
+def test_edgar_extract_rejects_fact_filed_before_period_end(monkeypatch):
+    monkeypatch.setattr(
+        edgar,
+        "fetch_submissions",
+        lambda cik: {"name": "Test Corp", "exchanges": ["NYSE"]},
+    )
+    payload = {
+        "cik": 1,
+        "facts": {
+            "us-gaap": {
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            {
+                                "start": "2024-01-01",
+                                "end": "2024-03-31",
+                                "filed": "2024-05-01",
+                                "fp": "Q1",
+                                "fy": 2024,
+                                "accn": "valid",
+                                "val": 100,
+                            },
+                            {
+                                "start": "2024-04-01",
+                                "end": "2024-06-30",
+                                "filed": "2024-05-01",
+                                "fp": "Q2",
+                                "fy": 2024,
+                                "accn": "invalid",
+                                "val": 200,
+                            },
+                        ]
+                    }
+                }
+            }
+        },
+    }
+
+    rows, meta = edgar.extract_fundamentals("TEST", 1, facts_payload=payload)
+
+    assert [row["period_end"] for row in rows] == ["2024-03-31"]
+    assert meta["rows_rejected_future_period"] == 1
 
 
 def test_purge_legacy_ebitda_is_narrow(tmp_path):
@@ -257,6 +372,340 @@ def test_ttm_sum_uses_four_known_quarters(tmp_path):
         store.upsert_fundamentals(rows)
 
         assert ttm_sum(store, "TEST", "2024-12-31", "revenue") == 100
+    finally:
+        store.close()
+
+
+def test_ttm_sum_rolls_fy_forward_with_matching_prior_q1(tmp_path):
+    store = Store(tmp_path / "ttm-fy-q1.duckdb")
+    try:
+        store.upsert_fundamentals(
+            [
+                _fundamental(
+                    "TEST",
+                    "2023-12-30",
+                    "2024-02-01",
+                    "revenue",
+                    10,
+                    fiscal_period="Q1_2024",
+                ),
+                _fundamental(
+                    "TEST",
+                    "2024-03-30",
+                    "2024-05-01",
+                    "revenue",
+                    20,
+                    fiscal_period="Q2_2024",
+                ),
+                _fundamental(
+                    "TEST",
+                    "2024-06-29",
+                    "2024-08-01",
+                    "revenue",
+                    30,
+                    fiscal_period="Q3_2024",
+                ),
+                _fundamental(
+                    "TEST",
+                    "2024-09-28",
+                    "2024-11-01",
+                    "revenue",
+                    100,
+                    fiscal_period="FY2024",
+                ),
+                _fundamental(
+                    "TEST",
+                    "2024-12-28",
+                    "2025-02-01",
+                    "revenue",
+                    15,
+                    fiscal_period="Q1_2025",
+                ),
+            ]
+        )
+
+        assert ttm_sum(store, "TEST", "2025-02-15", "revenue") == 105
+        assert quality_factor.compute_quality("TEST", "2025-02-15", store).ttm_revenue == 105
+    finally:
+        store.close()
+
+
+def test_ttm_sum_rolls_non_calendar_fy_forward_through_q2(tmp_path):
+    store = Store(tmp_path / "ttm-non-calendar-q2.duckdb")
+    try:
+        store.upsert_fundamentals(
+            [
+                _fundamental(
+                    "TEST",
+                    "2023-09-30",
+                    "2023-11-01",
+                    "revenue",
+                    10,
+                    fiscal_period="Q1_2024",
+                ),
+                _fundamental(
+                    "TEST",
+                    "2023-12-30",
+                    "2024-02-01",
+                    "revenue",
+                    20,
+                    fiscal_period="Q2_2024",
+                ),
+                _fundamental(
+                    "TEST",
+                    "2024-03-30",
+                    "2024-05-01",
+                    "revenue",
+                    30,
+                    fiscal_period="Q3_2024",
+                ),
+                _fundamental(
+                    "TEST",
+                    "2024-06-29",
+                    "2024-08-01",
+                    "revenue",
+                    100,
+                    fiscal_period="FY2024",
+                ),
+                _fundamental(
+                    "TEST",
+                    "2024-09-28",
+                    "2024-11-01",
+                    "revenue",
+                    15,
+                    fiscal_period="Q1_2025",
+                ),
+                _fundamental(
+                    "TEST",
+                    "2024-12-28",
+                    "2025-02-01",
+                    "revenue",
+                    25,
+                    fiscal_period="Q2_2025",
+                ),
+            ]
+        )
+
+        assert ttm_sum(store, "TEST", "2025-02-15", "revenue") == 110
+    finally:
+        store.close()
+
+
+def test_ttm_sum_fails_closed_without_exact_prior_quarter_match(tmp_path):
+    store = Store(tmp_path / "ttm-missing-match.duckdb")
+    try:
+        store.upsert_fundamentals(
+            [
+                _fundamental(
+                    "TEST",
+                    "2023-09-30",
+                    "2023-11-01",
+                    "revenue",
+                    10,
+                    fiscal_period="Q1_2024",
+                ),
+                _fundamental(
+                    "TEST",
+                    "2024-03-30",
+                    "2024-05-01",
+                    "revenue",
+                    30,
+                    fiscal_period="Q3_2024",
+                ),
+                _fundamental(
+                    "TEST",
+                    "2024-06-29",
+                    "2024-08-01",
+                    "revenue",
+                    100,
+                    fiscal_period="FY2024",
+                ),
+                _fundamental(
+                    "TEST",
+                    "2024-09-28",
+                    "2024-11-01",
+                    "revenue",
+                    15,
+                    fiscal_period="Q1_2025",
+                ),
+                _fundamental(
+                    "TEST",
+                    "2024-12-28",
+                    "2025-02-01",
+                    "revenue",
+                    25,
+                    fiscal_period="Q2_2025",
+                ),
+            ]
+        )
+
+        assert ttm_sum(store, "TEST", "2025-02-15", "revenue") is None
+    finally:
+        store.close()
+
+
+def test_ttm_sum_without_annual_requires_consecutive_quarters(tmp_path):
+    store = Store(tmp_path / "ttm-quarter-gap.duckdb")
+    try:
+        store.upsert_fundamentals(
+            [
+                _fundamental(
+                    "TEST",
+                    "2023-03-31",
+                    "2024-02-01",
+                    "revenue",
+                    10,
+                    fiscal_period="Q1_2023",
+                ),
+                _fundamental(
+                    "TEST",
+                    "2023-06-30",
+                    "2024-02-01",
+                    "revenue",
+                    20,
+                    fiscal_period="Q2_2023",
+                ),
+                _fundamental(
+                    "TEST",
+                    "2023-12-31",
+                    "2024-02-01",
+                    "revenue",
+                    40,
+                    fiscal_period="Q4_2023",
+                ),
+                _fundamental(
+                    "TEST",
+                    "2024-03-31",
+                    "2024-05-01",
+                    "revenue",
+                    50,
+                    fiscal_period="Q1_2024",
+                ),
+            ]
+        )
+
+        assert ttm_sum(store, "TEST", "2024-12-31", "revenue") is None
+    finally:
+        store.close()
+
+
+def test_compute_quality_routes_sic_financials(monkeypatch, tmp_path):
+    store = Store(tmp_path / "quality-financial-routing.duckdb")
+    try:
+        store.execute("INSERT INTO securities (ticker, sic_code) VALUES ('BANK', '6021')")
+        routed: list[str] = []
+
+        def fake_financial_quality(ticker, as_of, store, snap):
+            routed.append(ticker)
+            snap._is_financials = True
+            return snap
+
+        monkeypatch.setattr(quality_factor, "compute_quality_financials", fake_financial_quality)
+
+        snap = quality_factor.compute_quality("BANK", "2024-12-31", store)
+
+        assert routed == ["BANK"]
+        assert snap._is_financials is True
+    finally:
+        store.close()
+
+
+def test_composite_scores_financials_with_bank_components(monkeypatch, tmp_path):
+    store = Store(tmp_path / "quality-financial-composite.duckdb")
+    try:
+        quality = {
+            "BANKA": QualitySnapshot(
+                ticker="BANKA",
+                as_of="2024-12-31",
+                roic=-1,
+                fcf_margin=-1,
+                gross_margin=-1,
+                piotroski_f=4,
+                piotroski_evaluated=4,
+                _is_financials=True,
+                _bank_roe=0.20,
+                _bank_equity_ratio=0.12,
+                _bank_net_margin=0.30,
+            ),
+            "BANKB": QualitySnapshot(
+                ticker="BANKB",
+                as_of="2024-12-31",
+                roic=1,
+                fcf_margin=1,
+                gross_margin=1,
+                piotroski_f=4,
+                piotroski_evaluated=4,
+                _is_financials=True,
+                _bank_roe=0.10,
+                _bank_equity_ratio=0.06,
+                _bank_net_margin=0.15,
+            ),
+        }
+        monkeypatch.setattr(
+            composite_factor,
+            "compute_quality",
+            lambda ticker, as_of, store: quality[ticker],
+        )
+        monkeypatch.setattr(
+            composite_factor,
+            "compute_value_ranked",
+            lambda tickers, as_of, store: {
+                ticker: ValueSnapshot(
+                    ticker=ticker,
+                    as_of=str(as_of),
+                    value_score=50,
+                    multiples_available=2,
+                )
+                for ticker in tickers
+            },
+        )
+        no_regime = SimpleNamespace(
+            as_of="2024-12-31",
+            is_pit_ready=False,
+            regime="unknown",
+            missing=[],
+        )
+
+        rows = {
+            row.ticker: row
+            for row in composite_factor.compute_composite(
+                ["BANKA", "BANKB"],
+                "2024-12-31",
+                store,
+                regime_snapshot=no_regime,
+            )
+        }
+
+        assert rows["BANKA"].quality_components_available == 4
+        assert rows["BANKB"].quality_components_available == 4
+        assert rows["BANKA"].quality_score > rows["BANKB"].quality_score
+    finally:
+        store.close()
+
+
+def test_piotroski_counts_only_criteria_with_available_inputs(tmp_path):
+    store = Store(tmp_path / "piotroski-evaluated.duckdb")
+    try:
+        score, evaluated = quality_factor._piotroski_f_score(
+            store=store,
+            ticker="TEST",
+            as_of="2024-12-31",
+            prior_as_of="2023-12-31",
+            ttm_net_income=None,
+            ttm_cfo=None,
+            ttm_gross_profit=None,
+            ttm_revenue=None,
+            cur_roa=0.10,
+            prior_roa=None,
+            total_assets=None,
+            debt_total=None,
+            current_assets=None,
+            current_liabilities=None,
+            shares_out=None,
+        )
+
+        assert score == 1
+        assert evaluated == 1
     finally:
         store.close()
 
@@ -490,9 +939,7 @@ def test_macro_ingest_continues_after_one_series_fails(monkeypatch, tmp_path):
             fred_ingest.ingest_macro(["BAD", "GOOD"])
 
         assert calls == ["BAD", "GOOD"]
-        assert store.query(
-            "SELECT COUNT(*) AS n FROM macro WHERE series_id = 'GOOD'"
-        )[0]["n"] == 1
+        assert store.query("SELECT COUNT(*) AS n FROM macro WHERE series_id = 'GOOD'")[0]["n"] == 1
         run = store.ingest_history(1)[0]
         assert run["status"] == "failed"
         assert run["rows_inserted"] == 1
@@ -559,9 +1006,10 @@ def test_old_macro_schema_is_migrated_and_excluded_from_pit(tmp_path):
         columns = {row["column_name"] for row in store.query("DESCRIBE macro")}
         assert "release_date" in columns
         assert store.query("SELECT COUNT(*) AS n FROM macro_legacy")[0]["n"] == 1
-        assert store.query(
-            "SELECT source, release_date FROM macro WHERE series_id = 'GDP'"
-        )[0] == {"source": "legacy_unversioned", "release_date": None}
+        assert store.query("SELECT source, release_date FROM macro WHERE series_id = 'GDP'")[0] == {
+            "source": "legacy_unversioned",
+            "release_date": None,
+        }
         report = {row["check"]: row for row in store.data_quality_report()}
         assert report["macro_unversioned_rows"]["status"] == "fail"
         assert store.pit_macro_history("GDP", "2020-12-31") == []
@@ -575,9 +1023,9 @@ def test_old_macro_schema_is_migrated_and_excluded_from_pit(tmp_path):
         store.close()
 
         store = Store(db_path)
-        assert store.query(
-            "SELECT COUNT(*) AS n FROM macro WHERE release_date IS NULL"
-        )[0]["n"] == 0
+        assert (
+            store.query("SELECT COUNT(*) AS n FROM macro WHERE release_date IS NULL")[0]["n"] == 0
+        )
         assert store.query("SELECT COUNT(*) AS n FROM macro_legacy")[0]["n"] == 1
         reopened_report = {row["check"]: row for row in store.data_quality_report()}
         assert reopened_report["macro_unversioned_rows"]["status"] == "ok"

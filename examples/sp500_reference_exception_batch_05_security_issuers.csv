@@ -1,0 +1,4 @@
+security_id,issuer_id,effective_start,effective_end,verified_date,source
+aios:bounded:sp500:ipg,aios:issuer:sec:0000051644,2023-08-01,2025-01-01,2026-07-17,https://www.sec.gov/Archives/edgar/data/51644/000005164424000013/ipg-20231231.htm
+aios:bounded:sp500:jnpr,aios:issuer:sec:0001043604,2023-08-01,2025-01-01,2026-07-17,https://www.sec.gov/Archives/edgar/data/1043604/000104360424000014/jnpr-20231231.htm
+aios:bounded:sp500:k,aios:issuer:sec:0000055067,2023-08-01,2025-01-01,2026-07-17,https://www.sec.gov/Archives/edgar/data/55067/000162828024005583/k-20231230.htm

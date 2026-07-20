@@ -1,0 +1,27 @@
+# Batch 16: next unchanged full-window securities without continuous reviewed owners.
+# Certified identity window: 2023-08-01 through 2025-01-01 (exclusive end).
+PGR
+PH
+PHM
+PKG
+PLD
+PM
+PNC
+PNR
+PNW
+PODD
+POOL
+PPG
+PPL
+PRU
+PSA
+PSX
+PTC
+PWR
+PYPL
+QCOM
+RCL
+REG
+REGN
+RF
+RJF

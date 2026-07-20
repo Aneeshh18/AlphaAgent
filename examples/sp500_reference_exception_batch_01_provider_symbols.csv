@@ -1,0 +1,9 @@
+provider,provider_symbol,security_id,data_start,data_end,mapping_status,verified_date,source
+yfinance,ANSS,aios:bounded:sp500:anss,2023-08-01,2025-01-01,unavailable,2026-07-17,https://query1.finance.yahoo.com/v8/finance/chart/ANSS
+stooq,ANSS,aios:bounded:sp500:anss,2023-08-01,2025-01-01,unavailable,2026-07-17,https://stooq.com/q/d/l/?s=anss&i=d
+yfinance,BF-B,aios:bounded:sp500:bf.b,2023-08-01,2025-01-01,verified,2026-07-17,https://query1.finance.yahoo.com/v8/finance/chart/BF-B
+yfinance,BG,aios:bounded:sp500:bg,2023-08-01,2025-01-01,verified,2026-07-17,https://query1.finance.yahoo.com/v8/finance/chart/BG
+yfinance,BNY,aios:bounded:sp500:bk,2023-08-01,2025-01-01,verified,2026-07-17,https://query1.finance.yahoo.com/v8/finance/chart/BNY
+yfinance,BLK,aios:bounded:sp500:blk,2023-08-01,2025-01-01,verified,2026-07-17,https://query1.finance.yahoo.com/v8/finance/chart/BLK
+yfinance,BRK-B,aios:bounded:sp500:brk.b,2023-08-01,2025-01-01,verified,2026-07-17,https://query1.finance.yahoo.com/v8/finance/chart/BRK-B
+yfinance,C,aios:bounded:sp500:c,2023-08-01,2025-01-01,verified,2026-07-17,https://query1.finance.yahoo.com/v8/finance/chart/C

@@ -1,0 +1,5 @@
+# Exception Batch 02: retired tickers with primary identity evidence and Tiingo history.
+# Certified identity/provider window: 2023-08-01 through 2025-01-01 (exclusive).
+ANSS
+CTRA
+DFS

@@ -1,0 +1,3 @@
+# Exception Batch 03: Fiserv's retired FI window with official identity evidence.
+# Certified identity/provider window: 2023-08-01 through 2025-01-01 (exclusive).
+FI

@@ -1,0 +1,26 @@
+issuer_id,canonical_name,canonical_ticker,cik,effective_start,effective_end,verified_date,source
+aios:issuer:sec:0001637459,Kraft Heinz Co,KHC,0001637459,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001637459.json
+aios:issuer:sec:0000879101,KIMCO REALTY CORP,KIM,0000879101,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000879101.json
+aios:issuer:sec:0000319201,KLA CORP,KLAC,0000319201,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000319201.json
+aios:issuer:sec:0000055785,KIMBERLY CLARK CORP,KMB,0000055785,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000055785.json
+aios:issuer:sec:0001506307,"KINDER MORGAN, INC.",KMI,0001506307,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001506307.json
+aios:issuer:sec:0001170010,CARMAX INC,KMX,0001170010,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001170010.json
+aios:issuer:sec:0000021344,COCA COLA CO,KO,0000021344,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000021344.json
+aios:issuer:sec:0000056873,KROGER CO,KR,0000056873,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000056873.json
+aios:issuer:sec:0000060086,LOEWS CORP,L,0000060086,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000060086.json
+aios:issuer:sec:0001336920,"Leidos Holdings, Inc.",LDOS,0001336920,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001336920.json
+aios:issuer:sec:0000920760,LENNAR CORP /NEW/,LEN,0000920760,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000920760.json
+aios:issuer:sec:0000920148,LABCORP HOLDINGS INC.,LH,0000920148,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000920148.json
+aios:issuer:sec:0000202058,"L3HARRIS TECHNOLOGIES, INC. /DE/",LHX,0000202058,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000202058.json
+aios:issuer:sec:0001707925,LINDE PLC,LIN,0001707925,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001707925.json
+aios:issuer:sec:0001065696,LKQ CORP,LKQ,0001065696,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001065696.json
+aios:issuer:sec:0000059478,ELI LILLY & Co,LLY,0000059478,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000059478.json
+aios:issuer:sec:0000936468,LOCKHEED MARTIN CORP,LMT,0000936468,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000936468.json
+aios:issuer:sec:0000352541,ALLIANT ENERGY CORP,LNT,0000352541,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000352541.json
+aios:issuer:sec:0000060667,LOWES COMPANIES INC,LOW,0000060667,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000060667.json
+aios:issuer:sec:0000707549,LAM RESEARCH CORP,LRCX,0000707549,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000707549.json
+aios:issuer:sec:0000092380,SOUTHWEST AIRLINES CO,LUV,0000092380,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000092380.json
+aios:issuer:sec:0001300514,LAS VEGAS SANDS CORP,LVS,0001300514,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001300514.json
+aios:issuer:sec:0001679273,"Lamb Weston Holdings, Inc.",LW,0001679273,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001679273.json
+aios:issuer:sec:0001489393,LyondellBasell Industries N.V.,LYB,0001489393,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001489393.json
+aios:issuer:sec:0001335258,"Live Nation Entertainment, Inc.",LYV,0001335258,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001335258.json

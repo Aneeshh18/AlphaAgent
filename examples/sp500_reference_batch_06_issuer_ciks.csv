@@ -1,0 +1,24 @@
+issuer_id,canonical_name,canonical_ticker,cik,effective_start,effective_end,verified_date,source
+aios:issuer:sec:0000711404,"COOPER COMPANIES, INC.",COO,0000711404,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000711404.json
+aios:issuer:sec:0001163165,CONOCOPHILLIPS,COP,0001163165,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001163165.json
+aios:issuer:sec:0000909832,COSTCO WHOLESALE CORP /NEW,COST,0000909832,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000909832.json
+aios:issuer:sec:0000016732,CAMPBELL'S Co,CPB,0000016732,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000016732.json
+aios:issuer:sec:0000900075,COPART INC,CPRT,0000900075,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000900075.json
+aios:issuer:sec:0000906345,CAMDEN PROPERTY TRUST,CPT,0000906345,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000906345.json
+aios:issuer:sec:0001100682,"CHARLES RIVER LABORATORIES INTERNATIONAL, INC.",CRL,0001100682,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001100682.json
+aios:issuer:sec:0001108524,"Salesforce, Inc.",CRM,0001108524,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001108524.json
+aios:issuer:sec:0000858877,"CISCO SYSTEMS, INC.",CSCO,0000858877,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000858877.json
+aios:issuer:sec:0001057352,"COSTAR GROUP, INC.",CSGP,0001057352,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001057352.json
+aios:issuer:sec:0000277948,CSX CORP,CSX,0000277948,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000277948.json
+aios:issuer:sec:0000723254,CINTAS CORP,CTAS,0000723254,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000723254.json
+aios:issuer:sec:0001058290,COGNIZANT TECHNOLOGY SOLUTIONS CORP,CTSH,0001058290,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001058290.json
+aios:issuer:sec:0001755672,"Corteva, Inc.",CTVA,0001755672,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001755672.json
+aios:issuer:sec:0000064803,CVS HEALTH Corp,CVS,0000064803,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000064803.json
+aios:issuer:sec:0000093410,CHEVRON CORP,CVX,0000093410,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000093410.json
+aios:issuer:sec:0001590895,"Caesars Entertainment, Inc.",CZR,0001590895,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001590895.json
+aios:issuer:sec:0000715957,"DOMINION ENERGY, INC",D,0000715957,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000715957.json
+aios:issuer:sec:0000027904,"DELTA AIR LINES, INC.",DAL,0000027904,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000027904.json
+aios:issuer:sec:0001666700,"DuPont de Nemours, Inc.",DD,0001666700,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001666700.json
+aios:issuer:sec:0000315189,DEERE & CO,DE,0000315189,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000315189.json
+aios:issuer:sec:0000029534,DOLLAR GENERAL CORP,DG,0000029534,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000029534.json
+aios:issuer:sec:0001022079,QUEST DIAGNOSTICS INC,DGX,0001022079,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001022079.json

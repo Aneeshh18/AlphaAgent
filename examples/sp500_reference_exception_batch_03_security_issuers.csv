@@ -1,0 +1,2 @@
+security_id,issuer_id,effective_start,effective_end,verified_date,source
+aios:bounded:sp500:fi,aios:issuer:sec:0000798354,2023-08-01,2025-01-01,2026-07-17,https://www.sec.gov/Archives/edgar/data/798354/000079835424000037/fi-20231231.htm

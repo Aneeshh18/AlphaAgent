@@ -1,0 +1,27 @@
+# Batch 06: next 25 uncovered unchanged full-window S&P 500 securities.
+# Certified identity window: 2023-08-01 through 2025-01-01 (exclusive end).
+COO
+COP
+COST
+CPB
+CPRT
+CPT
+CRL
+CRM
+CSCO
+CSGP
+CSX
+CTAS
+CTRA
+CTSH
+CTVA
+CVS
+CVX
+CZR
+D
+DAL
+DD
+DE
+DFS
+DG
+DGX

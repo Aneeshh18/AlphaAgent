@@ -1,0 +1,10 @@
+security_id,issuer_id,effective_start,effective_end,verified_date,source
+aios:bounded:sp500:anss,aios:issuer:sec:0001013462,2023-08-01,2025-01-01,2026-07-17,https://www.sec.gov/Archives/edgar/data/1013462/000101346224000007/anss-20231231.htm
+aios:bounded:sp500:bf.b,aios:issuer:sec:0000014693,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000014693.json
+aios:bounded:sp500:bg,aios:issuer:sec:0001144519,2023-08-01,2023-11-01,2026-07-17,https://www.sec.gov/Archives/edgar/data/1144519/000110465923113122/tm2329110d1_8k.htm
+aios:bounded:sp500:bg,aios:issuer:sec:0001996862,2023-11-01,2025-01-01,2026-07-17,https://www.sec.gov/Archives/edgar/data/1144519/000110465923113122/tm2329110d1_8k.htm
+aios:bounded:sp500:bk,aios:issuer:sec:0001390777,2023-08-01,2025-01-01,2026-07-17,https://www.sec.gov/Archives/edgar/data/1390777/000139077724000051/bk-20231231.htm
+aios:bounded:sp500:blk,aios:issuer:sec:0001364742,2023-08-01,2024-10-01,2026-07-17,https://www.sec.gov/Archives/edgar/data/1364742/000119312524229654/d856279d8k.htm
+aios:bounded:sp500:blk,aios:issuer:sec:0002012383,2024-10-01,2025-01-01,2026-07-17,https://www.sec.gov/Archives/edgar/data/1364742/000119312524229654/d856279d8k.htm
+aios:bounded:sp500:brk.b,aios:issuer:sec:0001067983,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001067983.json
+aios:bounded:sp500:c,aios:issuer:sec:0000831001,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000831001.json

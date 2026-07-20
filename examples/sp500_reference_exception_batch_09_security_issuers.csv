@@ -1,0 +1,7 @@
+security_id,issuer_id,effective_start,effective_end,verified_date,source
+aios:bounded:sp500:atvi,aios:issuer:sec:0000718877,2023-08-01,2023-10-18,2026-07-18,https://www.sec.gov/Archives/edgar/data/718877/000162828023004842/atvi-20221231.htm
+aios:bounded:sp500:cma,aios:issuer:sec:0000028412,2023-08-01,2024-06-24,2026-07-18,https://www.sec.gov/Archives/edgar/data/28412/000002841224000185/cma-20231231.htm
+aios:bounded:sp500:ctlt,aios:issuer:sec:0001596783,2023-08-01,2024-12-23,2026-07-18,https://www.sec.gov/Archives/edgar/data/1596783/000159678323000185/ctlt-20230630.htm
+aios:bounded:sp500:mro,aios:issuer:sec:0000101778,2023-08-01,2024-11-26,2026-07-18,https://www.sec.gov/Archives/edgar/data/101778/000010177824000023/mro-20231231.htm
+aios:bounded:sp500:pxd,aios:issuer:sec:0001038357,2023-08-01,2024-05-08,2026-07-18,https://www.sec.gov/Archives/edgar/data/1038357/000103835724000020/pxd-20231231.htm
+aios:bounded:sp500:see,aios:issuer:sec:0001012100,2023-08-01,2023-12-18,2026-07-18,https://www.sec.gov/Archives/edgar/data/1012100/000162828024007271/see-20231231.htm

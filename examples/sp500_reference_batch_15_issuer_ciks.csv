@@ -1,0 +1,24 @@
+issuer_id,canonical_name,canonical_ticker,cik,effective_start,effective_end,verified_date,source
+aios:issuer:sec:0001045810,NVIDIA CORP,NVDA,0001045810,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001045810.json
+aios:issuer:sec:0000906163,NVR INC,NVR,0000906163,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000906163.json
+aios:issuer:sec:0001564708,NEWS CORP,NWSA,0001564708,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001564708.json
+aios:issuer:sec:0001413447,NXP Semiconductors N.V.,NXPI,0001413447,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001413447.json
+aios:issuer:sec:0000726728,REALTY INCOME CORP,O,0000726728,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000726728.json
+aios:issuer:sec:0000878927,"OLD DOMINION FREIGHT LINE, INC.",ODFL,0000878927,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000878927.json
+aios:issuer:sec:0001039684,ONEOK INC /NEW/,OKE,0001039684,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001039684.json
+aios:issuer:sec:0000029989,OMNICOM GROUP INC.,OMC,0000029989,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000029989.json
+aios:issuer:sec:0001097864,ON SEMICONDUCTOR CORP,ON,0001097864,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001097864.json
+aios:issuer:sec:0001341439,ORACLE CORP,ORCL,0001341439,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001341439.json
+aios:issuer:sec:0000898173,O REILLY AUTOMOTIVE INC,ORLY,0000898173,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000898173.json
+aios:issuer:sec:0001781335,Otis Worldwide Corp,OTIS,0001781335,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001781335.json
+aios:issuer:sec:0000797468,OCCIDENTAL PETROLEUM CORP /DE/,OXY,0000797468,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000797468.json
+aios:issuer:sec:0001327567,Palo Alto Networks Inc,PANW,0001327567,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001327567.json
+aios:issuer:sec:0001590955,"Paycom Software, Inc.",PAYC,0001590955,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001590955.json
+aios:issuer:sec:0000723531,PAYCHEX INC,PAYX,0000723531,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000723531.json
+aios:issuer:sec:0000075362,PACCAR INC,PCAR,0000075362,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000075362.json
+aios:issuer:sec:0001004980,PG&E Corp,PCG,0001004980,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001004980.json
+aios:issuer:sec:0000788784,PUBLIC SERVICE ENTERPRISE GROUP INC,PEG,0000788784,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000788784.json
+aios:issuer:sec:0000077476,PEPSICO INC,PEP,0000077476,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000077476.json
+aios:issuer:sec:0000078003,PFIZER INC,PFE,0000078003,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000078003.json
+aios:issuer:sec:0001126328,PRINCIPAL FINANCIAL GROUP INC,PFG,0001126328,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001126328.json
+aios:issuer:sec:0000080424,PROCTER & GAMBLE Co,PG,0000080424,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000080424.json

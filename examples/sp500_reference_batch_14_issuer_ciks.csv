@@ -1,0 +1,26 @@
+issuer_id,canonical_name,canonical_ticker,cik,effective_start,effective_end,verified_date,source
+aios:issuer:sec:0000310158,"Merck & Co., Inc.",MRK,0000310158,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000310158.json
+aios:issuer:sec:0001682852,"Moderna, Inc.",MRNA,0001682852,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001682852.json
+aios:issuer:sec:0000895421,MORGAN STANLEY,MS,0000895421,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000895421.json
+aios:issuer:sec:0001408198,MSCI Inc.,MSCI,0001408198,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001408198.json
+aios:issuer:sec:0000789019,MICROSOFT CORP,MSFT,0000789019,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000789019.json
+aios:issuer:sec:0000068505,"Motorola Solutions, Inc.",MSI,0000068505,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000068505.json
+aios:issuer:sec:0000036270,M&T BANK CORP,MTB,0000036270,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000036270.json
+aios:issuer:sec:0000891103,"Match Group, Inc.",MTCH,0000891103,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000891103.json
+aios:issuer:sec:0001037646,METTLER TOLEDO INTERNATIONAL INC/,MTD,0001037646,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001037646.json
+aios:issuer:sec:0000723125,MICRON TECHNOLOGY INC,MU,0000723125,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000723125.json
+aios:issuer:sec:0001513761,Norwegian Cruise Line Holdings Ltd.,NCLH,0001513761,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001513761.json
+aios:issuer:sec:0001120193,"NASDAQ, INC.",NDAQ,0001120193,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001120193.json
+aios:issuer:sec:0000072331,NORDSON CORP,NDSN,0000072331,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000072331.json
+aios:issuer:sec:0000753308,NEXTERA ENERGY INC,NEE,0000753308,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000753308.json
+aios:issuer:sec:0001164727,NEWMONT Corp /DE/,NEM,0001164727,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001164727.json
+aios:issuer:sec:0001065280,NETFLIX INC,NFLX,0001065280,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001065280.json
+aios:issuer:sec:0001111711,NISOURCE INC.,NI,0001111711,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001111711.json
+aios:issuer:sec:0000320187,"NIKE, Inc.",NKE,0000320187,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000320187.json
+aios:issuer:sec:0001133421,NORTHROP GRUMMAN CORP /DE/,NOC,0001133421,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001133421.json
+aios:issuer:sec:0001373715,"ServiceNow, Inc.",NOW,0001373715,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001373715.json
+aios:issuer:sec:0001013871,"NRG ENERGY, INC.",NRG,0001013871,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001013871.json
+aios:issuer:sec:0000702165,NORFOLK SOUTHERN CORP,NSC,0000702165,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000702165.json
+aios:issuer:sec:0001002047,"NetApp, Inc.",NTAP,0001002047,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001002047.json
+aios:issuer:sec:0000073124,NORTHERN TRUST CORP,NTRS,0000073124,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000073124.json
+aios:issuer:sec:0000073309,NUCOR CORP,NUE,0000073309,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000073309.json

@@ -1,0 +1,24 @@
+issuer_id,canonical_name,canonical_ticker,cik,effective_start,effective_end,verified_date,source
+aios:issuer:sec:0000886982,GOLDMAN SACHS GROUP INC,GS,0000886982,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000886982.json
+aios:issuer:sec:0000277135,"W.W. GRAINGER, INC.",GWW,0000277135,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000277135.json
+aios:issuer:sec:0000045012,HALLIBURTON CO,HAL,0000045012,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000045012.json
+aios:issuer:sec:0000046080,"HASBRO, INC.",HAS,0000046080,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000046080.json
+aios:issuer:sec:0000049196,HUNTINGTON BANCSHARES INC /MD/,HBAN,0000049196,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000049196.json
+aios:issuer:sec:0000860730,"HCA Healthcare, Inc.",HCA,0000860730,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000860730.json
+aios:issuer:sec:0000354950,"HOME DEPOT, INC.",HD,0000354950,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000354950.json
+aios:issuer:sec:0000874766,"HARTFORD INSURANCE GROUP, INC.",HIG,0000874766,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000874766.json
+aios:issuer:sec:0001501585,"HUNTINGTON INGALLS INDUSTRIES, INC.",HII,0001501585,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001501585.json
+aios:issuer:sec:0001585689,Hilton Worldwide Holdings Inc.,HLT,0001585689,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001585689.json
+aios:issuer:sec:0000773840,HONEYWELL INTERNATIONAL INC,HON,0000773840,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000773840.json
+aios:issuer:sec:0001645590,Hewlett Packard Enterprise Co,HPE,0001645590,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001645590.json
+aios:issuer:sec:0000047217,HP INC,HPQ,0000047217,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000047217.json
+aios:issuer:sec:0000048465,HORMEL FOODS CORP /DE/,HRL,0000048465,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000048465.json
+aios:issuer:sec:0001000228,HENRY SCHEIN INC,HSIC,0001000228,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001000228.json
+aios:issuer:sec:0001070750,"HOST HOTELS & RESORTS, INC.",HST,0001070750,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001070750.json
+aios:issuer:sec:0000047111,HERSHEY CO,HSY,0000047111,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000047111.json
+aios:issuer:sec:0000049071,HUMANA INC,HUM,0000049071,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000049071.json
+aios:issuer:sec:0000004281,Howmet Aerospace Inc.,HWM,0000004281,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000004281.json
+aios:issuer:sec:0000051143,INTERNATIONAL BUSINESS MACHINES CORP,IBM,0000051143,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000051143.json
+aios:issuer:sec:0001571949,"Intercontinental Exchange, Inc.",ICE,0001571949,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001571949.json
+aios:issuer:sec:0000874716,IDEXX LABORATORIES INC /DE,IDXX,0000874716,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000874716.json
+aios:issuer:sec:0000832101,IDEX CORP /DE/,IEX,0000832101,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000832101.json

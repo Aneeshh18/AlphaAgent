@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
+from time import perf_counter
 
 from structlog import get_logger
 
@@ -118,34 +119,63 @@ def compute_composite(
     )
     macro_regime = snapshot.regime if regime_pit_ready else "unknown"
 
-    # 1. Value (universe-relative percentile ranks)
-    value_snaps = compute_value_ranked(tickers, as_of, store)
+    # Quality and Value intentionally share one immutable decision-scoped
+    # fundamental snapshot. The scope is discarded before this function
+    # returns, so a later decision or post-ingest call can never reuse stale
+    # rows. Public factor function signatures remain unchanged.
+    factor_started = perf_counter()
+    with fc.factor_cache_scope(store, tickers) as factor_cache:
+        # 1. Value (universe-relative percentile ranks)
+        value_snaps = compute_value_ranked(tickers, as_of, store)
 
-    # 2. Quality per ticker + universe-relative rank
-    q_snaps = {}
-    for t in tickers:
-        try:
-            q_snaps[t.upper()] = compute_quality(t, as_of, store)
-        except Exception as e:
-            log.error("composite.quality_failed", ticker=t, error=str(e))
+        # 2. Quality per ticker + universe-relative rank
+        q_snaps = {}
+        for t in tickers:
+            try:
+                q_snaps[t.upper()] = compute_quality(t, as_of, store)
+            except Exception as e:
+                log.error("composite.quality_failed", ticker=t, error=str(e))
 
-    # 3. Quality composite score (0-100) — blend of ROIC, FCF margin, gross margin,
-    #    Piotroski. We rank each within the universe then average the percentiles.
+    # 3. Quality composite score (0-100). Industrial companies use ROIC, FCF
+    #    margin, and gross margin. SIC-routed financials use ROE, equity ratio,
+    #    and net margin because industrial capital and margin formulas are not
+    #    meaningful for deposit-funded businesses. Piotroski is normalized by
+    #    the number of criteria actually evaluated before percentile ranking.
     def _quality_components(s):
+        piotroski = (
+            s.piotroski_f / s.piotroski_evaluated
+            if s.piotroski_f is not None and s.piotroski_evaluated
+            else None
+        )
+        if s._is_financials:
+            return {
+                "bank_roe": s._bank_roe,
+                "bank_equity_ratio": s._bank_equity_ratio,
+                "bank_net_margin": s._bank_net_margin,
+                "piotroski": piotroski,
+            }
         return {
             "roic": s.roic,
             "fcf_margin": s.fcf_margin,
             "gross_margin": s.gross_margin,
-            "piotroski": float(s.piotroski_f) if s.piotroski_f is not None else None,
+            "piotroski": piotroski,
         }
 
-    comp_names = ["roic", "fcf_margin", "gross_margin", "piotroski"]
+    comp_names = [
+        "roic",
+        "fcf_margin",
+        "gross_margin",
+        "bank_roe",
+        "bank_equity_ratio",
+        "bank_net_margin",
+        "piotroski",
+    ]
     # Build peer lists for percentile ranking
     peer_lists = {c: [] for c in comp_names}
     for s in q_snaps.values():
         comps = _quality_components(s)
         for c in comp_names:
-            v = comps[c]
+            v = comps.get(c)
             if v is not None:
                 peer_lists[c].append(v)
 
@@ -155,7 +185,7 @@ def compute_composite(
         comps = _quality_components(s)
         pcts = []
         for c in comp_names:
-            v = comps[c]
+            v = comps.get(c)
             if v is None or not peer_lists[c]:
                 continue
             pcts.append(fc.percentile_rank(v, peer_lists[c]) or 0.0)
@@ -228,6 +258,8 @@ def compute_composite(
         "composite.computed",
         as_of=as_of,
         universe=len(rows),
+        elapsed_seconds=round(perf_counter() - factor_started, 3),
+        fundamental_snapshots=factor_cache.fundamental_snapshot_count,
         macro_regime=macro_regime,
         quality_weight=weights.quality,
         value_weight=weights.value,

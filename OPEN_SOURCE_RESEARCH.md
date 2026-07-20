@@ -1,6 +1,6 @@
 # Open-source research evaluation
 
-Last reviewed: 2026-07-16. This file records whether externally suggested
+Last reviewed: 2026-07-17. This file records whether externally suggested
 projects actually fit AIOS. A popular repository or plausible code sample is
 not evidence by itself; primary documentation, PIT behavior, licensing, and
 our identity model all have to agree.
@@ -11,6 +11,11 @@ our identity model all have to agree.
 |---|---|---|
 | Norgate Data Platinum/Diamond | Optional paid pilot | Effective membership, delisted prices, and an independent survivorship-bias check on Windows |
 | SEC EDGAR full-text search | Discovery/corroboration only | Find candidate issuer filings, then verify the exact accession and earlier announcement evidence |
+| SEC submissions `filings.files` | Adopted | Follow SEC-named older shards when the current recent block does not bracket the certified window |
+| SEC submissions `formerNames` | Reject as ticker history | These are issuer-name changes, not a dated ticker/security mapping |
+| SEC bulk ZIP archives | Optional local reader implemented | Reuse one official nightly Company Facts archive across a large reviewed batch without weakening CIK validation |
+| Tiingo EOD | Optional adapter implemented | Explicit token-header provider for reviewed symbols; configuration alone never certifies coverage |
+| Wayback/Wikipedia snapshots | Secondary cross-check only | A capture timestamp is not the page's publication timestamp and cannot become `known_date` |
 | `effective_date - 7 days` | Reject | An inferred offset is not a public timestamp and cannot become `known_date` |
 | S&P DJI Index Announcements RSS | Monitor later | Forward announcement discovery, followed by document parsing and archival |
 | `rheitner/S-P-500-Additions-and-Removals` | Reject | GitHub API returned 404; the advertised CSV could not be verified |
@@ -21,9 +26,12 @@ our identity model all have to agree.
 | dbt-duckdb | Defer | Useful when transformation DAG complexity justifies another runtime/toolchain |
 | Partitioned Parquet | Defer pending measurement | Current local tables are too small to justify a second storage layout |
 
-No dependency was added from this review. Replacing working, tested code merely
-to use a framework would increase migration risk without fixing the current
-constraint: survivorship-safe data coverage.
+No third-party package dependency was added from this review. Direct Tiingo
+HTTP support, SEC submissions-shard traversal, and a standard-library reader
+for selected CIKs inside the official Company Facts ZIP sit behind the existing
+identity/provenance contracts. Replacing working, tested code merely to use a
+framework would increase migration risk without fixing the current constraint:
+survivorship-safe data coverage.
 
 ## Norgate Data
 
@@ -101,6 +109,66 @@ publication artifact. AIOS source priority is:
 2. timestamped issuer release for a same-security ticker event;
 3. an exact SEC filing only as explicitly labeled fallback evidence; and
 4. never an offset inferred from `effective_date`.
+
+## SEC identity metadata, history shards, and bulk archives
+
+The official [SEC EDGAR API documentation](https://www.sec.gov/search-filings/edgar-application-programming-interfaces)
+confirms three distinct capabilities that must not be conflated:
+
+- the top-level submissions metadata includes current/former **company names**
+  and current ticker/exchange metadata;
+- `filings.files` names additional JSON files containing older submission
+  history for large filers; and
+- nightly bulk submissions and Company Facts ZIP archives are available.
+
+The history-shard capability directly fixed a real false rejection: Citi's
+current `recent` block did not reach 2023-08-01, while the SEC-named older shard
+did. The batch builder now validates shard filenames, fetches only enough of
+them to prove the missing boundary, fingerprints the combined evidence, and
+retains each shard URL in the review CSV.
+
+`formerNames` is not a former-ticker table. Using an issuer name as a market
+symbol would join the wrong identity domain and is covered by a rejection test.
+Likewise, punctuation normalization is intentionally limited to one exact
+market-dot/SEC-hyphen transform, such as BF.B↔BF-B; it is never fuzzy matching.
+
+The Submissions endpoint is keyed by a ten-digit CIK, so it cannot by itself
+solve an unknown ticker→CIK lookup. A live check made the lifecycle limitation
+concrete: Berkshire and Brown-Forman currently expose `BRK-B` and `BF-B`, while
+post-acquisition ANSYS exposes no ticker. Current ticker arrays corroborate a
+candidate identity; they are not dated ticker-owner histories.
+
+The bulk ZIP is a scale optimization, not a correctness shortcut. For a large
+reviewed batch, `aios ingest-reference-batch --companyfacts-zip PATH` opens one
+local official archive and reads only the members named by the manifest's
+reviewed CIKs. It refuses a missing/duplicate member, invalid JSON, absent
+`facts`, or an embedded CIK mismatch before that payload can reach storage.
+Submissions metadata is still fetched separately because Company Facts does not
+contain the same issuer/exchange metadata. Small or freshness-sensitive runs
+should keep the default real-time per-CIK API path; the archive is republished
+nightly and is intentionally not downloaded automatically.
+
+## Tiingo and archived-web suggestions
+
+Tiingo's official [EOD documentation](https://www.tiingo.com/documentation/end-of-day)
+and [symbol notes](https://www.tiingo.com/documentation/appendix/symbology)
+make it a useful optional source, including some delisted symbols. Its own
+documentation also warns that not every old or recycled symbol can be resolved
+without ambiguity. AIOS therefore treats Tiingo exactly like other providers:
+one explicit symbol, security ID, status, and half-open date range. The token
+is sent in an authorization header and never in the URL. A configured token is
+not evidence of coverage: returned rows must still pass the complete bounded
+date, uniqueness, positive-close, and security-relabel checks. That standard
+was met for ANSS, CTRA, and DFS: each returned 358 sessions for the certified
+window, so Exception Batch 02 is the first versioned Tiingo-backed manifest.
+
+Archived Wikipedia constituent pages can help discover discrepancies, but
+they remain community-authored snapshots. More importantly, a Wayback capture
+timestamp proves when the archive fetched a page—not when S&P published an
+announcement or when the market first knew it. It cannot populate
+`known_date`. Use archived pages only to generate candidates that are then
+verified against an S&P release, issuer release, or explicitly labeled filing
+fallback.
 
 ## S&P announcement sources
 
@@ -198,7 +266,7 @@ identity resolution. At the current scale, introducing dbt would duplicate a
 small, tested Python orchestration layer.
 
 Likewise, partitioned Parquet can help at tens of millions of rows or for an
-immutable data lake. The current database has about 165k prices and 65k
+immutable data lake. The current database has about 199k prices and 289k
 fundamental rows, so DuckDB is not the bottleneck. Benchmark first; add Parquet
 only when measured query/backup/portability needs justify dual storage.
 

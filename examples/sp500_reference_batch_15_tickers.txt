@@ -1,0 +1,28 @@
+# Batch 15: next 25 uncovered unchanged full-window S&P 500 securities.
+# Includes the reviewed NWS/NWSA dual-class pair.
+# Certified identity window: 2023-08-01 through 2025-01-01 (exclusive end).
+NVDA
+NVR
+NWS
+NWSA
+NXPI
+O
+ODFL
+OKE
+OMC
+ON
+ORCL
+ORLY
+OTIS
+OXY
+PANW
+PARA
+PAYC
+PAYX
+PCAR
+PCG
+PEG
+PEP
+PFE
+PFG
+PG

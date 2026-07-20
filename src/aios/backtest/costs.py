@@ -165,51 +165,72 @@ def simulate_period(
     initial_capital: float,
     transaction_costs: TransactionCostPolicy,
     tax_policy: TaxPolicy,
+    scheduled_entry_date: date | None = None,
+    scheduled_exit_date: date | None = None,
 ) -> FrictionResult:
     """Simulate equal-weight entry/exit with explicit costs and tax lots.
 
-    A common entry and exit date is required for every selected ticker. This
-    prevents a portfolio return from silently mixing different market days.
-    Adjusted close is used for gross total return when available; raw close,
-    split ratios, and dividends are used for execution and tax accounting.
+    A common entry and exit date is required for every selected security. When
+    the engine supplies scheduled dates, every policy must price on those exact
+    sessions; missing evidence fails the period instead of silently shortening
+    it. Reviewed securities are queried by immutable ``security_id`` so a dated
+    ticker change does not look like a sale or delisting. Adjusted close is used
+    for gross total return when available; raw close, split ratios, and
+    dividends are used for execution and tax accounting.
     """
     if initial_capital <= 0 or not isfinite(initial_capital):
         raise ValueError("initial_capital must be finite and positive")
     if not tickers:
         return _missing_result(("empty_portfolio",))
 
-    entry_date = _common_price_date(
-        tickers, decision_date, next_decision_date, store, ascending=True
-    )
-    exit_date = _common_price_date(
-        tickers, decision_date, next_decision_date, store, ascending=False
-    )
+    by_ticker = {
+        ticker: _holding_price_rows(
+            ticker,
+            decision_date,
+            next_decision_date,
+            store,
+        )
+        for ticker in tickers
+    }
+    date_sets = [{row["date"] for row in rows} for rows in by_ticker.values()]
+    common_dates = set.intersection(*date_sets) if date_sets else set()
+    entry_date = scheduled_entry_date or (min(common_dates) if common_dates else None)
+    exit_date = scheduled_exit_date or (max(common_dates) if common_dates else None)
     missing: list[str] = []
     if entry_date is None:
         missing.append("common_entry_price")
     if exit_date is None:
         missing.append("common_exit_price")
+    if scheduled_entry_date is not None:
+        missing.extend(
+            f"{ticker}:missing_scheduled_entry_price:{scheduled_entry_date}"
+            for ticker, rows in by_ticker.items()
+            if scheduled_entry_date not in {row["date"] for row in rows}
+        )
+    if scheduled_exit_date is not None:
+        missing.extend(
+            f"{ticker}:missing_scheduled_exit_price:{scheduled_exit_date}"
+            for ticker, rows in by_ticker.items()
+            if scheduled_exit_date not in {row["date"] for row in rows}
+        )
     if missing:
-        return _missing_result(tuple(missing))
+        return _missing_result(tuple(sorted(set(missing))))
     if exit_date < entry_date:
         return _missing_result(("empty_holding_window",))
 
-    placeholders = ",".join("?" for _ in tickers)
-    rows = store.query(
-        f"""
-        SELECT ticker, date, close, adj_close, dividends, split_ratio
-        FROM prices
-        WHERE ticker IN ({placeholders})
-          AND date >= ? AND date <= ?
-        ORDER BY ticker, date
-        """,
-        (*tickers, entry_date, exit_date),
-    )
-    by_ticker: dict[str, list[dict]] = {ticker: [] for ticker in tickers}
-    for row in rows:
-        by_ticker[row["ticker"]].append(row)
-    entry_rows = {row["ticker"]: row for row in rows if row["date"] == entry_date}
-    exit_rows = {row["ticker"]: row for row in rows if row["date"] == exit_date}
+    entry_rows: dict[str, dict] = {}
+    exit_rows: dict[str, dict] = {}
+    for ticker, rows in by_ticker.items():
+        entries = [row for row in rows if row["date"] == entry_date]
+        exits = [row for row in rows if row["date"] == exit_date]
+        if len(entries) != 1:
+            missing.append(f"{ticker}:ambiguous_entry_price")
+        else:
+            entry_rows[ticker] = entries[0]
+        if len(exits) != 1:
+            missing.append(f"{ticker}:ambiguous_exit_price")
+        else:
+            exit_rows[ticker] = exits[0]
     missing.extend(
         f"{ticker}:invalid_execution_price"
         for ticker in tickers
@@ -288,17 +309,51 @@ def simulate_period(
     )
 
 
+def _holding_price_rows(
+    ticker: str,
+    decision_date: date,
+    next_decision_date: date,
+    store: Store,
+) -> list[dict]:
+    """Load one holding path without confusing a ticker label for identity."""
+    security_id = store.security_id_for_ticker(ticker, decision_date)
+    if security_id is not None:
+        return store.query(
+            """
+            SELECT ticker, security_id, date, close, adj_close, dividends, split_ratio
+            FROM prices
+            WHERE security_id = ?
+              AND date > ? AND date <= ?
+            ORDER BY date, ticker
+            """,
+            (security_id, decision_date, next_decision_date),
+        )
+    return store.query(
+        """
+        SELECT ticker, security_id, date, close, adj_close, dividends, split_ratio
+        FROM prices
+        WHERE ticker = ?
+          AND date > ? AND date <= ?
+        ORDER BY date
+        """,
+        (ticker, decision_date, next_decision_date),
+    )
+
+
 def benchmark_period_return(
     ticker: str,
     decision_date: date,
     next_decision_date: date,
     store: Store,
+    *,
+    scheduled_entry_date: date | None = None,
+    scheduled_exit_date: date | None = None,
 ) -> tuple[float | None, date | None, date | None, str | None]:
     """Return a benchmark's adjusted-close total return for one interval."""
-    entry_date = _common_price_date(
+    entry_date = scheduled_entry_date or _common_price_date(
         (ticker,), decision_date, next_decision_date, store, ascending=True
     )
-    exit_date = _common_price_date(
+    exit_date = scheduled_exit_date or _common_price_date(
         (ticker,), decision_date, next_decision_date, store, ascending=False
     )
     if entry_date is None or exit_date is None:

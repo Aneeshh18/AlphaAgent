@@ -1,0 +1,24 @@
+issuer_id,canonical_name,canonical_ticker,cik,effective_start,effective_end,verified_date,source
+aios:issuer:sec:0000814547,FAIR ISAAC CORP,FICO,0000814547,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000814547.json
+aios:issuer:sec:0001136893,"Fidelity National Information Services, Inc.",FIS,0001136893,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001136893.json
+aios:issuer:sec:0000035527,FIFTH THIRD BANCORP,FITB,0000035527,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000035527.json
+aios:issuer:sec:0000037785,FMC CORP,FMC,0000037785,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000037785.json
+aios:issuer:sec:0001754301,Fox Corp,FOXA,0001754301,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001754301.json
+aios:issuer:sec:0000034903,FEDERAL REALTY INVESTMENT TRUST,FRT,0000034903,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000034903.json
+aios:issuer:sec:0001274494,"FIRST SOLAR, INC.",FSLR,0001274494,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001274494.json
+aios:issuer:sec:0001262039,"Fortinet, Inc.",FTNT,0001262039,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001262039.json
+aios:issuer:sec:0001659166,Fortive Corp,FTV,0001659166,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001659166.json
+aios:issuer:sec:0000040533,GENERAL DYNAMICS CORP,GD,0000040533,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000040533.json
+aios:issuer:sec:0000040545,GENERAL ELECTRIC CO,GE,0000040545,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000040545.json
+aios:issuer:sec:0001932393,GE HealthCare Technologies Inc.,GEHC,0001932393,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001932393.json
+aios:issuer:sec:0000849399,Gen Digital Inc.,GEN,0000849399,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000849399.json
+aios:issuer:sec:0000882095,"GILEAD SCIENCES, INC.",GILD,0000882095,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000882095.json
+aios:issuer:sec:0000040704,GENERAL MILLS INC,GIS,0000040704,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000040704.json
+aios:issuer:sec:0000320335,GLOBE LIFE INC.,GL,0000320335,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000320335.json
+aios:issuer:sec:0000024741,CORNING INC /NY,GLW,0000024741,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000024741.json
+aios:issuer:sec:0001467858,General Motors Co,GM,0001467858,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001467858.json
+aios:issuer:sec:0001474735,GENERAC HOLDINGS INC.,GNRC,0001474735,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001474735.json
+aios:issuer:sec:0001652044,Alphabet Inc.,GOOGL,0001652044,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001652044.json
+aios:issuer:sec:0000040987,GENUINE PARTS CO,GPC,0000040987,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000040987.json
+aios:issuer:sec:0001123360,GLOBAL PAYMENTS INC,GPN,0001123360,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001123360.json
+aios:issuer:sec:0001121788,GARMIN LTD,GRMN,0001121788,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001121788.json

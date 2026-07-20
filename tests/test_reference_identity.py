@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 from datetime import date
+from types import SimpleNamespace
+from zipfile import ZipFile
 
 import duckdb
 import pytest
@@ -17,6 +20,33 @@ SECURITY_ID = "aios:security:demo-common"
 ISSUER_ID = "aios:issuer:demo"
 EVIDENCE = "https://www.sec.gov/Archives/edgar/data/1/example.htm"
 PROVIDER_EVIDENCE = "https://query1.finance.yahoo.com/v8/finance/chart/NEW"
+
+
+def test_companyfacts_archive_reads_reviewed_cik_and_rejects_wrong_payload(tmp_path):
+    valid_path = tmp_path / "companyfacts.zip"
+    with ZipFile(valid_path, "w") as archive:
+        archive.writestr(
+            "nested/CIK0000000001.json",
+            json.dumps({"cik": 1, "entityName": "Demo", "facts": {}}),
+        )
+
+    with edgar.CompanyFactsArchive(valid_path) as archive:
+        archive.validate_ciks([1])
+        assert archive.read(1)["entityName"] == "Demo"
+        with pytest.raises(ValueError, match="no member for CIK 0000000002"):
+            archive.validate_ciks([2])
+
+    mismatch_path = tmp_path / "mismatch.zip"
+    with ZipFile(mismatch_path, "w") as archive:
+        archive.writestr(
+            "CIK0000000001.json",
+            json.dumps({"cik": 2, "entityName": "Wrong", "facts": {}}),
+        )
+    with (
+        edgar.CompanyFactsArchive(mismatch_path) as archive,
+        pytest.raises(ValueError, match="does not match reviewed CIK"),
+    ):
+        archive.read(1)
 
 
 def _membership(ticker: str, start: str, end: str | None, known: str) -> dict:
@@ -147,9 +177,7 @@ def test_existing_price_and_fundamental_tables_migrate_additively(tmp_path):
             )
             """
         )
-        con.execute(
-            "INSERT INTO prices (ticker, date, close) VALUES ('OLD', '2024-01-02', 10)"
-        )
+        con.execute("INSERT INTO prices (ticker, date, close) VALUES ('OLD', '2024-01-02', 10)")
         con.execute(
             """
             INSERT INTO fundamentals
@@ -163,9 +191,7 @@ def test_existing_price_and_fundamental_tables_migrate_additively(tmp_path):
     store = Store(db_path)
     try:
         price_columns = {row["column_name"] for row in store.query("DESCRIBE prices")}
-        fundamental_columns = {
-            row["column_name"] for row in store.query("DESCRIBE fundamentals")
-        }
+        fundamental_columns = {row["column_name"] for row in store.query("DESCRIBE fundamentals")}
         assert {"security_id", "provider_symbol"} <= price_columns
         assert {"issuer_id", "security_id"} <= fundamental_columns
         assert store.query("SELECT close, security_id FROM prices")[0] == {
@@ -213,18 +239,18 @@ def test_strict_csv_import_normalizes_cik_and_is_idempotent(tmp_path):
     store = Store(tmp_path / "reference-import.duckdb")
     try:
         _setup_security(store)
-        first = ingest_reference_identity_csvs(
-            issuer_path, owner_path, provider_path, store=store
+        first = ingest_reference_identity_csvs(issuer_path, owner_path, provider_path, store=store)
+        second = ingest_reference_identity_csvs(issuer_path, owner_path, provider_path, store=store)
+        assert (
+            first
+            == second
+            == {
+                "issuers": 1,
+                "cik_history": 1,
+                "security_issuers": 1,
+                "provider_symbols": 1,
+            }
         )
-        second = ingest_reference_identity_csvs(
-            issuer_path, owner_path, provider_path, store=store
-        )
-        assert first == second == {
-            "issuers": 1,
-            "cik_history": 1,
-            "security_issuers": 1,
-            "provider_symbols": 1,
-        }
         assert store.issuer_reference(ISSUER_ID)["cik"] == "0000000001"
     finally:
         store.close()
@@ -273,9 +299,70 @@ def test_pit_fundamentals_follow_issuer_and_ignore_ticker_contamination(tmp_path
         new_ticker = store.pit_fundamentals("NEW", "2024-07-01", ["revenue"])
         assert old_ticker[0]["value"] == 100
         assert new_ticker[0]["value"] == 100
-        assert store.fundamental_history("NEW", "2024-07-01", "revenue")[0][
-            "quarter_value"
-        ] == 100
+        assert store.fundamental_history("NEW", "2024-07-01", "revenue")[0]["quarter_value"] == 100
+        assert store.pit_factor_fundamentals("OLD", "2024-06-30", ["revenue"])[0]["value"] == 100
+        assert store.pit_factor_fundamentals("NEW", "2024-07-01", ["revenue"])[0]["value"] == 100
+    finally:
+        store.close()
+
+
+def test_reviewed_owner_gap_cannot_fall_back_to_legacy_fundamentals(tmp_path):
+    store = Store(tmp_path / "reviewed-owner-gap.duckdb")
+    try:
+        _setup_security(store)
+        store.upsert_fundamentals([_fundamental(77, ticker="OLD")])
+
+        assert store.pit_fundamentals("OLD", "2024-06-30", ["revenue"])[0]["value"] == 77
+        assert store.fundamental_history("OLD", "2024-06-30", "revenue")[0]["quarter_value"] == 77
+
+        issuers, ciks, owners, providers = _reference_rows()
+        owners[0]["effective_start"] = "2024-07-01"
+        store.upsert_reference_identities(issuers, ciks, owners, providers)
+
+        assert store.pit_fundamentals("OLD", "2024-06-30", ["revenue"]) == []
+        assert store.fundamental_history("OLD", "2024-06-30", "revenue") == []
+        assert store.pit_factor_fundamentals("OLD", "2024-06-30", ["revenue"]) == []
+        coverage = store.universe_data_coverage("demo", "2024-06-30")[0]
+        assert coverage["has_pit_fundamentals"] is False
+        assert coverage["latest_fundamental_date"] is None
+    finally:
+        store.close()
+
+
+def test_future_period_end_is_rejected_reported_and_filtered(tmp_path):
+    store = Store(tmp_path / "future-fundamental-period.duckdb")
+    try:
+        future_period = _fundamental(123, ticker="FUTURE")
+        future_period["period_end"] = "2024-06-30"
+        future_period["as_of_date"] = "2024-05-01"
+
+        with pytest.raises(ValueError, match="period_end later than as_of_date"):
+            store.upsert_fundamentals([future_period])
+
+        store.execute(
+            """
+            INSERT INTO fundamentals
+            (ticker, period_end, as_of_date, fiscal_period, statement, metric,
+             value, quarter_value, unit, source)
+            VALUES
+            ('FUTURE', '2024-06-30', '2024-05-01', 'Q2_2024', 'income',
+             'revenue', 123, 123, 'USD', 'legacy-test')
+            """
+        )
+
+        report = {row["check"]: row for row in store.data_quality_report()}
+        assert report["fundamentals_period_end_after_as_of_date"] == {
+            "check": "fundamentals_period_end_after_as_of_date",
+            "status": "fail",
+            "count": 1,
+            "detail": "A fiscal period cannot end after the filing became publicly knowable.",
+        }
+        assert store.pit_fundamentals("FUTURE", "2024-12-31", ["revenue"]) == []
+        assert store.fundamental_history("FUTURE", "2024-12-31", "revenue") == []
+        assert store.quarantine_invalid_fundamental_periods() == 1
+        assert store.query("SELECT COUNT(*) AS n FROM fundamentals")[0]["n"] == 0
+        quarantined = store.query("SELECT quarantine_reason FROM fundamentals_quarantine")
+        assert quarantined == [{"quarantine_reason": "period_end_after_as_of_date"}]
     finally:
         store.close()
 
@@ -300,11 +387,67 @@ def test_provider_rows_are_cut_off_and_relabelled_by_security_date():
 
     output = prices.relabel_provider_price_rows(raw, mapping, assignments)
 
-    assert [(row["ticker"], row["date"]) for row in output] == [
-        ("NEW", "2024-07-01")
-    ]
+    assert [(row["ticker"], row["date"]) for row in output] == [("NEW", "2024-07-01")]
     assert output[0]["security_id"] == SECURITY_ID
     assert output[0]["provider_symbol"] == "NEW"
+
+
+def test_sec_submission_history_file_allows_only_official_shard_names(monkeypatch):
+    class FakeHttp:
+        def get_json(self, url):
+            assert url.endswith("/CIK0000000001-submissions-001.json")
+            return {"filingDate": ["2020-01-01"]}
+
+    monkeypatch.setattr(edgar, "get_http", lambda: FakeHttp())
+
+    payload = edgar.fetch_submission_file("CIK0000000001-submissions-001.json")
+    assert payload == {"filingDate": ["2020-01-01"]}
+    with pytest.raises(ValueError, match="invalid SEC submissions history filename"):
+        edgar.fetch_submission_file("../companyfacts.json")
+
+
+def test_tiingo_fetch_uses_header_token_and_preserves_exclusive_end(monkeypatch):
+    class FakeHttp:
+        def get_json(self, url, headers=None):
+            assert "token=" not in url
+            assert headers == {"Authorization": "Token test-token"}
+            return [
+                {
+                    "date": "2024-01-02T00:00:00.000Z",
+                    "open": 10,
+                    "high": 12,
+                    "low": 9,
+                    "close": 11,
+                    "adjClose": 10.5,
+                    "volume": 1000,
+                    "divCash": 0.25,
+                    "splitFactor": 1,
+                },
+                {
+                    "date": "2024-01-03T00:00:00.000Z",
+                    "close": 12,
+                },
+            ]
+
+    monkeypatch.setattr(prices, "settings", SimpleNamespace(tiingo_api_key="test-token"))
+    monkeypatch.setattr(prices, "get_http", lambda: FakeHttp())
+
+    rows = prices.fetch_tiingo("tst", start="2024-01-01", end="2024-01-03")
+
+    assert len(rows) == 1
+    assert rows[0] == {
+        "ticker": "TST",
+        "date": "2024-01-02",
+        "open": 10.0,
+        "high": 12.0,
+        "low": 9.0,
+        "close": 11.0,
+        "adj_close": 10.5,
+        "volume": 1000,
+        "dividends": 0.25,
+        "split_ratio": 1.0,
+        "source": "tiingo",
+    }
 
 
 def test_identity_price_ingest_preserves_transition_and_coverage(monkeypatch, tmp_path):
@@ -312,9 +455,7 @@ def test_identity_price_ingest_preserves_transition_and_coverage(monkeypatch, tm
     try:
         _setup_security(store)
         _install_reference_rows(store)
-        store.upsert_fundamentals(
-            [_fundamental(100, issuer_id=ISSUER_ID, security_id=SECURITY_ID)]
-        )
+        store.upsert_fundamentals([_fundamental(100, issuer_id=ISSUER_ID, security_id=SECURITY_ID)])
 
         monkeypatch.setattr(
             prices,
@@ -350,11 +491,41 @@ def test_identity_price_ingest_preserves_transition_and_coverage(monkeypatch, tm
         store.close()
 
 
+def test_terminal_provider_mapping_cannot_reactivate_legacy_price_rows(tmp_path):
+    store = Store(tmp_path / "terminal-provider-mapping.duckdb")
+    try:
+        _setup_security(store)
+        store.upsert_prices([{"ticker": "OLD", "date": "2024-06-28", "close": 99.0}])
+
+        assert store.latest_price("OLD", "2024-06-30")["close"] == 99.0
+
+        issuers, ciks, owners, providers = _reference_rows()
+        providers[0]["mapping_status"] = "blocked_wrong_security"
+        store.upsert_reference_identities(issuers, ciks, owners, providers)
+
+        assert store.latest_price("OLD", "2024-06-30") is None
+        coverage = store.universe_data_coverage("demo", "2024-06-30")[0]
+        assert coverage["has_price_history"] is False
+        assert coverage["latest_price_date"] is None
+    finally:
+        store.close()
+
+
 def test_ingest_issuer_uses_reviewed_cik_and_tags_rows(monkeypatch, tmp_path):
     store = Store(tmp_path / "issuer-ingest.duckdb")
     try:
         _setup_security(store)
         _install_reference_rows(store)
+        store.upsert_fundamentals(
+            [
+                _fundamental(
+                    50,
+                    ticker="STALE",
+                    issuer_id=ISSUER_ID,
+                    security_id=SECURITY_ID,
+                )
+            ]
+        )
 
         def fake_extract(ticker, cik, *, issuer_id, security_id):
             assert (ticker, cik) == ("NEW", 1)
@@ -373,7 +544,15 @@ def test_ingest_issuer_uses_reviewed_cik_and_tags_rows(monkeypatch, tmp_path):
 
         monkeypatch.setattr(edgar, "extract_fundamentals", fake_extract)
         assert edgar.ingest_issuer(ISSUER_ID, store=store) == 1
-        row = store.query("SELECT issuer_id, security_id FROM fundamentals")[0]
-        assert row == {"issuer_id": ISSUER_ID, "security_id": SECURITY_ID}
+        rows = store.query(
+            "SELECT ticker, issuer_id, security_id FROM fundamentals ORDER BY ticker"
+        )
+        assert rows == [
+            {
+                "ticker": "NEW",
+                "issuer_id": ISSUER_ID,
+                "security_id": SECURITY_ID,
+            }
+        ]
     finally:
         store.close()

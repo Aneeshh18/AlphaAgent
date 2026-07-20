@@ -1,0 +1,26 @@
+# Six legacy baseline names first, followed by the next 19 alphabetical gaps.
+AAPL
+AMZN
+BA
+BAC
+CAT
+CDW
+CE
+CEG
+CF
+CFG
+CHD
+CHRW
+CHTR
+CI
+CINF
+CL
+CLX
+CMCSA
+CME
+CMG
+CMI
+CMS
+CNC
+CNP
+COF

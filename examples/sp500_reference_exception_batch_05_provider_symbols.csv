@@ -1,0 +1,4 @@
+provider,provider_symbol,security_id,data_start,data_end,mapping_status,verified_date,source
+tiingo,IPG,aios:bounded:sp500:ipg,2023-08-01,2025-01-01,verified,2026-07-17,https://api.tiingo.com/tiingo/daily/IPG
+tiingo,JNPR,aios:bounded:sp500:jnpr,2023-08-01,2025-01-01,verified,2026-07-17,https://api.tiingo.com/tiingo/daily/JNPR
+tiingo,K,aios:bounded:sp500:k,2023-08-01,2025-01-01,verified,2026-07-17,https://api.tiingo.com/tiingo/daily/K

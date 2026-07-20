@@ -1,0 +1,26 @@
+issuer_id,canonical_name,canonical_ticker,cik,effective_start,effective_end,verified_date,source
+aios:issuer:sec:0000080661,PROGRESSIVE CORP/OH/,PGR,0000080661,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000080661.json
+aios:issuer:sec:0000076334,Parker-Hannifin Corp,PH,0000076334,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000076334.json
+aios:issuer:sec:0000822416,PULTEGROUP INC/MI/,PHM,0000822416,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000822416.json
+aios:issuer:sec:0000075677,PACKAGING CORP OF AMERICA,PKG,0000075677,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000075677.json
+aios:issuer:sec:0001045609,"Prologis, Inc.",PLD,0001045609,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001045609.json
+aios:issuer:sec:0001413329,Philip Morris International Inc.,PM,0001413329,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001413329.json
+aios:issuer:sec:0000713676,"PNC FINANCIAL SERVICES GROUP, INC.",PNC,0000713676,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000713676.json
+aios:issuer:sec:0000077360,PENTAIR plc,PNR,0000077360,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000077360.json
+aios:issuer:sec:0000764622,PINNACLE WEST CAPITAL CORP,PNW,0000764622,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000764622.json
+aios:issuer:sec:0001145197,INSULET CORP,PODD,0001145197,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001145197.json
+aios:issuer:sec:0000945841,POOL CORP,POOL,0000945841,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000945841.json
+aios:issuer:sec:0000079879,PPG INDUSTRIES INC,PPG,0000079879,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000079879.json
+aios:issuer:sec:0000922224,PPL Corp,PPL,0000922224,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000922224.json
+aios:issuer:sec:0001137774,PRUDENTIAL FINANCIAL INC,PRU,0001137774,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001137774.json
+aios:issuer:sec:0001393311,Public Storage,PSA,0001393311,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001393311.json
+aios:issuer:sec:0001534701,Phillips 66,PSX,0001534701,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001534701.json
+aios:issuer:sec:0000857005,PTC INC.,PTC,0000857005,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000857005.json
+aios:issuer:sec:0001050915,"QUANTA SERVICES, INC.",PWR,0001050915,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001050915.json
+aios:issuer:sec:0001633917,"PayPal Holdings, Inc.",PYPL,0001633917,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001633917.json
+aios:issuer:sec:0000804328,QUALCOMM INC/DE,QCOM,0000804328,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000804328.json
+aios:issuer:sec:0000884887,ROYAL CARIBBEAN CRUISES LTD,RCL,0000884887,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000884887.json
+aios:issuer:sec:0000910606,REGENCY CENTERS CORP,REG,0000910606,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000910606.json
+aios:issuer:sec:0000872589,"REGENERON PHARMACEUTICALS, INC.",REGN,0000872589,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000872589.json
+aios:issuer:sec:0001281761,REGIONS FINANCIAL CORP,RF,0001281761,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001281761.json
+aios:issuer:sec:0000720005,RAYMOND JAMES FINANCIAL INC,RJF,0000720005,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000720005.json

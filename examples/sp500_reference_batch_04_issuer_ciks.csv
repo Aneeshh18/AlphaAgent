@@ -1,0 +1,20 @@
+issuer_id,canonical_name,canonical_ticker,cik,effective_start,effective_end,verified_date,source
+aios:issuer:sec:0000038777,FRANKLIN RESOURCES INC,BEN,0000038777,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000038777.json
+aios:issuer:sec:0000875045,BIOGEN INC.,BIIB,0000875045,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000875045.json
+aios:issuer:sec:0001075531,Booking Holdings Inc.,BKNG,0001075531,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001075531.json
+aios:issuer:sec:0001701605,Baker Hughes Co,BKR,0001701605,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001701605.json
+aios:issuer:sec:0000014272,BRISTOL MYERS SQUIBB CO,BMY,0000014272,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000014272.json
+aios:issuer:sec:0001383312,"BROADRIDGE FINANCIAL SOLUTIONS, INC.",BR,0001383312,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001383312.json
+aios:issuer:sec:0000079282,"BROWN & BROWN, INC.",BRO,0000079282,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000079282.json
+aios:issuer:sec:0000885725,BOSTON SCIENTIFIC CORP,BSX,0000885725,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000885725.json
+aios:issuer:sec:0000908255,BORGWARNER INC,BWA,0000908255,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000908255.json
+aios:issuer:sec:0001037540,"BXP, Inc.",BXP,0001037540,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001037540.json
+aios:issuer:sec:0000023217,CONAGRA BRANDS INC.,CAG,0000023217,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000023217.json
+aios:issuer:sec:0000721371,CARDINAL HEALTH INC,CAH,0000721371,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000721371.json
+aios:issuer:sec:0001783180,CARRIER GLOBAL Corp,CARR,0001783180,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001783180.json
+aios:issuer:sec:0000896159,Chubb Ltd,CB,0000896159,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000896159.json
+aios:issuer:sec:0001374310,"Cboe Global Markets, Inc.",CBOE,0001374310,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001374310.json
+aios:issuer:sec:0001138118,"CBRE GROUP, INC.",CBRE,0001138118,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001138118.json
+aios:issuer:sec:0001051470,CROWN CASTLE INC.,CCI,0001051470,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0001051470.json
+aios:issuer:sec:0000815097,Carnival Corp Ltd.,CCL,0000815097,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000815097.json
+aios:issuer:sec:0000813672,CADENCE DESIGN SYSTEMS INC,CDNS,0000813672,2023-08-01,2025-01-01,2026-07-17,https://data.sec.gov/submissions/CIK0000813672.json

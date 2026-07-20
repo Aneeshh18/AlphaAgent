@@ -1,0 +1,27 @@
+# Batch 07: next 25 uncovered unchanged full-window S&P 500 securities.
+# Certified identity window: 2023-08-01 through 2025-01-01 (exclusive end).
+DHI
+DHR
+DIS
+DLR
+DLTR
+DOV
+DOW
+DPZ
+DRI
+DTE
+DUK
+DVA
+DVN
+DXCM
+EA
+EBAY
+ECL
+ED
+EFX
+EG
+EIX
+EL
+ELV
+EMN
+EMR

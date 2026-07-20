@@ -114,13 +114,17 @@ except Exception as e:
 # ----------------------------------------------------------------------
 if view == "🌍 Universe Ranking":
     st.title("🌍 Universe Ranking — QV Composite")
-    if not df.empty:
-        macro_regime = str(df["Macro regime"].iloc[0])
-        quality_weight = df["Quality weight %"].iloc[0]
-        value_weight = df["Value weight %"].iloc[0]
-        macro_pit_ready = bool(df["Macro PIT ready"].iloc[0])
-    else:
-        macro_regime, quality_weight, value_weight, macro_pit_ready = "unknown", 60.0, 40.0, False
+    if df.empty:
+        st.info(
+            "No universe rankings are available for this as-of date. Load securities "
+            "and the required factor inputs, or choose a date with coverage, then refresh."
+        )
+        st.stop()
+
+    macro_regime = str(df["Macro regime"].iloc[0])
+    quality_weight = df["Quality weight %"].iloc[0]
+    value_weight = df["Value weight %"].iloc[0]
+    macro_pit_ready = bool(df["Macro PIT ready"].iloc[0])
     st.caption(
         f"As of {as_of} • {len(df)} tickers • Regime: {macro_regime} • "
         f"Quality {quality_weight:.0f}% / Value {value_weight:.0f}%"
@@ -142,30 +146,36 @@ if view == "🌍 Universe Ranking":
     st.subheader("Quality vs Value — the opportunity map")
     st.caption("Top-right = high quality AND cheap (the sweet spot). Bubble size = market cap.")
     plot_df = df.dropna(subset=["Quality", "Value"]).copy()
-    # Market cap may be NaN for some tickers — fill with median so the bubble
-    # still renders (size is purely visual, not data).
-    median_mcap = plot_df["Market Cap ($B)"].median()
-    plot_df["Market Cap ($B)"] = plot_df["Market Cap ($B)"].fillna(
-        median_mcap if pd.notna(median_mcap) else 100
-    )
-    fig = px.scatter(
-        plot_df,
-        x="Value",
-        y="Quality",
-        text="Ticker",
-        size="Market Cap ($B)",
-        size_max=45,
-        color="QV Score",
-        color_continuous_scale="RdYlGn",
-        hover_data=["P/E", "EV/EBITDA", "ROIC %", "FCF Margin %"],
-        range_x=[-5, 105],
-        range_y=[-5, 105],
-    )
-    fig.update_traces(textposition="top center", textfont_size=10)
-    fig.add_hline(y=50, line_dash="dash", line_color="gray", opacity=0.4)
-    fig.add_vline(x=50, line_dash="dash", line_color="gray", opacity=0.4)
-    fig.update_layout(height=520, coloraxis_colorbar=dict(title="QV"))
-    st.plotly_chart(fig, width="stretch")
+    if plot_df.empty:
+        st.info(
+            "The opportunity map is unavailable because no ticker has both a Quality "
+            "and Value score. Review factor-input coverage in the ranking table below."
+        )
+    else:
+        # Market cap may be NaN for some tickers — fill with median so the bubble
+        # still renders (size is purely visual, not data).
+        median_mcap = plot_df["Market Cap ($B)"].median()
+        plot_df["Market Cap ($B)"] = plot_df["Market Cap ($B)"].fillna(
+            median_mcap if pd.notna(median_mcap) else 100
+        )
+        fig = px.scatter(
+            plot_df,
+            x="Value",
+            y="Quality",
+            text="Ticker",
+            size="Market Cap ($B)",
+            size_max=45,
+            color="QV Score",
+            color_continuous_scale="RdYlGn",
+            hover_data=["P/E", "EV/EBITDA", "ROIC %", "FCF Margin %"],
+            range_x=[-5, 105],
+            range_y=[-5, 105],
+        )
+        fig.update_traces(textposition="top center", textfont_size=10)
+        fig.add_hline(y=50, line_dash="dash", line_color="gray", opacity=0.4)
+        fig.add_vline(x=50, line_dash="dash", line_color="gray", opacity=0.4)
+        fig.update_layout(height=520, coloraxis_colorbar=dict(title="QV"))
+        st.plotly_chart(fig, width="stretch")
 
     # Full ranking table
     st.subheader("Full ranking")
@@ -200,7 +210,15 @@ if view == "🌍 Universe Ranking":
 elif view == "🔬 Deep Dive":
     st.title("🔬 Single-Ticker Deep Dive")
 
-    ticker = st.selectbox("Select ticker", sorted(df["Ticker"].tolist()))
+    ticker_options = sorted(df["Ticker"].tolist()) if "Ticker" in df.columns else []
+    if not ticker_options:
+        st.info(
+            "No tickers are available for Deep Dive for this as-of date. Load securities "
+            "and the required factor inputs, or choose a date with coverage, then refresh."
+        )
+        st.stop()
+
+    ticker = st.selectbox("Select ticker", ticker_options)
     row = df[df["Ticker"] == ticker].iloc[0]
 
     snap = None

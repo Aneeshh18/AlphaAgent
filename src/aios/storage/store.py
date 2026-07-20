@@ -51,9 +51,7 @@ class Store:
 
     def _migrate_security_identity_schema(self) -> None:
         """Add the stable identity link to databases created before this layer."""
-        columns = {
-            row["column_name"] for row in self.query("DESCRIBE universe_membership")
-        }
+        columns = {row["column_name"] for row in self.query("DESCRIBE universe_membership")}
         if "security_id" not in columns:
             self.execute("ALTER TABLE universe_membership ADD COLUMN security_id VARCHAR")
 
@@ -206,9 +204,7 @@ class Store:
                 raise ValueError("universe membership requires effective_start and known_date")
             effective_start = _as_date(row["effective_start"])
             known_date = _as_date(row["known_date"])
-            effective_end = (
-                _as_date(row["effective_end"]) if row.get("effective_end") else None
-            )
+            effective_end = _as_date(row["effective_end"]) if row.get("effective_end") else None
             if known_date > effective_start:
                 raise ValueError("universe membership known_date cannot follow effective_start")
             if effective_end is not None and effective_end <= effective_start:
@@ -311,13 +307,9 @@ class Store:
             if status not in allowed_statuses:
                 raise ValueError(f"unsupported security identity status {status!r}")
             if not row.get("effective_start") or not row.get("known_date"):
-                raise ValueError(
-                    "security identity requires effective_start and known_date"
-                )
+                raise ValueError("security identity requires effective_start and known_date")
             effective_start = _as_date(row["effective_start"])
-            effective_end = (
-                _as_date(row["effective_end"]) if row.get("effective_end") else None
-            )
+            effective_end = _as_date(row["effective_end"]) if row.get("effective_end") else None
             known_date = _as_date(row["known_date"])
             if known_date > effective_start:
                 raise ValueError("security identity known_date cannot follow effective_start")
@@ -350,9 +342,7 @@ class Store:
         for security_id, assignments in by_security.items():
             statuses = {row["identity_status"] for row in assignments}
             if len(statuses) != 1:
-                raise ValueError(
-                    f"security identity {security_id!r} has inconsistent statuses"
-                )
+                raise ValueError(f"security identity {security_id!r} has inconsistent statuses")
             canonical = max(
                 assignments,
                 key=lambda row: (row["effective_start"], row["ticker"]),
@@ -530,9 +520,7 @@ class Store:
                 {
                     "issuer_id": issuer_id,
                     "canonical_name": _required_text(row, "canonical_name", "issuer"),
-                    "canonical_ticker": _required_text(
-                        row, "canonical_ticker", "issuer"
-                    ).upper(),
+                    "canonical_ticker": _required_text(row, "canonical_ticker", "issuer").upper(),
                     "source": _required_text(row, "source", "issuer"),
                 }
             )
@@ -544,9 +532,7 @@ class Store:
             raw_cik = _required_text(row, "cik", "CIK history")
             if not raw_cik.isdigit() or len(raw_cik) > 10:
                 raise ValueError(f"invalid SEC CIK {raw_cik!r}")
-            start, end = _half_open_dates(
-                row, "effective_start", "effective_end", "CIK history"
-            )
+            start, end = _half_open_dates(row, "effective_start", "effective_end", "CIK history")
             key = (issuer_id, start)
             if key in cik_keys:
                 raise ValueError(f"duplicate CIK history interval for {issuer_id!r}")
@@ -572,9 +558,7 @@ class Store:
             )
             key = (security_id, start)
             if key in owner_keys:
-                raise ValueError(
-                    f"duplicate security issuer interval for {security_id!r}"
-                )
+                raise ValueError(f"duplicate security issuer interval for {security_id!r}")
             owner_keys.add(key)
             owner_rows.append(
                 {
@@ -592,17 +576,13 @@ class Store:
         for row in provider_symbols:
             provider = _required_text(row, "provider", "provider symbol").lower()
             security_id = _required_text(row, "security_id", "provider symbol")
-            start, end = _half_open_dates(
-                row, "data_start", "data_end", "provider symbol"
-            )
+            start, end = _half_open_dates(row, "data_start", "data_end", "provider symbol")
             status = _required_text(row, "mapping_status", "provider symbol")
             if status not in {"verified", "unavailable", "blocked_wrong_security"}:
                 raise ValueError(f"unsupported provider mapping status {status!r}")
             key = (provider, security_id, start)
             if key in provider_keys:
-                raise ValueError(
-                    f"duplicate provider interval for {provider}:{security_id}"
-                )
+                raise ValueError(f"duplicate provider interval for {provider}:{security_id}")
             provider_keys.add(key)
             provider_rows.append(
                 {
@@ -646,18 +626,14 @@ class Store:
                 )
 
             incoming_issuers = {row["issuer_id"] for row in issuer_rows}
-            referenced_issuers = {
-                row["issuer_id"] for row in cik_rows + owner_rows
-            }
+            referenced_issuers = {row["issuer_id"] for row in cik_rows + owner_rows}
             existing_issuers = {
-                row["issuer_id"]
-                for row in self.query("SELECT issuer_id FROM issuer_master")
+                row["issuer_id"] for row in self.query("SELECT issuer_id FROM issuer_master")
             }
             unknown_issuers = referenced_issuers - incoming_issuers - existing_issuers
             if unknown_issuers:
                 raise ValueError(
-                    "reference identity uses unknown issuer_id "
-                    f"{sorted(unknown_issuers)[0]!r}"
+                    f"reference identity uses unknown issuer_id {sorted(unknown_issuers)[0]!r}"
                 )
 
             conflict_checks = (
@@ -932,23 +908,40 @@ class Store:
                 f"upsert_fundamentals: {len(missing)} rows lack as_of_date. "
                 "Point-in-time correctness requires a knowable-date per row."
             )
-        normalized = [
-            {
-                "ticker": str(row.get("ticker") or "").strip().upper(),
-                "issuer_id": row.get("issuer_id"),
-                "security_id": row.get("security_id"),
-                "period_end": row.get("period_end"),
-                "as_of_date": row.get("as_of_date"),
-                "fiscal_period": row.get("fiscal_period"),
-                "statement": row.get("statement"),
-                "metric": row.get("metric"),
-                "value": row.get("value"),
-                "quarter_value": row.get("quarter_value"),
-                "unit": row.get("unit", "USD"),
-                "source": row.get("source", "edgar"),
-            }
-            for row in rows
-        ]
+        missing_period_end = [r for r in rows if not r.get("period_end")]
+        if missing_period_end:
+            raise ValueError(
+                f"upsert_fundamentals: {len(missing_period_end)} rows lack period_end."
+            )
+
+        normalized: list[dict] = []
+        invalid_periods = 0
+        for row in rows:
+            period_end = _as_date(row["period_end"])
+            as_of_date = _as_date(row["as_of_date"])
+            if period_end > as_of_date:
+                invalid_periods += 1
+            normalized.append(
+                {
+                    "ticker": str(row.get("ticker") or "").strip().upper(),
+                    "issuer_id": row.get("issuer_id"),
+                    "security_id": row.get("security_id"),
+                    "period_end": period_end,
+                    "as_of_date": as_of_date,
+                    "fiscal_period": row.get("fiscal_period"),
+                    "statement": row.get("statement"),
+                    "metric": row.get("metric"),
+                    "value": row.get("value"),
+                    "quarter_value": row.get("quarter_value"),
+                    "unit": row.get("unit", "USD"),
+                    "source": row.get("source", "edgar"),
+                }
+            )
+        if invalid_periods:
+            raise ValueError(
+                f"upsert_fundamentals: {invalid_periods} rows have period_end later "
+                "than as_of_date. A filing cannot report a future fiscal period."
+            )
         self._con.register("_tmp_fund", _rows_to_arrowable(normalized))
         n = self._con.execute(
             """
@@ -977,6 +970,54 @@ class Store:
         ).fetchone()[0]
         self._con.unregister("_tmp_fund")
         return int(n)
+
+    def refresh_issuer_fundamentals(
+        self,
+        rows: list[dict],
+        *,
+        issuer_id: str,
+        canonical_ticker: str,
+    ) -> tuple[int, int]:
+        """Upsert one issuer snapshot and remove only stale canonical labels.
+
+        SEC Company Facts is fetched as a complete issuer history. Once that
+        complete payload has been extracted successfully, keeping rows for the
+        same ``issuer_id`` under an older canonical display ticker would create
+        duplicate PIT facts. The upsert and narrow cleanup are one transaction.
+        Untagged legacy rows and rows belonging to other issuers are untouched.
+        """
+        if not rows:
+            return 0, 0
+        issuer_id = issuer_id.strip()
+        canonical_ticker = canonical_ticker.strip().upper()
+        if not issuer_id or not canonical_ticker:
+            raise ValueError("issuer refresh requires issuer_id and canonical_ticker")
+        if any(str(row.get("issuer_id") or "").strip() != issuer_id for row in rows):
+            raise ValueError("issuer refresh contains a different issuer_id")
+        if any(str(row.get("ticker") or "").strip().upper() != canonical_ticker for row in rows):
+            raise ValueError("issuer refresh contains a non-canonical ticker")
+
+        self.execute("BEGIN TRANSACTION")
+        try:
+            inserted = self.upsert_fundamentals(rows)
+            stale = self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM fundamentals
+                WHERE issuer_id = ? AND ticker <> ?
+                """,
+                (issuer_id, canonical_ticker),
+            )[0]["n"]
+            if stale:
+                self.execute(
+                    "DELETE FROM fundamentals WHERE issuer_id = ? AND ticker <> ?",
+                    (issuer_id, canonical_ticker),
+                )
+            self.execute("COMMIT")
+            return inserted, int(stale)
+        except Exception:
+            self.execute("ROLLBACK")
+            raise
 
     def upsert_macro(self, rows: list[dict]) -> int:
         """Upsert release-aware macro vintages.
@@ -1104,6 +1145,14 @@ class Store:
             "Future availability dates indicate a malformed or premature ingest.",
         )
         add(
+            "fundamentals_period_end_after_as_of_date",
+            self.query("SELECT COUNT(*) AS n FROM fundamentals WHERE period_end > as_of_date")[0][
+                "n"
+            ],
+            "fail",
+            "A fiscal period cannot end after the filing became publicly knowable.",
+        )
+        add(
             "fundamentals_missing_quarter_value",
             self.query(
                 """
@@ -1146,9 +1195,7 @@ class Store:
         )
         add(
             "macro_future_release_date",
-            self.query(
-                "SELECT COUNT(*) AS n FROM macro WHERE release_date > CURRENT_DATE"
-            )[0]["n"],
+            self.query("SELECT COUNT(*) AS n FROM macro WHERE release_date > CURRENT_DATE")[0]["n"],
             "fail",
             "A future release date is malformed and cannot be used for analysis.",
         )
@@ -1197,9 +1244,9 @@ class Store:
         )
         add(
             "universe_missing_security_ids",
-            self.query(
-                "SELECT COUNT(*) AS n FROM universe_membership WHERE security_id IS NULL"
-            )[0]["n"],
+            self.query("SELECT COUNT(*) AS n FROM universe_membership WHERE security_id IS NULL")[
+                0
+            ]["n"],
             "fail",
             "Every certified membership interval needs a stable security identity.",
         )
@@ -1504,6 +1551,36 @@ class Store:
         self.execute(f"DELETE FROM fundamentals WHERE {where}", params)
         return int(count)
 
+    def quarantine_invalid_fundamental_periods(self) -> int:
+        """Move impossible future-period facts out of the active PIT table."""
+        count = self.query("SELECT COUNT(*) AS n FROM fundamentals WHERE period_end > as_of_date")[
+            0
+        ]["n"]
+        if not count:
+            return 0
+        self.execute("BEGIN TRANSACTION")
+        try:
+            self.execute(
+                """
+                INSERT INTO fundamentals_quarantine
+                (ticker, issuer_id, security_id, period_end, as_of_date,
+                 fiscal_period, statement, metric, value, quarter_value, unit,
+                 source, fetched_at, quarantine_reason, quarantined_at)
+                SELECT ticker, issuer_id, security_id, period_end, as_of_date,
+                       fiscal_period, statement, metric, value, quarter_value,
+                       unit, source, fetched_at,
+                       'period_end_after_as_of_date', now()
+                FROM fundamentals
+                WHERE period_end > as_of_date
+                """
+            )
+            self.execute("DELETE FROM fundamentals WHERE period_end > as_of_date")
+            self.execute("COMMIT")
+        except Exception:
+            self.execute("ROLLBACK")
+            raise
+        return int(count)
+
     def purge_legacy_macro(self, series_ids: list[str] | None = None) -> int:
         """Remove only quarantined macro copies after replacement coverage.
 
@@ -1632,6 +1709,41 @@ class Store:
             return None
         return self.issuer_id_for_security(security_id, as_of)
 
+    def _fundamental_identity_filter(
+        self,
+        ticker: str,
+        as_of: date | str,
+    ) -> tuple[str, str] | None:
+        """Resolve a PIT fundamental identity without crossing reviewed gaps.
+
+        Ticker fallback is retained only for legacy securities that have never
+        received a reviewed owner assignment. Once owner history exists, a date
+        without an active owner is an explicit data gap and must fail closed.
+        """
+        normalized_ticker = ticker.upper()
+        security_id = self.security_id_for_ticker(normalized_ticker, as_of)
+        if security_id is None:
+            return "ticker = ?", normalized_ticker
+
+        issuer_id = self.issuer_id_for_security(security_id, as_of)
+        if issuer_id is not None:
+            return "issuer_id = ?", issuer_id
+
+        has_reviewed_owner = bool(
+            self.query(
+                """
+                SELECT 1
+                FROM security_issuer_assignments
+                WHERE security_id = ?
+                LIMIT 1
+                """,
+                (security_id,),
+            )
+        )
+        if has_reviewed_owner:
+            return None
+        return "ticker = ?", normalized_ticker
+
     def issuer_reference(self, issuer_id: str) -> dict | None:
         """Return canonical issuer metadata and its latest verified SEC CIK."""
         rows = self.query(
@@ -1714,9 +1826,10 @@ class Store:
         This is THE point-in-time read. It returns the most recent filing for
         each metric whose as_of_date <= as_of. No look-ahead possible.
         """
-        issuer_id = self.issuer_id_for_ticker(ticker, as_of)
-        identity_filter = "issuer_id = ?" if issuer_id is not None else "ticker = ?"
-        identity_value = issuer_id or ticker.upper()
+        identity = self._fundamental_identity_filter(ticker, as_of)
+        if identity is None:
+            return []
+        identity_filter, identity_value = identity
         sql = f"""
             WITH ranked AS (
                 SELECT *,
@@ -1727,6 +1840,7 @@ class Store:
                 FROM fundamentals
                 WHERE {identity_filter}
                   AND as_of_date <= CAST(? AS DATE)
+                  AND period_end <= as_of_date
             )
             SELECT ticker, issuer_id, security_id, period_end, as_of_date, fiscal_period,
                    statement, metric, value, quarter_value, unit, source
@@ -1747,9 +1861,10 @@ class Store:
         metric: str,
     ) -> list[dict]:
         """Return PIT-deduped metric history using issuer identity when verified."""
-        issuer_id = self.issuer_id_for_ticker(ticker, as_of)
-        identity_filter = "issuer_id = ?" if issuer_id is not None else "ticker = ?"
-        identity_value = issuer_id or ticker.upper()
+        identity = self._fundamental_identity_filter(ticker, as_of)
+        if identity is None:
+            return []
+        identity_filter, identity_value = identity
         return self.query(
             f"""
             WITH ranked AS (
@@ -1762,6 +1877,7 @@ class Store:
                 WHERE {identity_filter}
                   AND metric = ?
                   AND as_of_date <= CAST(? AS DATE)
+                  AND period_end <= as_of_date
                   AND quarter_value IS NOT NULL
             )
             SELECT period_end, fiscal_period, quarter_value
@@ -1770,6 +1886,53 @@ class Store:
             ORDER BY period_end ASC
             """,
             (identity_value, metric, str(as_of)),
+        )
+
+    def pit_factor_fundamentals(
+        self,
+        ticker: str,
+        as_of: date | str,
+        metrics: list[str],
+    ) -> list[dict]:
+        """Return one PIT-deduped history snapshot for several factor metrics.
+
+        This is the batched equivalent of repeatedly calling
+        :meth:`pit_fundamentals` and :meth:`fundamental_history`. It preserves
+        the same reviewed issuer/security routing and fail-closed identity-gap
+        behavior, while collapsing all requested metrics for one ticker/date
+        into a single DuckDB query. Callers must keep the result scoped to one
+        immutable decision snapshot; this method does not persist a cache.
+        """
+        normalized_metrics = sorted({metric.strip() for metric in metrics if metric.strip()})
+        if not normalized_metrics:
+            return []
+        identity = self._fundamental_identity_filter(ticker, as_of)
+        if identity is None:
+            return []
+        identity_filter, identity_value = identity
+        placeholders = ",".join("?" for _ in normalized_metrics)
+        return self.query(
+            f"""
+            WITH ranked AS (
+                SELECT metric, period_end, as_of_date, fiscal_period,
+                       value, quarter_value,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY metric, period_end
+                           ORDER BY as_of_date DESC
+                       ) AS period_rn
+                FROM fundamentals
+                WHERE {identity_filter}
+                  AND metric IN ({placeholders})
+                  AND as_of_date <= CAST(? AS DATE)
+                  AND period_end <= as_of_date
+            )
+            SELECT metric, period_end, as_of_date, fiscal_period,
+                   value, quarter_value
+            FROM ranked
+            WHERE period_rn = 1
+            ORDER BY metric, period_end
+            """,
+            (identity_value, *normalized_metrics, str(as_of)),
         )
 
     def pit_macro_history(self, series_id: str, as_of: date | str) -> list[dict]:
@@ -1878,27 +2041,32 @@ class Store:
         """Return a PIT price, preferring verified security identity when available.
 
         Legacy ticker lookup remains the compatibility path for securities that
-        do not yet have a reviewed provider-symbol mapping. Once a mapping is
-        active, untagged ticker rows are intentionally ignored.
+        have never had a reviewed provider-symbol mapping. Once any reviewed
+        mapping exists, dates without an active verified mapping fail closed;
+        when one is active, untagged ticker rows are intentionally ignored.
         """
         security_id = self.security_id_for_ticker(ticker, as_of)
-        has_mapping = False
+        has_reviewed_mapping = False
+        has_active_mapping = False
         if security_id is not None:
-            has_mapping = bool(
-                self.query(
-                    """
-                    SELECT 1
+            mapping_state = self.query(
+                """
+                    SELECT COUNT(*) AS reviewed_count,
+                           COUNT(*) FILTER (
+                               WHERE mapping_status = 'verified'
+                                 AND data_start <= CAST(? AS DATE)
+                                 AND (data_end IS NULL OR data_end > CAST(? AS DATE))
+                           ) AS active_count
                     FROM provider_symbol_history
                     WHERE security_id = ?
-                      AND mapping_status = 'verified'
-                      AND data_start <= CAST(? AS DATE)
-                      AND (data_end IS NULL OR data_end > CAST(? AS DATE))
-                    LIMIT 1
-                    """,
-                    (security_id, str(as_of), str(as_of)),
-                )
-            )
-        if has_mapping:
+                """,
+                (str(as_of), str(as_of), security_id),
+            )[0]
+            has_reviewed_mapping = mapping_state["reviewed_count"] > 0
+            has_active_mapping = mapping_state["active_count"] > 0
+        if has_reviewed_mapping and not has_active_mapping:
+            return None
+        if has_active_mapping:
             rows = self.query(
                 """
                 SELECT * FROM prices
@@ -1935,9 +2103,7 @@ class Store:
         sql += " ORDER BY date"
         return self.query(sql, tuple(params))
 
-    def universe_membership_on(
-        self, universe_id: str, as_of: date | str
-    ) -> list[dict]:
+    def universe_membership_on(self, universe_id: str, as_of: date | str) -> list[dict]:
         """Return members active and publicly known on the decision date."""
         return self.query(
             """
@@ -1953,9 +2119,7 @@ class Store:
             (universe_id, str(as_of), str(as_of), str(as_of)),
         )
 
-    def universe_data_coverage(
-        self, universe_id: str, as_of: date | str
-    ) -> list[dict]:
+    def universe_data_coverage(self, universe_id: str, as_of: date | str) -> list[dict]:
         """Report PIT fundamentals and price availability for each active member.
 
         Reviewed identities use issuer-tagged fundamentals and security-tagged
@@ -1994,6 +2158,11 @@ class Store:
                        ) AS issuer_id,
                        EXISTS (
                            SELECT 1
+                           FROM security_issuer_assignments AS owner
+                           WHERE owner.security_id = members.security_id
+                       ) AS has_reviewed_owner,
+                       EXISTS (
+                           SELECT 1
                            FROM provider_symbol_history AS mapping
                            WHERE mapping.security_id = members.security_id
                              AND mapping.mapping_status = 'verified'
@@ -2002,7 +2171,12 @@ class Store:
                                  mapping.data_end IS NULL
                                  OR mapping.data_end > members.as_of
                              )
-                       ) AS has_provider_mapping
+                       ) AS has_provider_mapping,
+                       EXISTS (
+                           SELECT 1
+                           FROM provider_symbol_history AS mapping
+                           WHERE mapping.security_id = members.security_id
+                       ) AS has_reviewed_provider_mapping
                 FROM members
             )
             SELECT identified.universe_id, identified.ticker,
@@ -2013,7 +2187,8 @@ class Store:
                        WHERE prices.security_id = identified.security_id
                          AND prices.date <= identified.as_of
                          AND prices.close IS NOT NULL
-                   ) ELSE EXISTS (
+                   ) WHEN identified.has_reviewed_provider_mapping THEN FALSE
+                   ELSE EXISTS (
                        SELECT 1 FROM prices
                        WHERE prices.ticker = identified.ticker
                          AND prices.date <= identified.as_of
@@ -2023,16 +2198,20 @@ class Store:
                        SELECT 1 FROM fundamentals
                        WHERE fundamentals.issuer_id = identified.issuer_id
                          AND fundamentals.as_of_date <= identified.as_of
-                   ) ELSE EXISTS (
+                         AND fundamentals.period_end <= fundamentals.as_of_date
+                   ) WHEN identified.has_reviewed_owner THEN FALSE
+                   ELSE EXISTS (
                        SELECT 1 FROM fundamentals
                        WHERE fundamentals.ticker = identified.ticker
                          AND fundamentals.as_of_date <= identified.as_of
+                         AND fundamentals.period_end <= fundamentals.as_of_date
                    ) END AS has_pit_fundamentals,
                    CASE WHEN identified.has_provider_mapping THEN (
                        SELECT MAX(prices.date) FROM prices
                        WHERE prices.security_id = identified.security_id
                          AND prices.date <= identified.as_of
-                   ) ELSE (
+                   ) WHEN identified.has_reviewed_provider_mapping THEN CAST(NULL AS DATE)
+                   ELSE (
                        SELECT MAX(prices.date) FROM prices
                        WHERE prices.ticker = identified.ticker
                          AND prices.date <= identified.as_of
@@ -2041,10 +2220,13 @@ class Store:
                        SELECT MAX(fundamentals.as_of_date) FROM fundamentals
                        WHERE fundamentals.issuer_id = identified.issuer_id
                          AND fundamentals.as_of_date <= identified.as_of
-                   ) ELSE (
+                         AND fundamentals.period_end <= fundamentals.as_of_date
+                   ) WHEN identified.has_reviewed_owner THEN CAST(NULL AS DATE)
+                   ELSE (
                        SELECT MAX(fundamentals.as_of_date) FROM fundamentals
                        WHERE fundamentals.ticker = identified.ticker
                          AND fundamentals.as_of_date <= identified.as_of
+                         AND fundamentals.period_end <= fundamentals.as_of_date
                    ) END AS latest_fundamental_date
             FROM identified
             LEFT JOIN security_master AS security
@@ -2069,6 +2251,7 @@ class Store:
             "provider_symbol_history",
             "prices",
             "fundamentals",
+            "fundamentals_quarantine",
             "macro",
             "universe_membership",
         ):

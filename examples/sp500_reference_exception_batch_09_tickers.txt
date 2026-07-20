@@ -1,0 +1,8 @@
+# Exception Batch 09: historical issuers absent from the SEC current ticker map.
+# Each exact membership window is certified separately below.
+ATVI
+CMA
+CTLT
+MRO
+PXD
+SEE

@@ -1,0 +1,26 @@
+issuer_id,canonical_name,canonical_ticker,cik,effective_start,effective_end,verified_date,source
+aios:issuer:sec:0001318605,"Tesla, Inc.",TSLA,0001318605,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001318605.json
+aios:issuer:sec:0000100493,"TYSON FOODS, INC.",TSN,0000100493,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000100493.json
+aios:issuer:sec:0001466258,Trane Technologies plc,TT,0001466258,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001466258.json
+aios:issuer:sec:0000946581,TAKE TWO INTERACTIVE SOFTWARE INC,TTWO,0000946581,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000946581.json
+aios:issuer:sec:0000097476,TEXAS INSTRUMENTS INC,TXN,0000097476,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000097476.json
+aios:issuer:sec:0000217346,TEXTRON INC,TXT,0000217346,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000217346.json
+aios:issuer:sec:0000860731,TYLER TECHNOLOGIES INC,TYL,0000860731,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000860731.json
+aios:issuer:sec:0000100517,"United Airlines Holdings, Inc.",UAL,0000100517,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000100517.json
+aios:issuer:sec:0000074208,"UDR, Inc.",UDR,0000074208,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000074208.json
+aios:issuer:sec:0000352915,UNIVERSAL HEALTH SERVICES INC,UHS,0000352915,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000352915.json
+aios:issuer:sec:0001403568,"Ulta Beauty, Inc.",ULTA,0001403568,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001403568.json
+aios:issuer:sec:0000731766,UNITEDHEALTH GROUP INC,UNH,0000731766,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000731766.json
+aios:issuer:sec:0000100885,UNION PACIFIC CORP,UNP,0000100885,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000100885.json
+aios:issuer:sec:0001090727,UNITED PARCEL SERVICE INC,UPS,0001090727,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001090727.json
+aios:issuer:sec:0001067701,"UNITED RENTALS, INC.",URI,0001067701,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001067701.json
+aios:issuer:sec:0000036104,US BANCORP \DE\,USB,0000036104,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000036104.json
+aios:issuer:sec:0001403161,VISA INC.,V,0001403161,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001403161.json
+aios:issuer:sec:0001705696,VICI PROPERTIES INC.,VICI,0001705696,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001705696.json
+aios:issuer:sec:0001035002,VALERO ENERGY CORP/TX,VLO,0001035002,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001035002.json
+aios:issuer:sec:0001396009,Vulcan Materials CO,VMC,0001396009,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001396009.json
+aios:issuer:sec:0001442145,"Verisk Analytics, Inc.",VRSK,0001442145,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001442145.json
+aios:issuer:sec:0001014473,VERISIGN INC/CA,VRSN,0001014473,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001014473.json
+aios:issuer:sec:0000875320,VERTEX PHARMACEUTICALS INC / MA,VRTX,0000875320,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000875320.json
+aios:issuer:sec:0000740260,"Ventas, Inc.",VTR,0000740260,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0000740260.json
+aios:issuer:sec:0001792044,Viatris Inc,VTRS,0001792044,2023-08-01,2025-01-01,2026-07-18,https://data.sec.gov/submissions/CIK0001792044.json

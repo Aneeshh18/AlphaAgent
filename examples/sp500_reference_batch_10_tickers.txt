@@ -1,0 +1,27 @@
+# Batch 10: next 25 uncovered unchanged full-window S&P 500 securities.
+# Certified identity window: 2023-08-01 through 2025-01-01 (exclusive end).
+GS
+GWW
+HAL
+HAS
+HBAN
+HCA
+HD
+HES
+HIG
+HII
+HLT
+HOLX
+HON
+HPE
+HPQ
+HRL
+HSIC
+HST
+HSY
+HUM
+HWM
+IBM
+ICE
+IDXX
+IEX

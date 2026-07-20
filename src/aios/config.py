@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     # --- SimFin (optional) ---
     simfin_api_key: str = Field(default="")
 
+    # --- Tiingo EOD prices (optional; each user supplies their own token) ---
+    tiingo_api_key: str = Field(default="")
+
     # --- LLM (reserved, unused in foundation phase) ---
     anthropic_api_key: str = Field(default="")
     zai_api_key: str = Field(default="")
