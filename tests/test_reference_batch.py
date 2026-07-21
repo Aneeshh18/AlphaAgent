@@ -10,18 +10,24 @@ from typer.testing import CliRunner
 from aios.cli import app
 from aios.ingest import reference_batch
 from aios.ingest.reference_batch import (
+    build_anchored_reference_extension_batch,
     build_stable_reference_batch,
     build_stable_reference_window_batch,
     ingest_reviewed_reference_batch,
     load_batch_tickers,
     load_batch_windows,
+    merge_reference_batch_files,
+    plan_historical_reference_gaps,
+    plan_missing_reference_windows,
     write_reference_batch,
+    write_reference_window_batches,
 )
 from aios.ingest.reference_identity import (
     load_issuer_cik_csv,
     load_provider_symbol_csv,
     load_security_issuer_csv,
 )
+from aios.market_calendar import us_equity_sessions
 from aios.storage.store import Store
 
 EVIDENCE = "https://www.sec.gov/Archives/edgar/data/1/example.htm"
@@ -73,18 +79,23 @@ def _submissions(_cik: int) -> dict:
     }
 
 
-def _prices(_provider: str, symbol: str, start: str, _end: str) -> list[dict]:
+def _prices(_provider: str, symbol: str, start: str, end: str) -> list[dict]:
     first = date.fromisoformat(start)
+    requested_end = date.fromisoformat(end) if end else first + timedelta(days=10)
+    exclusive_end = min(requested_end, date.today())
     return [
         {
             "ticker": symbol,
-            "date": (first + timedelta(days=offset)).isoformat(),
+            "date": session.isoformat(),
             "close": 100.0 + offset,
             "adj_close": 100.0 + offset,
             "volume": 1_000 + offset,
             "source": "yfinance",
         }
-        for offset in range(1, 9)
+        for offset, session in enumerate(
+            us_equity_sessions(first, exclusive_end),
+            start=1,
+        )
     ]
 
 
@@ -109,7 +120,7 @@ def test_stable_reference_batch_builds_importable_manifests(tmp_path):
         )
         assert result["accepted"] == 1
         assert result["rejected"] == 0
-        assert result["review_rows"][0]["provider_rows"] == 8
+        assert result["review_rows"][0]["provider_rows"] == 7
         assert len(result["review_rows"][0]["price_payload_sha256"]) == 64
 
         paths = write_reference_batch(
@@ -175,10 +186,73 @@ def test_stable_reference_batch_rejects_ambiguous_sec_and_thin_prices(tmp_path):
             store=store,
             sec_records=_sec_records(),
             submissions_fetcher=_submissions,
-            price_fetcher=lambda *_args: _prices("yfinance", "TST", "2024-01-01", "")[:6],
+            price_fetcher=lambda *_args: _prices("yfinance", "TST", "2024-01-01", "")[:5],
         )
         assert thin["accepted"] == 0
         assert "incomplete" in thin["review_rows"][0]["reason"]
+    finally:
+        store.close()
+
+
+def test_stable_reference_batch_uses_current_sec_identity_for_live_endpoint(tmp_path):
+    today = date.today()
+    start = today - timedelta(days=10)
+    end = today + timedelta(days=1)
+    store = Store(tmp_path / "live-endpoint.duckdb")
+    try:
+        _setup_named_security(
+            store,
+            ticker="TST",
+            security_id=SECURITY_ID,
+            start=start.isoformat(),
+            end=end.isoformat(),
+        )
+
+        def current_submissions(_cik: int) -> dict:
+            return {
+                "cik": "1",
+                "name": "Test Corporation",
+                "tickers": ["TST"],
+                "filings": {"recent": {"filingDate": [(start - timedelta(days=1)).isoformat()]}},
+            }
+
+        result = build_stable_reference_batch(
+            ["TST"],
+            universe_id="demo",
+            start=start,
+            end=end,
+            verified_date=today,
+            store=store,
+            sec_records=_sec_records(),
+            submissions_fetcher=current_submissions,
+            price_fetcher=_prices,
+        )
+
+        assert result["accepted"] == 1
+        assert result["rejected"] == 0
+    finally:
+        store.close()
+
+
+def test_stable_reference_batch_rejects_window_beyond_verification_boundary(tmp_path):
+    store = Store(tmp_path / "future-window.duckdb")
+    try:
+        _setup_stable_security(store)
+        with pytest.raises(
+            ValueError,
+            match="end cannot extend beyond the day after verified_date",
+        ):
+            build_stable_reference_batch(
+                ["TST"],
+                universe_id="demo",
+                start="2024-01-01",
+                end="2024-01-11",
+                verified_date="2024-01-09",
+                store=store,
+                sec_records=_sec_records(),
+                submissions_fetcher=_submissions,
+                price_fetcher=_prices,
+            )
     finally:
         store.close()
 
@@ -456,6 +530,51 @@ def test_bulk_archive_is_validated_before_reference_import(tmp_path):
         store.close()
 
 
+def test_reference_batch_reports_empty_reviewed_price_fetch_as_failure(monkeypatch, tmp_path):
+    store = Store(tmp_path / "empty-price-fetch.duckdb")
+    try:
+        _setup_stable_security(store)
+        result = build_stable_reference_batch(
+            ["TST"],
+            universe_id="demo",
+            start="2024-01-01",
+            end="2024-01-11",
+            verified_date="2024-01-11",
+            store=store,
+            sec_records=_sec_records(),
+            submissions_fetcher=_submissions,
+            price_fetcher=_prices,
+        )
+        paths = write_reference_batch(
+            result,
+            output_dir=tmp_path / "empty-price-output",
+            batch_name="empty_price_batch",
+        )
+
+        monkeypatch.setattr("aios.ingest.edgar.ingest_issuer", lambda *_a, **_k: 12)
+        monkeypatch.setattr(reference_batch, "ingest_security_prices", lambda *_a, **_k: 0)
+
+        summary = ingest_reviewed_reference_batch(
+            paths["issuer_ciks"],
+            paths["security_issuers"],
+            paths["provider_symbols"],
+            start="2024-01-01",
+            end="2024-01-11",
+            store=store,
+        )
+
+        assert summary["price_rows"] == 0
+        assert summary["failures"] == [
+            {
+                "kind": "prices",
+                "id": SECURITY_ID,
+                "error": "provider returned no rows in the reviewed interval",
+            }
+        ]
+    finally:
+        store.close()
+
+
 def test_batch_window_csv_loads_comments_blank_lines_and_mixed_windows(tmp_path):
     path = tmp_path / "windows.csv"
     path.write_text(
@@ -480,6 +599,320 @@ def test_batch_window_csv_loads_comments_blank_lines_and_mixed_windows(tmp_path)
             "end": date(2024, 1, 25),
         },
     ]
+
+
+def test_missing_reference_window_plan_is_resumable_and_writes_batches(tmp_path):
+    store = Store(tmp_path / "reference-plan.duckdb")
+    try:
+        _setup_named_security(
+            store,
+            ticker="AAA",
+            security_id="aios:bounded:demo:aaa",
+        )
+        _setup_named_security(
+            store,
+            ticker="BBB",
+            security_id="aios:bounded:demo:bbb",
+        )
+        store.upsert_reference_identities(
+            [
+                {
+                    "issuer_id": "aios:issuer:sec:0000000001",
+                    "canonical_name": "AAA Corporation",
+                    "canonical_ticker": "AAA",
+                    "source": EVIDENCE,
+                }
+            ],
+            [
+                {
+                    "issuer_id": "aios:issuer:sec:0000000001",
+                    "cik": "0000000001",
+                    "effective_start": "2024-01-01",
+                    "effective_end": "2024-01-11",
+                    "verified_date": "2024-01-05",
+                    "source": EVIDENCE,
+                }
+            ],
+            [
+                {
+                    "security_id": "aios:bounded:demo:aaa",
+                    "issuer_id": "aios:issuer:sec:0000000001",
+                    "effective_start": "2024-01-01",
+                    "effective_end": "2024-01-11",
+                    "verified_date": "2024-01-05",
+                    "source": EVIDENCE,
+                }
+            ],
+            [
+                {
+                    "provider": "yfinance",
+                    "provider_symbol": "AAA",
+                    "security_id": "aios:bounded:demo:aaa",
+                    "data_start": "2024-01-01",
+                    "data_end": "2024-01-11",
+                    "mapping_status": "verified",
+                    "verified_date": "2024-01-05",
+                    "source": "https://query1.finance.yahoo.com/v8/finance/chart/AAA",
+                }
+            ],
+        )
+
+        windows = plan_missing_reference_windows(
+            universe_id="demo",
+            as_of="2024-01-05",
+            start_floor="2024-01-02",
+            end="2024-01-10",
+            store=store,
+        )
+        assert windows == [
+            {
+                "ticker": "BBB",
+                "start": date(2024, 1, 2),
+                "end": date(2024, 1, 10),
+            }
+        ]
+        paths = write_reference_window_batches(
+            windows,
+            output_dir=tmp_path / "planned",
+            batch_prefix="demo_reference_batch",
+            batch_size=1,
+            start_number=7,
+        )
+        assert [path.name for path in paths] == ["demo_reference_batch_07_windows.csv"]
+        assert load_batch_windows(paths[0]) == windows
+    finally:
+        store.close()
+
+
+def test_historical_reference_plan_finds_internal_removed_member_gap(tmp_path):
+    store = Store(tmp_path / "historical-reference-plan.duckdb")
+    try:
+        security_id = "aios:bounded:demo:aaa"
+        issuer_id = "aios:issuer:sec:0000000001"
+        _setup_named_security(
+            store,
+            ticker="AAA",
+            security_id=security_id,
+            start="2024-01-01",
+            end="2024-02-01",
+        )
+        intervals = [("2024-01-01", "2024-01-10"), ("2024-01-20", "2024-02-01")]
+        store.upsert_reference_identities(
+            [
+                {
+                    "issuer_id": issuer_id,
+                    "canonical_name": "AAA Corporation",
+                    "canonical_ticker": "AAA",
+                    "source": EVIDENCE,
+                }
+            ],
+            [
+                {
+                    "issuer_id": issuer_id,
+                    "cik": "0000000001",
+                    "effective_start": start,
+                    "effective_end": end,
+                    "verified_date": "2024-02-01",
+                    "source": EVIDENCE,
+                }
+                for start, end in intervals
+            ],
+            [
+                {
+                    "security_id": security_id,
+                    "issuer_id": issuer_id,
+                    "effective_start": start,
+                    "effective_end": end,
+                    "verified_date": "2024-02-01",
+                    "source": EVIDENCE,
+                }
+                for start, end in intervals
+            ],
+            [
+                {
+                    "provider": "yfinance",
+                    "provider_symbol": "AAA",
+                    "security_id": security_id,
+                    "data_start": start,
+                    "data_end": end,
+                    "mapping_status": "verified",
+                    "verified_date": "2024-02-01",
+                    "source": "https://query1.finance.yahoo.com/v8/finance/chart/AAA",
+                }
+                for start, end in intervals
+            ],
+        )
+
+        assert plan_historical_reference_gaps(
+            universe_id="demo",
+            start="2024-01-01",
+            end="2024-02-01",
+            store=store,
+        ) == [
+            {
+                "ticker": "AAA",
+                "start": date(2024, 1, 10),
+                "end": date(2024, 1, 20),
+            }
+        ]
+    finally:
+        store.close()
+
+
+def test_anchored_extension_accepts_retired_ticker_without_live_sec_map(tmp_path):
+    store = Store(tmp_path / "anchored-extension.duckdb")
+    try:
+        security_id = "aios:bounded:demo:tst"
+        issuer_id = "aios:issuer:sec:0000000001"
+        _setup_named_security(
+            store,
+            ticker="TST",
+            security_id=security_id,
+            start="2024-01-01",
+            end="2024-02-01",
+        )
+        store.upsert_reference_identities(
+            [
+                {
+                    "issuer_id": issuer_id,
+                    "canonical_name": "Test Corporation",
+                    "canonical_ticker": "TST",
+                    "source": EVIDENCE,
+                }
+            ],
+            [
+                {
+                    "issuer_id": issuer_id,
+                    "cik": "0000000001",
+                    "effective_start": "2024-01-01",
+                    "effective_end": None,
+                    "verified_date": "2024-01-10",
+                    "source": EVIDENCE,
+                }
+            ],
+            [
+                {
+                    "security_id": security_id,
+                    "issuer_id": issuer_id,
+                    "effective_start": "2024-01-01",
+                    "effective_end": "2024-01-10",
+                    "verified_date": "2024-01-10",
+                    "source": EVIDENCE,
+                }
+            ],
+            [
+                {
+                    "provider": "yfinance",
+                    "provider_symbol": "TST",
+                    "security_id": security_id,
+                    "data_start": "2024-01-01",
+                    "data_end": "2024-01-10",
+                    "mapping_status": "verified",
+                    "verified_date": "2024-01-10",
+                    "source": "https://query1.finance.yahoo.com/v8/finance/chart/TST",
+                }
+            ],
+        )
+
+        def retired_submissions(_cik: int) -> dict:
+            return {
+                "cik": "1",
+                "name": "Test Corporation",
+                "tickers": [],
+                "filings": {
+                    "recent": {"filingDate": ["2023-12-01", "2024-01-31"]}
+                },
+            }
+
+        result = build_anchored_reference_extension_batch(
+            [{"ticker": "TST", "start": "2024-01-10", "end": "2024-02-01"}],
+            universe_id="demo",
+            provider="yfinance",
+            verified_date="2024-02-01",
+            store=store,
+            submissions_fetcher=retired_submissions,
+            price_fetcher=_prices,
+        )
+
+        assert result["accepted"] == 1
+        assert result["rejected"] == 0
+        assert result["issuer_rows"][0]["cik"] == "0000000001"
+        assert result["issuer_rows"][0]["effective_start"] == date(2024, 1, 1)
+        assert result["issuer_rows"][0]["effective_end"] is None
+        assert result["provider_rows"][0]["data_start"] == date(2024, 1, 10)
+        assert "adjacent reviewed" in result["review_rows"][0]["reason"]
+    finally:
+        store.close()
+
+
+def test_reference_batch_file_merge_keeps_accepts_and_drops_rejections(tmp_path):
+    accepted_result = {
+        "issuer_rows": [
+            {
+                "issuer_id": "aios:issuer:sec:0000000001",
+                "canonical_name": "AAA Corporation",
+                "canonical_ticker": "AAA",
+                "cik": "0000000001",
+                "effective_start": date(2024, 1, 1),
+                "effective_end": date(2024, 1, 11),
+                "verified_date": date(2024, 1, 11),
+                "source": EVIDENCE,
+            }
+        ],
+        "owner_rows": [
+            {
+                "security_id": "aios:bounded:demo:aaa",
+                "issuer_id": "aios:issuer:sec:0000000001",
+                "effective_start": date(2024, 1, 1),
+                "effective_end": date(2024, 1, 11),
+                "verified_date": date(2024, 1, 11),
+                "source": EVIDENCE,
+            }
+        ],
+        "provider_rows": [
+            {
+                "provider": "yfinance",
+                "provider_symbol": "AAA",
+                "security_id": "aios:bounded:demo:aaa",
+                "data_start": date(2024, 1, 1),
+                "data_end": date(2024, 1, 11),
+                "mapping_status": "verified",
+                "verified_date": date(2024, 1, 11),
+                "source": "https://query1.finance.yahoo.com/v8/finance/chart/AAA",
+            }
+        ],
+        "review_rows": [
+            {
+                "ticker": "AAA",
+                "security_id": "aios:bounded:demo:aaa",
+                "assignment_start": "2024-01-01",
+                "assignment_end": "2024-01-11",
+                "review_status": "accepted",
+            },
+            {
+                "ticker": "BAD",
+                "security_id": "aios:bounded:demo:bad",
+                "assignment_start": "2024-01-01",
+                "assignment_end": "2024-01-11",
+                "review_status": "rejected",
+                "reason": "manual review",
+            },
+        ],
+        "accepted": 1,
+        "rejected": 1,
+    }
+    write_reference_batch(
+        accepted_result,
+        output_dir=tmp_path,
+        batch_name="source_batch",
+    )
+
+    merged = merge_reference_batch_files([tmp_path / "source_batch"])
+
+    assert merged["accepted"] == 1
+    assert merged["rejected"] == 0
+    assert [row["ticker"] for row in merged["review_rows"]] == ["AAA"]
+    assert [row["security_id"] for row in merged["owner_rows"]] == ["aios:bounded:demo:aaa"]
 
 
 @pytest.mark.parametrize(

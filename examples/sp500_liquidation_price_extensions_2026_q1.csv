@@ -1,0 +1,3 @@
+universe_id,security_id,ticker,provider,provider_symbol,data_start,data_end,verified_date,identity_source,provider_source,purpose
+sp500,aios:bounded:sp500:mtch,MTCH,yfinance,MTCH,2026-03-23,2026-04-02,2026-07-21,https://data.sec.gov/submissions/CIK0000891103.json,https://query1.finance.yahoo.com/v8/finance/chart/MTCH,portfolio_liquidation
+sp500,aios:bounded:sp500:payc,PAYC,yfinance,PAYC,2026-03-23,2026-04-02,2026-07-21,https://data.sec.gov/submissions/CIK0001590955.json,https://query1.finance.yahoo.com/v8/finance/chart/PAYC,portfolio_liquidation

@@ -1,0 +1,3 @@
+issuer_id,canonical_name,canonical_ticker,cik,effective_start,effective_end,verified_date,source
+aios:issuer:sec:0000034088,Exxon Mobil Corporation,XOM,0000034088,2025-01-01,2026-07-02,2026-07-21,https://www.sec.gov/Archives/edgar/data/34088/000119312526291986/d70995d8k.htm
+aios:issuer:sec:0002115436,ExxonMobil Holdings Corporation,XOM,0002115436,2026-07-02,2026-07-22,2026-07-21,https://www.sec.gov/Archives/edgar/data/2115436/000119312526291990/d71068d8k12b.htm

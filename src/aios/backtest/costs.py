@@ -175,8 +175,9 @@ def simulate_period(
     sessions; missing evidence fails the period instead of silently shortening
     it. Reviewed securities are queried by immutable ``security_id`` so a dated
     ticker change does not look like a sale or delisting. Adjusted close is used
-    for gross total return when available; raw close, split ratios, and
-    dividends are used for execution and tax accounting.
+    for gross total return when available; provider close and dividends are
+    used for execution/tax accounting, with split ratios applied only when the
+    provider close is not already split-normalized.
     """
     if initial_capital <= 0 or not isfinite(initial_capital):
         raise ValueError("initial_capital must be finite and positive")
@@ -217,6 +218,24 @@ def simulate_period(
         return _missing_result(tuple(sorted(set(missing))))
     if exit_date < entry_date:
         return _missing_result(("empty_holding_window",))
+    missing.extend(
+        f"{ticker}:unverified_corporate_actions:{row['date']}"
+        for ticker, rows in by_ticker.items()
+        for row in rows
+        if row.get("actions_complete") is not True
+    )
+    missing.extend(
+        f"{ticker}:split_adjustment_basis_unknown"
+        for ticker, rows in by_ticker.items()
+        if any(row.get("close_split_adjusted") is None for row in rows)
+    )
+    missing.extend(
+        f"{ticker}:mixed_split_adjustment_basis"
+        for ticker, rows in by_ticker.items()
+        if len({row.get("close_split_adjusted") for row in rows}) > 1
+    )
+    if missing:
+        return _missing_result(tuple(sorted(set(missing))))
 
     entry_rows: dict[str, dict] = {}
     exit_rows: dict[str, dict] = {}
@@ -267,7 +286,7 @@ def simulate_period(
             if action["date"] <= entry_date:
                 continue
             split_ratio = _positive_number(action.get("split_ratio"), default=1.0)
-            if split_ratio != 1.0:
+            if split_ratio != 1.0 and action.get("close_split_adjusted") is not True:
                 shares *= split_ratio
                 basis_per_share /= split_ratio
             dividends = _positive_number(action.get("dividends"), default=0.0)
@@ -320,7 +339,8 @@ def _holding_price_rows(
     if security_id is not None:
         return store.query(
             """
-            SELECT ticker, security_id, date, close, adj_close, dividends, split_ratio
+            SELECT ticker, security_id, date, close, adj_close, dividends, split_ratio,
+                   actions_complete, close_split_adjusted
             FROM prices
             WHERE security_id = ?
               AND date > ? AND date <= ?
@@ -330,7 +350,8 @@ def _holding_price_rows(
         )
     return store.query(
         """
-        SELECT ticker, security_id, date, close, adj_close, dividends, split_ratio
+        SELECT ticker, security_id, date, close, adj_close, dividends, split_ratio,
+               actions_complete, close_split_adjusted
         FROM prices
         WHERE ticker = ?
           AND date > ? AND date <= ?

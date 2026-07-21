@@ -6,18 +6,44 @@ through here. Designed to be wired to systemd/cron later.
 Commands
 --------
   aios doctor        — verify env, deps, DB, connectivity
+  aios readiness     — fail-closed U.S. data/readiness report
+  aios health        — one plain-language operating check
+  aios backup        — checksum-verified local data/paper backup
+  aios verify-backup — verify a backup without restoring it
+  aios restore       — confirmed recovery with automatic rollback backup
+  aios scheduler-install — enable local refresh/health/backup timers
+  aios scheduler-status — show whether local timers are enabled and waiting
+  aios scheduler-pause/resume — safely stop/start local timers
+  aios scheduler-remove — disable and remove only AIOS-managed timer files
+  aios dashboard     — open the local research dashboard
+  aios paper-init    — create a local simulation-only portfolio
+  aios forward-freeze — freeze policy/configuration for untouched monitoring
+  aios forward-status — verify the active forward policy has not drifted
+  aios paper-propose — build a reviewed QV simulation proposal
+  aios paper-execute — explicitly simulate an approved proposal
+  aios paper-mark    — update simulated holdings through a reviewed close
+  aios paper-status  — show local simulation state in plain language
+  aios refresh-us-current — refresh reviewed U.S. prices, filings, and macro
   aios ingest-macro  — pull FRED + Treasury macro series
   aios build-universe-membership — reconcile spans with public change events
   aios import-universe — import PIT historical universe membership CSV
   aios build-security-identities — assign stable IDs to certified intervals
   aios import-security-identities — import audited stable identity assignments
   aios import-reference-identities — import issuer/CIK/provider mappings
+  aios import-security-conversions — import reviewed share-for-share events
+  aios ingest-liquidation-prices — extend held removed securities to rebalance
   aios build-reference-batch — certify unchanged-ticker issuer/provider mappings
+  aios plan-reference-window-batches — plan resumable current-member batches
+  aios plan-historical-reference-batches — include removed-member provenance gaps
   aios build-reference-window-batch — certify per-ticker bounded windows
+  aios merge-reference-batches — consolidate accepted reviewed batch rows
   aios ingest-reference-batch — import and ingest one certified identity batch
+  aios refresh-price-actions — repair reviewed price rows fetched without actions
+  aios build-factor-price-warmup — overlap-review pre-membership factor history
+  aios ingest-factor-price-warmup — import an accepted factor warm-up batch
   aios universe-coverage — audit member-level price and PIT fundamental coverage
   aios macro-regime  — classify the release-aware macro regime for a date
-  aios backtest-qv   — validate regime weights against a fixed 60/40 policy
+  aios backtest-qv   — validate QV/QVML regime weights against a fixed baseline
   aios ingest-ticker — pull EDGAR fundamentals + prices for one ticker
   aios ingest-batch  — pull many tickers (reads tickers.txt)
   aios status        — show row counts + latest dates per table
@@ -31,10 +57,12 @@ Commands
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import platform
 import subprocess
 import sys
+from contextlib import suppress
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Annotated
@@ -47,6 +75,7 @@ from rich.table import Table
 
 from aios import __version__
 from aios.config import settings
+from aios.readiness import assess_us_readiness
 from aios.storage.store import get_store
 
 app = typer.Typer(
@@ -61,6 +90,17 @@ UNIVERSE_FILE_ARGUMENT = typer.Argument(..., help="CSV with effective and known 
 SECURITY_IDENTITY_FILE_ARGUMENT = typer.Argument(
     ..., help="Audited security identity assignment CSV."
 )
+SECURITY_CONVERSION_FILE_ARGUMENT = typer.Argument(
+    ..., help="Reviewed share-for-share security conversion CSV."
+)
+LIQUIDATION_EXTENSION_FILE_ARGUMENT = typer.Argument(
+    ..., help="Reviewed post-membership ticker/provider extension CSV."
+)
+
+
+def _project_path(path: Path) -> Path:
+    """Resolve a CLI data path consistently when invoked outside the repo."""
+    return path if path.is_absolute() else settings.project_root / path
 
 
 @app.command()
@@ -122,6 +162,885 @@ def doctor() -> None:
     sys.exit(0 if ok else 1)
 
 
+@app.command("health")
+def health(
+    strict: Annotated[
+        bool,
+        typer.Option(
+            "--strict/--report-only",
+            help="Return a failing exit code when an operating blocker remains.",
+        ),
+    ] = True,
+) -> None:
+    """Show whether normal research and paper monitoring are safe to open."""
+    from aios.paper import (
+        DEFAULT_ACCOUNT_RELATIVE_PATH,
+        latest_paper_decision_date,
+        paper_account_summary,
+    )
+
+    try:
+        store = get_store()
+        decision_date = latest_paper_decision_date(store)
+        report = assess_us_readiness(decision_date, purpose="paper", store=store)
+        account_path = settings.project_root / DEFAULT_ACCOUNT_RELATIVE_PATH
+        paper_detail = "not initialized; research remains available"
+        paper_ok = True
+        if account_path.exists():
+            try:
+                summary = paper_account_summary(account_path, store)
+                paper_detail = (
+                    f"verified; ${summary['equity']:,.2f} simulated value, "
+                    f"{len(summary['holdings'])} holding(s)"
+                )
+            except Exception as exc:
+                paper_ok = False
+                paper_detail = f"blocked; local paper state could not be verified ({exc})"
+    except duckdb.IOException as exc:
+        console.print(
+            "[red]Health check could not open the local database.[/red] Close the "
+            "dashboard or another AIOS command, then retry."
+        )
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:
+        console.print(f"[red]Health check failed safely:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    integrity = next(check for check in report.checks if check.check == "data_integrity")
+    table = Table(title=f"AI Investment OS health — {decision_date}")
+    table.add_column("area")
+    table.add_column("status")
+    table.add_column("plain-language detail")
+    table.add_row(
+        "U.S. research data",
+        "[green]ready[/green]" if report.ready else "[red]blocked[/red]",
+        "All current operating gates passed."
+        if report.ready
+        else f"{len(report.blockers)} blocking gate(s) need attention.",
+    )
+    table.add_row(
+        "Database integrity",
+        "[green]safe[/green]" if integrity.status != "fail" else "[red]blocked[/red]",
+        integrity.observed,
+    )
+    table.add_row(
+        "Paper simulation",
+        "[green]verified[/green]" if paper_ok else "[red]blocked[/red]",
+        paper_detail,
+    )
+    table.add_row(
+        "Broker orders",
+        "[yellow]disabled[/yellow]",
+        "No broker is connected; this installation cannot place an order.",
+    )
+    console.print(table)
+    console.print(
+        f"Source dates — prices: {report.raw_prices_through}; filings: "
+        f"{report.fundamentals_through}; macro releases: "
+        f"{report.macro_releases_through}."
+    )
+    healthy = report.ready and integrity.status != "fail" and paper_ok
+    if healthy:
+        console.print(
+            "[bold green]HEALTHY for supervised research and paper monitoring.[/bold green]"
+        )
+    else:
+        console.print("[bold red]BLOCKED — do not create or record a paper proposal.[/bold red]")
+    if strict and not healthy:
+        raise typer.Exit(code=1)
+
+
+@app.command("backup")
+def backup(
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            help="Backup directory; defaults to a timestamped folder under backups/.",
+        ),
+    ] = None,
+) -> None:
+    """Create a verified backup of DuckDB and local paper JSON; secrets are excluded."""
+    from aios.operations import create_local_backup
+
+    store = None
+    try:
+        store = get_store()
+        store.execute("CHECKPOINT")
+        store.close()
+        destination = _project_path(output) if output is not None else None
+        result = create_local_backup(
+            settings.project_root,
+            _project_path(settings.duckdb_path),
+            output=destination,
+            application_version=__version__,
+        )
+    except duckdb.IOException as exc:
+        console.print(
+            "[red]Backup could not lock the local database.[/red] Close the dashboard "
+            "and any other AIOS command, then retry."
+        )
+        raise typer.Exit(code=1) from exc
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Backup failed safely:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        if store is not None:
+            with suppress(Exception):
+                store.close()
+    console.print(f"[bold green]Verified backup created:[/bold green] {result.path}")
+    console.print(
+        f"{result.files} file(s), {result.bytes:,} bytes; manifest SHA-256 "
+        f"{result.manifest_sha256}."
+    )
+    console.print("The backup excludes .env, logs, caches, and backtest artifacts.")
+
+
+@app.command("verify-backup")
+def verify_backup(
+    path: Annotated[Path, typer.Argument(help="Backup directory to verify.")],
+) -> None:
+    """Verify every file and checksum in a local AIOS backup."""
+    from aios.operations import verify_local_backup
+
+    try:
+        result = verify_local_backup(_project_path(path))
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Backup verification failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"[bold green]Backup verified:[/bold green] {result.path} "
+        f"({result.files} file(s), {result.bytes:,} bytes)."
+    )
+
+
+@app.command("restore")
+def restore(
+    path: Annotated[Path, typer.Argument(help="Verified backup directory to restore.")],
+    confirm_restore: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-restore/--no-confirm-restore",
+            help="Required acknowledgement that local data and paper state will be replaced.",
+        ),
+    ] = False,
+) -> None:
+    """Restore database and paper state after an automatic pre-restore backup."""
+    from aios.operations import restore_local_backup
+    from aios.storage.store import Store
+
+    store = None
+    restored_store = None
+    try:
+        store = get_store()
+        store.execute("CHECKPOINT")
+        store.close()
+        database_path = _project_path(settings.duckdb_path)
+        result = restore_local_backup(
+            _project_path(path),
+            settings.project_root,
+            database_path,
+            application_version=__version__,
+            confirm=confirm_restore,
+        )
+        restored_store = Store(database_path)
+        failures = [
+            row for row in restored_store.data_quality_report() if row["status"] == "fail"
+        ]
+    except duckdb.IOException as exc:
+        console.print(
+            "[red]Restore could not lock the local database.[/red] Close the dashboard "
+            "and every other AIOS command, then retry."
+        )
+        raise typer.Exit(code=1) from exc
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Restore refused safely:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        for connection in (restored_store, store):
+            if connection is not None:
+                with suppress(Exception):
+                    connection.close()
+    console.print(f"[bold green]Restore completed from:[/bold green] {result.source}")
+    console.print(f"Automatic pre-restore safety backup: {result.safety_backup}")
+    if failures:
+        console.print(
+            f"[bold red]The restored database has {len(failures)} hard validation "
+            "failure(s). Do not use it; retain the safety backup above.[/bold red]"
+        )
+        raise typer.Exit(code=1)
+    console.print(
+        "[bold green]The restored database opened with zero hard validation failures.[/bold green]"
+    )
+
+
+@app.command("scheduler-install")
+def scheduler_install(
+    confirm_install: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-install/--no-confirm-install",
+            help="Required acknowledgement before user-level timers are installed.",
+        ),
+    ] = False,
+) -> None:
+    """Install weekday refresh, weekly filings, and verified-backup user timers."""
+    from aios.scheduler import install_user_scheduler
+
+    try:
+        result = install_user_scheduler(
+            settings.project_root,
+            confirm=confirm_install,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Scheduler installation refused safely:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"[bold green]Local scheduler installed:[/bold green] {len(result.timers)} "
+        f"timers in {result.unit_dir}."
+    )
+    console.print(
+        "Weekday prices/macro run at 07:30, weekly filings Saturday at 09:00, "
+        "and verified backups Sunday at 09:00 (computer local time)."
+    )
+    console.print(
+        "[yellow]Close the dashboard before a scheduled run.[/yellow] DuckDB is a "
+        "single-process local store; a collision fails safely and is visible in status/logs."
+    )
+
+
+@app.command("scheduler-status")
+def scheduler_status() -> None:
+    """Show whether each supported local timer is installed and waiting."""
+    from aios.scheduler import user_scheduler_status
+
+    try:
+        status = user_scheduler_status()
+    except (OSError, RuntimeError) as exc:
+        console.print(f"[red]Scheduler status is unavailable:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    table = Table(title="AIOS local scheduler")
+    table.add_column("timer")
+    table.add_column("enabled")
+    table.add_column("state")
+    table.add_column("last run")
+    table.add_column("next run")
+    for timer, state in status.items():
+        if not state.get("runtime_verified", True):
+            table.add_row(
+                timer,
+                "yes" if state["enabled"] else "no",
+                "not verified",
+                "runtime unavailable",
+                "runtime unavailable",
+            )
+            continue
+        if state["service_result"] in {"success", "not-run"}:
+            last_result = (
+                "passed"
+                if state["service_result"] == "success" and state["exit_status"] == "0"
+                else "not run yet"
+            )
+        else:
+            last_result = (
+                f"failed ({state['service_result']}, exit {state['exit_status']})"
+            )
+        last_event = state.get("last_run", state["last_trigger"])
+        last_run = (
+            f"{last_result}; {last_event}"
+            if last_event != "never"
+            else last_result
+        )
+        table.add_row(
+            timer,
+            "yes" if state["enabled"] else "no",
+            "waiting" if state["active"] else "stopped",
+            last_run,
+            state["next_trigger"],
+        )
+    console.print(table)
+    if any(not state.get("runtime_verified", True) for state in status.values()):
+        console.print(
+            "[yellow]The systemd user manager did not answer within 5 seconds.[/yellow] "
+            "Installed/enabled files are shown, but live waiting and run times could not "
+            "be verified. Try again from your normal logged-in terminal."
+        )
+
+
+@app.command("scheduler-pause")
+def scheduler_pause() -> None:
+    """Disable local AIOS timers without deleting their configuration."""
+    _set_scheduler_active(False)
+    console.print("[green]Local AIOS timers are paused.[/green]")
+
+
+@app.command("scheduler-resume")
+def scheduler_resume() -> None:
+    """Enable all previously installed local AIOS timers."""
+    _set_scheduler_active(True)
+    console.print("[green]Local AIOS timers are enabled.[/green]")
+
+
+def _set_scheduler_active(active: bool) -> None:
+    from aios.scheduler import set_user_scheduler_active
+
+    try:
+        set_user_scheduler_active(active)
+    except (OSError, RuntimeError) as exc:
+        console.print(f"[red]Scheduler change failed safely:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+@app.command("scheduler-remove")
+def scheduler_remove(
+    confirm_remove: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-remove/--no-confirm-remove",
+            help="Required acknowledgement before AIOS-managed timer files are removed.",
+        ),
+    ] = False,
+) -> None:
+    """Disable and remove only files previously managed by AIOS."""
+    from aios.scheduler import remove_user_scheduler
+
+    try:
+        removed = remove_user_scheduler(confirm=confirm_remove)
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Scheduler removal refused safely:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"[green]Local AIOS scheduler removed:[/green] {len(removed)} managed file(s)."
+    )
+
+
+@app.command("dashboard")
+def dashboard(
+    host: Annotated[
+        str,
+        typer.Option("--host", help="Network address for the dashboard."),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option("--port", min=1, max=65535, help="Dashboard port."),
+    ] = 8501,
+    open_browser: Annotated[
+        bool,
+        typer.Option(
+            "--open-browser/--no-browser",
+            help="Open a browser locally; deployments should use --no-browser.",
+        ),
+    ] = True,
+) -> None:
+    """Open the research dashboard without requiring Streamlit knowledge."""
+    if importlib.util.find_spec("streamlit") is None:
+        console.print(
+            "[red]Dashboard support is not installed.[/red] Run "
+            '`.venv/bin/pip install -e ".[dev,dashboard]"`, then retry.'
+        )
+        raise typer.Exit(code=1)
+
+    script = settings.project_root / "src" / "aios" / "dashboard.py"
+    command = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(script),
+        "--server.address",
+        host,
+        "--server.port",
+        str(port),
+        "--server.headless",
+        str(not open_browser).lower(),
+        "--browser.gatherUsageStats",
+        "false",
+    ]
+    console.print(f"[green]Opening AI Investment OS at http://{host}:{port}[/green]")
+    completed = subprocess.run(command, cwd=settings.project_root, check=False)
+    if completed.returncode:
+        raise typer.Exit(code=completed.returncode)
+
+
+@app.command("readiness")
+def readiness(
+    as_of: Annotated[
+        str | None,
+        typer.Option("--as-of", help="Decision date (YYYY-MM-DD); defaults to today."),
+    ] = None,
+    purpose: Annotated[
+        str,
+        typer.Option(
+            "--purpose",
+            help="Use 'paper' for current monitoring or 'historical_research' for a bounded run.",
+        ),
+    ] = "paper",
+    strict: Annotated[
+        bool,
+        typer.Option(
+            "--strict/--report-only",
+            help="Return a failing exit code when any readiness blocker remains.",
+        ),
+    ] = True,
+    json_output: Annotated[
+        Path | None,
+        typer.Option("--json-output", help="Optional machine-readable report path."),
+    ] = None,
+) -> None:
+    """Report whether U.S. evidence is safe for the requested operating use."""
+    decision_date = as_of or date.today().isoformat()
+    try:
+        date.fromisoformat(decision_date)
+        if purpose not in {"paper", "historical_research"}:
+            raise ValueError("purpose must be 'paper' or 'historical_research'")
+        report = assess_us_readiness(decision_date, purpose=purpose)
+        if json_output is not None:
+            json_output.parent.mkdir(parents=True, exist_ok=True)
+            json_output.write_text(
+                json.dumps(report.to_dict(), indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+    except duckdb.IOException as exc:
+        console.print(
+            "[red]Readiness could not open DuckDB.[/red] Close the dashboard or another "
+            "AIOS process using the database, then retry."
+        )
+        raise typer.Exit(code=1) from exc
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Readiness check refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.rule(f"[bold]U.S. readiness — {report.as_of} ({report.purpose})[/bold]")
+    console.print(
+        "[cyan]Certified historical research window:[/cyan] "
+        f"{report.certified_research_from or 'unavailable'} through "
+        f"{report.certified_research_through or 'unavailable'}"
+    )
+    console.print(
+        "[cyan]Raw source clocks:[/cyan] "
+        f"prices {report.raw_prices_through or 'none'}; "
+        f"fundamentals {report.fundamentals_through or 'none'}; "
+        f"macro releases {report.macro_releases_through or 'none'}"
+    )
+    table = Table(title="Operating gates")
+    table.add_column("gate")
+    table.add_column("status")
+    table.add_column("observed")
+    table.add_column("required")
+    table.add_column("what it means")
+    for check in report.checks:
+        color = {"pass": "green", "warn": "yellow", "fail": "red"}[check.status]
+        table.add_row(
+            check.label,
+            f"[{color}]{check.status}[/{color}]",
+            check.observed,
+            check.required,
+            check.detail,
+        )
+    console.print(table)
+    if json_output is not None:
+        console.print(f"Machine-readable report written to {json_output}.")
+    if report.ready:
+        console.print("[bold green]READY for the requested use.[/bold green]")
+    else:
+        console.print(
+            f"[bold red]BLOCKED:[/bold red] {len(report.blockers)} operating gate(s) failed."
+        )
+        if strict:
+            raise typer.Exit(code=1)
+
+
+@app.command("paper-init")
+def paper_init(
+    account: Annotated[
+        Path,
+        typer.Option("--account", help="Local paper-account JSON path."),
+    ] = Path("data/paper/us_qv_sandbox.json"),
+    initial_capital: Annotated[
+        float,
+        typer.Option("--initial-capital", min=1.0, help="Starting simulated dollars."),
+    ] = 100_000.0,
+    commission_bps: Annotated[
+        float,
+        typer.Option("--commission-bps", min=0.0, help="Simulated commission in basis points."),
+    ] = 5.0,
+    slippage_bps: Annotated[
+        float,
+        typer.Option("--slippage-bps", min=0.0, help="Simulated slippage in basis points."),
+    ] = 5.0,
+) -> None:
+    """Create a local pre-tax sandbox; this never connects to a broker."""
+    from aios.paper import initialize_paper_account
+
+    destination = _project_path(account)
+    try:
+        document = initialize_paper_account(
+            destination,
+            get_store(),
+            initial_capital=initial_capital,
+            commission_bps=commission_bps,
+            slippage_bps=slippage_bps,
+        )
+    except Exception as exc:
+        console.print(f"[red]Paper account creation refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print("[bold green]Local simulation account created.[/bold green]")
+    console.print(f"Account: {document.path}")
+    console.print(
+        "No broker is connected. Taxes are intentionally zero until your jurisdiction "
+        "and account type are configured."
+    )
+
+
+@app.command("forward-freeze")
+def forward_freeze(
+    proposal: Annotated[
+        Path | None,
+        typer.Option(
+            "--proposal",
+            help="Reviewed baseline proposal; defaults to the newest local U.S. proposal.",
+        ),
+    ] = None,
+    account: Annotated[
+        Path,
+        typer.Option("--account", help="Local paper-account JSON path."),
+    ] = Path("data/paper/us_qv_sandbox.json"),
+    output: Annotated[
+        Path,
+        typer.Option("--output", help="Checksum-protected forward-trial JSON path."),
+    ] = Path("data/paper/us_qv_forward_trial.json"),
+    confirm_freeze: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-freeze/--no-confirm-freeze",
+            help="Required acknowledgement that policy changes restart forward evidence.",
+        ),
+    ] = False,
+) -> None:
+    """Freeze the supervised U.S. policy baseline; market data may still advance."""
+    from aios.forward import create_forward_trial
+
+    proposals_dir = settings.project_root / "data" / "paper" / "proposals"
+    proposal_path = _project_path(proposal) if proposal is not None else None
+    if proposal_path is None:
+        candidates = sorted(proposals_dir.glob("us-qv-*.json"), reverse=True)
+        if not candidates:
+            console.print("[red]Forward freeze refused:[/red] no paper proposal exists")
+            raise typer.Exit(code=1)
+        proposal_path = candidates[0]
+    try:
+        document = create_forward_trial(
+            settings.project_root,
+            _project_path(output),
+            _project_path(account),
+            proposal_path,
+            confirm=confirm_freeze,
+        )
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Forward freeze refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print("[bold green]Untouched U.S. forward trial frozen.[/bold green]")
+    console.print(f"Trial: {document.path}")
+    console.print(f"Trial ID: {document.payload['trial_id']}")
+    console.print(f"Policy bundle: {document.payload['policy_bundle_sha256']}")
+    console.print(
+        "Market data may advance normally. A factor, risk, cost, tax, calendar, readiness, "
+        "or paper-policy change will now be reported as drift and block simulation."
+    )
+
+
+@app.command("forward-status")
+def forward_status(
+    trial: Annotated[
+        Path,
+        typer.Option("--trial", help="Checksum-protected forward-trial JSON path."),
+    ] = Path("data/paper/us_qv_forward_trial.json"),
+    account: Annotated[
+        Path,
+        typer.Option("--account", help="Local paper-account JSON path."),
+    ] = Path("data/paper/us_qv_sandbox.json"),
+) -> None:
+    """Verify that the active forward policy and registered evidence are unchanged."""
+    from aios.forward import assess_forward_trial
+
+    try:
+        status = assess_forward_trial(
+            settings.project_root,
+            _project_path(trial),
+            _project_path(account),
+        )
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Forward status unavailable:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.rule("[bold]U.S. untouched forward monitor[/bold]")
+    console.print(f"Trial ID: {status.trial_id}")
+    console.print(f"Registered proposals: {status.registered_proposals}")
+    if status.ready:
+        console.print("[bold green]UNCHANGED — forward policy evidence is intact.[/bold green]")
+        return
+    for issue in status.issues:
+        console.print(f"[red]• {issue}[/red]")
+    console.print("[bold red]DRIFTED — do not count newer observations in this trial.[/bold red]")
+    raise typer.Exit(code=1)
+
+
+@app.command("paper-propose")
+def paper_propose(
+    as_of: Annotated[
+        str | None,
+        typer.Option(
+            "--as-of",
+            help="Reviewed decision close (YYYY-MM-DD); defaults to the latest safe SPY close.",
+        ),
+    ] = None,
+    account: Annotated[
+        Path,
+        typer.Option("--account", help="Local paper-account JSON path."),
+    ] = Path("data/paper/us_qv_sandbox.json"),
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="Dated proposal path; a safe default is generated."),
+    ] = None,
+    top_n: Annotated[
+        int,
+        typer.Option("--top-n", min=10, max=20, help="Number of simulated holdings."),
+    ] = 10,
+    replace: Annotated[
+        bool,
+        typer.Option(
+            "--replace/--no-replace",
+            help="Explicitly replace an existing proposal for the same date.",
+        ),
+    ] = False,
+) -> None:
+    """Create a risk-checked research proposal; no trade is performed."""
+    from aios.forward import (
+        DEFAULT_FORWARD_RELATIVE_PATH,
+        assess_forward_trial,
+        read_forward_trial,
+        register_forward_proposal,
+    )
+    from aios.paper import (
+        create_paper_proposal,
+        default_proposal_path,
+        latest_paper_decision_date,
+    )
+
+    store = get_store()
+    try:
+        decision_date = date.fromisoformat(as_of) if as_of else latest_paper_decision_date(store)
+        destination = (
+            _project_path(output)
+            if output is not None
+            else default_proposal_path(settings.project_root, decision_date)
+        )
+        trial_path = settings.project_root / DEFAULT_FORWARD_RELATIVE_PATH
+        if trial_path.exists():
+            status = assess_forward_trial(
+                settings.project_root,
+                trial_path,
+                _project_path(account),
+            )
+            if not status.ready:
+                raise ValueError("active forward trial drifted: " + "; ".join(status.issues))
+            trial = read_forward_trial(trial_path)
+            if top_n != int(trial.payload["frozen_configuration"]["top_n"]):
+                raise ValueError("top_n differs from the active forward trial")
+            if replace and destination.exists():
+                raise ValueError("registered forward proposals cannot be replaced")
+        document = create_paper_proposal(
+            _project_path(account),
+            destination,
+            decision_date,
+            store,
+            top_n=top_n,
+            replace=replace,
+        )
+        if trial_path.exists():
+            register_forward_proposal(
+                settings.project_root,
+                trial_path,
+                _project_path(account),
+                document.path,
+            )
+    except Exception as exc:
+        console.print(f"[red]Paper proposal refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    payload = document.payload
+    console.rule(f"[bold]U.S. paper proposal — {payload['decision_date']}[/bold]")
+    console.print(f"Status: [bold]{payload['status']}[/bold]")
+    console.print(f"Proposal: {document.path}")
+    console.print(f"Next simulated close: {payload['scheduled_simulation_date']}")
+    console.print(
+        f"Factor-eligible stocks: {payload['factor_eligible_count']}; "
+        f"risk-screened targets: {len(payload['targets'])}."
+    )
+    if payload["targets"]:
+        table = Table(title="Research portfolio targets (simulation only)")
+        table.add_column("rank")
+        table.add_column("symbol")
+        table.add_column("target")
+        table.add_column("broad business group")
+        for target in payload["targets"]:
+            table.add_row(
+                str(target["factor_rank"]),
+                target["ticker"],
+                f"{target['target_weight']:.1%}",
+                target["sector"],
+            )
+        console.print(table)
+    assessment = payload.get("risk_assessment")
+    if assessment and not assessment["approved"]:
+        blockers = [row["label"] for row in assessment["checks"] if row["status"] == "fail"]
+        console.print("[red]Risk blockers:[/red] " + ", ".join(blockers))
+    console.print(
+        "[yellow]Research simulation only — this is not a personal buy/sell recommendation "
+        "and nothing was sent to a broker.[/yellow]"
+    )
+
+
+@app.command("paper-execute")
+def paper_execute(
+    proposal: Annotated[
+        Path,
+        typer.Option("--proposal", help="Reviewed proposal JSON to simulate."),
+    ],
+    account: Annotated[
+        Path,
+        typer.Option("--account", help="Local paper-account JSON path."),
+    ] = Path("data/paper/us_qv_sandbox.json"),
+    confirm_simulated: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-simulated/--no-confirm-simulated",
+            help="Required acknowledgement that this is a local simulation.",
+        ),
+    ] = False,
+) -> None:
+    """Simulate an approved next-session close after explicit confirmation."""
+    from aios.forward import (
+        DEFAULT_FORWARD_RELATIVE_PATH,
+        require_registered_forward_proposal,
+    )
+    from aios.paper import execute_paper_proposal
+
+    try:
+        trial_path = settings.project_root / DEFAULT_FORWARD_RELATIVE_PATH
+        if trial_path.exists():
+            require_registered_forward_proposal(
+                settings.project_root,
+                trial_path,
+                _project_path(account),
+                _project_path(proposal),
+            )
+        result = execute_paper_proposal(
+            _project_path(account),
+            _project_path(proposal),
+            get_store(),
+            confirm_simulated=confirm_simulated,
+        )
+    except Exception as exc:
+        console.print(f"[red]Simulated execution refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    execution = result["execution"]
+    console.print(
+        f"[bold green]Simulation recorded for {execution['execution_date']}.[/bold green] "
+        f"{len(execution['trades'])} simulated trade(s), "
+        f"${execution['transaction_costs']:,.2f} modeled costs."
+    )
+    console.print("No order was sent to a broker.")
+
+
+@app.command("paper-mark")
+def paper_mark(
+    through: Annotated[
+        str | None,
+        typer.Option(
+            "--through",
+            help="Reviewed market close (YYYY-MM-DD); defaults to the latest safe SPY close.",
+        ),
+    ] = None,
+    account: Annotated[
+        Path,
+        typer.Option("--account", help="Local paper-account JSON path."),
+    ] = Path("data/paper/us_qv_sandbox.json"),
+) -> None:
+    """Update simulated holdings and the daily equity curve without rebalancing."""
+    from aios.paper import latest_paper_decision_date, mark_paper_account
+
+    store = get_store()
+    try:
+        mark_date = date.fromisoformat(through) if through else latest_paper_decision_date(store)
+        result = mark_paper_account(_project_path(account), mark_date, store)
+    except Exception as exc:
+        console.print(f"[red]Paper mark refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"[green]Simulation marked through {mark_date}:[/green] "
+        f"{len(result['points'])} new daily point(s)."
+    )
+
+
+@app.command("paper-status")
+def paper_status(
+    account: Annotated[
+        Path,
+        typer.Option("--account", help="Local paper-account JSON path."),
+    ] = Path("data/paper/us_qv_sandbox.json"),
+) -> None:
+    """Show the local simulated account without requiring DuckDB knowledge."""
+    from aios.forward import DEFAULT_FORWARD_RELATIVE_PATH, assess_forward_trial
+    from aios.paper import paper_account_summary
+
+    try:
+        summary = paper_account_summary(_project_path(account), get_store())
+    except Exception as exc:
+        console.print(f"[red]Paper status unavailable:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.rule("[bold]U.S. supervised paper monitor[/bold]")
+    console.print("[bold yellow]Simulation only — no broker connection.[/bold yellow]")
+    console.print(f"Last market date: {summary['last_market_date'] or 'not invested yet'}")
+    console.print(f"Simulated account value: ${summary['equity']:,.2f}")
+    console.print(f"Cash: ${summary['cash']:,.2f}")
+    console.print(f"Current drawdown: {summary['drawdown']:.2%}")
+    console.print(f"Recorded rebalances: {summary['execution_count']}")
+    trial_path = settings.project_root / DEFAULT_FORWARD_RELATIVE_PATH
+    if trial_path.exists():
+        try:
+            forward = assess_forward_trial(
+                settings.project_root,
+                trial_path,
+                _project_path(account),
+            )
+        except (OSError, ValueError) as exc:
+            console.print(f"[red]Forward-test baseline cannot be verified:[/red] {exc}")
+        else:
+            if forward.ready:
+                console.print(
+                    "Forward-test baseline: [green]unchanged[/green] "
+                    f"({forward.registered_proposals} registered proposal(s))"
+                )
+            else:
+                console.print("Forward-test baseline: [red]drift detected[/red]")
+                for issue in forward.issues:
+                    console.print(f"  • {issue}")
+    else:
+        console.print("Forward-test baseline: [yellow]not frozen yet[/yellow]")
+    if summary["holdings"]:
+        table = Table(title="Simulated holdings")
+        table.add_column("symbol")
+        table.add_column("portfolio weight")
+        for holding in summary["holdings"]:
+            table.add_row(holding["ticker"], f"{holding['weight']:.2%}")
+        console.print(table)
+    else:
+        console.print(
+            "No simulated holdings. A proposal remains separate until its scheduled "
+            "close is reviewed and explicitly recorded."
+        )
+
+
 @app.command("ingest-macro")
 def ingest_macro(
     series_ids: Annotated[
@@ -143,6 +1062,116 @@ def ingest_macro(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
     console.print(f"[green]Macro ingest done:[/green] {n} rows upserted.")
+
+
+@app.command("refresh-us-current")
+def refresh_us_current_command(
+    as_of: Annotated[
+        str | None,
+        typer.Option(
+            "--as-of",
+            help=(
+                "Reviewed membership date; defaults to the newest viable snapshot "
+                "within seven days."
+            ),
+        ),
+    ] = None,
+    prices: Annotated[
+        bool,
+        typer.Option("--prices/--no-prices", help="Refresh reviewed member and SPY prices."),
+    ] = True,
+    fundamentals: Annotated[
+        bool,
+        typer.Option(
+            "--fundamentals/--no-fundamentals",
+            help="Refresh SEC filings through reviewed issuer/CIK identities.",
+        ),
+    ] = True,
+    macro: Annotated[
+        bool,
+        typer.Option("--macro/--no-macro", help="Refresh release-aware macro vintages."),
+    ] = True,
+    json_output: Annotated[
+        Path | None,
+        typer.Option("--json-output", help="Optional machine-readable run summary."),
+    ] = None,
+) -> None:
+    """Refresh the current reviewed U.S. universe without approving new members."""
+    from aios.refresh import refresh_us_current
+
+    def show_progress(kind: str, identity: str, index: int, total: int) -> None:
+        if index == 1 or index == total or index % 25 == 0:
+            console.print(f"  {kind}: {index}/{total} ({identity})")
+
+    try:
+        result = refresh_us_current(
+            as_of,
+            include_prices=prices,
+            include_fundamentals=fundamentals,
+            include_macro=macro,
+            progress=show_progress,
+        )
+        if json_output is not None:
+            destination = _project_path(json_output)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(
+                json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+    except duckdb.IOException as exc:
+        console.print(
+            "[red]Current refresh could not lock DuckDB.[/red] Close the dashboard "
+            "and every other AIOS command, then retry."
+        )
+        raise typer.Exit(code=1) from exc
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Current U.S. refresh refused safely:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    table = Table(title=f"Current U.S. refresh — {result.as_of}")
+    table.add_column("area")
+    table.add_column("result", justify="right")
+    table.add_row("reviewed membership date", result.membership_as_of or result.as_of)
+    table.add_row("stored universe members", str(result.members))
+    table.add_row("issuers attempted", str(result.issuers_attempted))
+    table.add_row("member securities attempted", str(result.securities_attempted))
+    table.add_row("macro rows", str(result.macro_rows))
+    table.add_row("fundamental rows", str(result.fundamental_rows))
+    table.add_row("member price rows", str(result.price_rows))
+    table.add_row("SPY rows", str(result.benchmark_rows))
+    table.add_row("visible warnings", str(len(result.warnings)))
+    table.add_row("failures", str(len(result.failures)))
+    console.print(table)
+    console.print(
+        "[yellow]Membership boundary:[/yellow] this refresh uses only already reviewed "
+        "identities. New S&P announcements still require source review and import."
+    )
+    if json_output is not None:
+        console.print(f"Run summary written to {_project_path(json_output)}.")
+    for warning in result.warnings[:25]:
+        console.print(
+            f"  [yellow]{warning.kind} {warning.identity}:[/yellow] {warning.error}"
+        )
+    if len(result.warnings) > 25:
+        console.print(
+            f"  [yellow]... {len(result.warnings) - 25} additional warnings are in "
+            "the JSON summary and ingest audit.[/yellow]"
+        )
+    if result.failures:
+        for failure in result.failures[:25]:
+            console.print(
+                f"  [red]{failure.kind} {failure.identity}:[/red] {failure.error}"
+            )
+        if len(result.failures) > 25:
+            console.print(
+                f"  [red]... {len(result.failures) - 25} additional failures are in "
+                "the JSON summary and ingest audit.[/red]"
+            )
+        raise typer.Exit(code=1)
+    console.print(
+        "[bold green]Refresh completed.[/bold green] Run `aios health` before creating "
+        "or recording a paper proposal."
+    )
 
 
 @app.command("import-universe")
@@ -190,10 +1219,13 @@ def build_universe_membership(
         ),
     ],
     events: Annotated[
-        Path,
+        list[Path],
         typer.Option(
             "--events",
-            help="Audited event CSV with effective_date, action, known_date, and source.",
+            help=(
+                "Audited event CSV with effective_date, action, known_date, and source. "
+                "Repeat --events to combine non-overlapping reviewed batches."
+            ),
         ),
     ],
     output: Annotated[
@@ -226,6 +1258,7 @@ def build_universe_membership(
         build_membership_from_events,
         load_effective_spans_csv,
         load_universe_events_csv,
+        merge_universe_event_batches,
         reconcile_event_boundaries,
         write_membership_csv,
     )
@@ -234,10 +1267,15 @@ def build_universe_membership(
         coverage_start = date.fromisoformat(start)
         coverage_end = date.fromisoformat(end)
         spans = load_effective_spans_csv(baseline_spans)
-        event_rows = load_universe_events_csv(
-            events,
-            universe_id=universe_id,
-            require_official_sources=require_official_sources,
+        event_rows = merge_universe_event_batches(
+            *(
+                load_universe_events_csv(
+                    event_path,
+                    universe_id=universe_id,
+                    require_official_sources=require_official_sources,
+                )
+                for event_path in events
+            )
         )
         reconciliation = reconcile_event_boundaries(
             spans,
@@ -386,6 +1424,53 @@ def import_reference_identities(
     )
 
 
+@app.command("import-security-conversions")
+def import_security_conversions(
+    path: Path = SECURITY_CONVERSION_FILE_ARGUMENT,
+) -> None:
+    """Import reviewed events that convert one security into another."""
+    from aios.ingest.security_events import ingest_security_conversion_csv
+
+    try:
+        count = ingest_security_conversion_csv(path)
+    except duckdb.IOException as exc:
+        console.print(
+            "[red]Security conversion import could not open DuckDB.[/red] "
+            "Close the dashboard and any other AIOS command, then retry."
+        )
+        raise typer.Exit(code=1) from exc
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Security conversion import refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"[green]Security conversion import done:[/green] {count} reviewed event(s) upserted."
+    )
+
+
+@app.command("ingest-liquidation-prices")
+def ingest_liquidation_prices(
+    path: Path = LIQUIDATION_EXTENSION_FILE_ARGUMENT,
+) -> None:
+    """Fetch held-security prices through the next rebalance only."""
+    from aios.ingest.liquidation_prices import ingest_liquidation_extension_csv
+
+    try:
+        counts = ingest_liquidation_extension_csv(path)
+    except duckdb.IOException as exc:
+        console.print(
+            "[red]Liquidation price import could not open DuckDB.[/red] "
+            "Close the dashboard and any other AIOS command, then retry."
+        )
+        raise typer.Exit(code=1) from exc
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Liquidation price import refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        "[green]Liquidation price import done:[/green] "
+        f"{counts['extensions']} extension(s), {counts['prices']} price rows."
+    )
+
+
 @app.command("build-reference-batch")
 def build_reference_batch(
     tickers_file: Path = TICKERS_FILE_ARGUMENT,
@@ -511,6 +1596,175 @@ def build_reference_window_batch(
             if row["review_status"] == "rejected":
                 console.print(f"  [yellow]{row['ticker']}:[/yellow] {row['reason']}")
         raise typer.Exit(code=1)
+
+
+@app.command("plan-reference-window-batches")
+def plan_reference_window_batches(
+    as_of: Annotated[str, typer.Option(help="Active-universe date, YYYY-MM-DD.")],
+    start_floor: Annotated[
+        str,
+        typer.Option(help="Earliest extension date, YYYY-MM-DD."),
+    ],
+    end: Annotated[str, typer.Option(help="Exclusive certified end, YYYY-MM-DD.")],
+    output_dir: Annotated[
+        Path,
+        typer.Option("--output-dir", help="Directory for deterministic window CSVs."),
+    ] = Path("data/reference_batches"),
+    universe_id: Annotated[str, typer.Option("--universe-id")] = "sp500",
+    provider: Annotated[str, typer.Option(help="Provider whose coverage is required.")] = (
+        "yfinance"
+    ),
+    batch_prefix: Annotated[
+        str,
+        typer.Option(help="Safe filename prefix before the batch number."),
+    ] = "reference_batch",
+    batch_size: Annotated[
+        int,
+        typer.Option(min=1, help="Maximum ticker windows per batch."),
+    ] = 25,
+    start_number: Annotated[
+        int,
+        typer.Option(min=1, help="First batch number to write."),
+    ] = 1,
+) -> None:
+    """Plan only active members missing complete current reference coverage."""
+    from aios.ingest.reference_batch import (
+        plan_missing_reference_windows,
+        write_reference_window_batches,
+    )
+
+    try:
+        windows = plan_missing_reference_windows(
+            universe_id=universe_id,
+            as_of=as_of,
+            start_floor=start_floor,
+            end=end,
+            provider=provider,
+        )
+        paths = write_reference_window_batches(
+            windows,
+            output_dir=output_dir,
+            batch_prefix=batch_prefix,
+            batch_size=batch_size,
+            start_number=start_number,
+        )
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Reference window plan refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if not paths:
+        console.print(
+            f"[green]Reference coverage is complete for {universe_id} on {as_of}.[/green]"
+        )
+        return
+    console.print(
+        f"[green]Reference window plan:[/green] {len(windows)} missing members in "
+        f"{len(paths)} batch(es)."
+    )
+    for path in paths:
+        console.print(f"  {path}")
+
+
+@app.command("plan-historical-reference-batches")
+def plan_historical_reference_batches(
+    start: Annotated[str, typer.Option(help="Inclusive research start, YYYY-MM-DD.")],
+    end: Annotated[str, typer.Option(help="Exclusive research end, YYYY-MM-DD.")],
+    output_dir: Annotated[
+        Path,
+        typer.Option("--output-dir", help="Directory for deterministic window CSVs."),
+    ] = Path("data/reference_batches"),
+    universe_id: Annotated[str, typer.Option("--universe-id")] = "sp500",
+    batch_prefix: Annotated[
+        str,
+        typer.Option(help="Safe filename prefix before the batch number."),
+    ] = "historical_reference_batch",
+    batch_size: Annotated[
+        int,
+        typer.Option(min=1, help="Maximum ticker windows per batch."),
+    ] = 25,
+    start_number: Annotated[
+        int,
+        typer.Option(min=1, help="First batch number to write."),
+    ] = 1,
+) -> None:
+    """Plan survivorship-safe reference gaps, including securities later removed."""
+    from aios.ingest.reference_batch import (
+        plan_historical_reference_gaps,
+        write_reference_window_batches,
+    )
+
+    try:
+        windows = plan_historical_reference_gaps(
+            universe_id=universe_id,
+            start=start,
+            end=end,
+        )
+        paths = (
+            write_reference_window_batches(
+                windows,
+                output_dir=output_dir,
+                batch_prefix=batch_prefix,
+                batch_size=batch_size,
+                start_number=start_number,
+            )
+            if windows
+            else []
+        )
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Historical reference plan refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if not paths:
+        console.print(
+            f"[green]Historical reference coverage is complete for {universe_id} "
+            f"from {start} through {end}.[/green]"
+        )
+        return
+    console.print(
+        f"[green]Historical reference plan:[/green] {len(windows)} provenance gap(s) "
+        f"in {len(paths)} batch(es), including removed members."
+    )
+    for path in paths:
+        console.print(f"  {path}")
+
+
+@app.command("merge-reference-batches")
+def merge_reference_batches(
+    batches: Annotated[
+        list[Path],
+        typer.Option(
+            "--batch",
+            help="Path stem before _issuer_ciks.csv; repeat for each reviewed batch.",
+        ),
+    ],
+    batch_name: Annotated[
+        str,
+        typer.Option("--batch-name", help="Filename prefix for consolidated manifests."),
+    ],
+    output_dir: Annotated[
+        Path,
+        typer.Option("--output-dir", help="Directory for consolidated manifests."),
+    ] = Path("data/reference_batches"),
+) -> None:
+    """Consolidate accepted rows without carrying failed reviews forward."""
+    from aios.ingest.reference_batch import (
+        merge_reference_batch_files,
+        write_reference_batch,
+    )
+
+    try:
+        result = merge_reference_batch_files(batches)
+        paths = write_reference_batch(
+            result,
+            output_dir=output_dir,
+            batch_name=batch_name,
+        )
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Reference batch merge refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"[green]Reference batches merged:[/green] {result['accepted']} accepted reviews."
+    )
+    for label, path in paths.items():
+        console.print(f"  {label}: {path}")
 
 
 @app.command("ingest-reference-batch")
@@ -746,6 +2000,11 @@ def backtest_qv(
             help="Explicitly exclude a ticker from factor eligibility; repeat as needed.",
         ),
     ] = None,
+    factor_model: str = typer.Option(
+        "qv",
+        "--factor-model",
+        help="Selection model: certified baseline 'qv' or experimental 'qvml'.",
+    ),
     output: Annotated[
         Path | None,
         typer.Option(
@@ -792,7 +2051,7 @@ def backtest_qv(
         help="Dividend tax rate as a decimal.",
     ),
 ) -> None:
-    """Compare QV policies after explicit costs/taxes and against benchmarks."""
+    """Compare QV/QVML policies after explicit costs/taxes and benchmarks."""
     from aios.backtest import TaxPolicy, TransactionCostPolicy, run_qv_policy_backtest
 
     try:
@@ -807,6 +2066,7 @@ def backtest_qv(
             benchmark_tickers=benchmarks,
             calendar_ticker=calendar,
             excluded_tickers=excluded_tickers,
+            factor_model=factor_model,
             initial_capital=initial_capital,
             transaction_costs=TransactionCostPolicy(
                 commission_bps=commission_bps,
@@ -823,7 +2083,8 @@ def backtest_qv(
         console.print(f"[red]Backtest refused:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    console.rule(f"[bold]QV policy backtest: {start} → {end}[/bold]")
+    model_label = result.config.factor_model.upper()
+    console.rule(f"[bold]{model_label} policy backtest: {start} → {end}[/bold]")
     console.print(
         f"Universe union: {len(result.tickers)} tickers • quarterly • "
         f"top {top_n} equal-weight • "
@@ -859,7 +2120,7 @@ def backtest_qv(
     summary.add_column("daily obs", justify="right")
     for name, metrics in (
         ("regime-aware", result.regime_metrics),
-        ("baseline 60/40", result.baseline_metrics),
+        (f"baseline {model_label}", result.baseline_metrics),
     ):
         summary.add_row(
             name,
@@ -883,28 +2144,48 @@ def backtest_qv(
     coverage_table.add_column("raw complete", justify="right")
     coverage_table.add_column("Q scored", justify="right")
     coverage_table.add_column("V scored", justify="right")
+    if result.config.factor_model == "qvml":
+        coverage_table.add_column("M scored", justify="right")
+        coverage_table.add_column("L scored", justify="right")
     coverage_table.add_column("eligible", justify="right")
     coverage_table.add_column("regime")
-    coverage_table.add_column("Q/V weights")
+    coverage_table.add_column("factor weights")
     coverage_table.add_column("status")
     for period in result.periods:
-        coverage_table.add_row(
+        cells = [
             period.decision_date,
             str(len(period.member_tickers)),
             ("N/A" if period.raw_complete_tickers is None else str(period.raw_complete_tickers)),
             str(period.quality_scored_tickers),
             str(period.value_scored_tickers),
-            str(period.eligible_tickers),
-            period.regime,
-            f"{period.quality_weight:.0%}/{period.value_weight:.0%}",
-            period.status,
+        ]
+        if result.config.factor_model == "qvml":
+            cells.extend(
+                [
+                    str(period.momentum_scored_tickers),
+                    str(period.low_volatility_scored_tickers),
+                ]
+            )
+        cells.extend(
+            [
+                str(period.eligible_tickers),
+                period.regime,
+                (
+                    f"{period.quality_weight:.0%}/{period.value_weight:.0%}/"
+                    f"{period.momentum_weight:.0%}/{period.low_volatility_weight:.0%}"
+                    if result.config.factor_model == "qvml"
+                    else f"{period.quality_weight:.0%}/{period.value_weight:.0%}"
+                ),
+                period.status,
+            ]
         )
+        coverage_table.add_row(*cells)
     console.print(coverage_table)
 
     selections = Table(title="Selected holdings by policy")
     selections.add_column("decision")
     selections.add_column("regime-aware")
-    selections.add_column("baseline 60/40")
+    selections.add_column(f"baseline {model_label}")
     for period in result.periods:
         selections.add_row(
             period.decision_date,
@@ -915,7 +2196,7 @@ def backtest_qv(
 
     if result.benchmark_metrics:
         benchmark_table = Table(
-            title="Persistent benchmark returns (raw close + actions; no costs/taxes)"
+            title="Persistent benchmark returns (basis-aware actions; no costs/taxes)"
         )
         benchmark_table.add_column("benchmark")
         benchmark_table.add_column("periods", justify="right")
@@ -1022,7 +2303,7 @@ def _write_backtest_audit(output: Path, result, explanations: list[dict]) -> Pat
     diff = _git_bytes(["git", "diff", "--binary", "HEAD", "--"])
     untracked_count, untracked_sha256 = _untracked_tree_fingerprint()
     payload = {
-        "schema_version": 2,
+        "schema_version": 4,
         "run_id": str(uuid4()),
         "generated_at": datetime.now(UTC).isoformat(),
         "application_version": __version__,
@@ -1186,6 +2467,283 @@ def ingest_security_prices(
         console.print(f"[red]Security price ingest failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc
     console.print(f"[green]Prices:[/green] {n} identity-tagged rows")
+
+
+@app.command("refresh-price-actions")
+def refresh_price_actions(
+    start: Annotated[
+        str,
+        typer.Option(help="Inclusive corrective window start, YYYY-MM-DD."),
+    ],
+    end: Annotated[
+        str,
+        typer.Option(help="Exclusive corrective window end, YYYY-MM-DD."),
+    ],
+    provider: Annotated[
+        str,
+        typer.Option(help="Reviewed action-capable provider."),
+    ] = "yfinance",
+    limit: Annotated[
+        int | None,
+        typer.Option(help="Optional candidate cap for a smoke test or resumable batch."),
+    ] = None,
+    tickers: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--ticker",
+            help="Also refresh an explicit benchmark/calendar ticker; repeat as needed.",
+        ),
+    ] = None,
+) -> None:
+    """Correct rows fetched before explicit dividend/split actions were enabled."""
+    import time
+
+    from aios.ingest.prices import fetch_provider_prices
+    from aios.ingest.prices import (
+        ingest_security_prices as _ingest_security_prices,
+    )
+
+    try:
+        window_start = date.fromisoformat(start)
+        window_end = date.fromisoformat(end)
+    except ValueError as exc:
+        console.print(f"[red]Action refresh refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if window_end <= window_start:
+        console.print("[red]Action refresh refused:[/red] end must follow start")
+        raise typer.Exit(code=1)
+    if limit is not None and limit < 1:
+        console.print("[red]Action refresh refused:[/red] limit must be positive")
+        raise typer.Exit(code=1)
+
+    store = get_store()
+    candidates = store.price_action_refresh_candidates(provider, window_start, window_end)
+    if limit is not None:
+        candidates = candidates[:limit]
+    explicit_tickers = sorted(
+        {ticker.strip().upper() for ticker in tickers or [] if ticker.strip()}
+    )
+    if not candidates and not explicit_tickers:
+        console.print("[green]No reviewed price-action rows need refresh.[/green]")
+        return
+
+    if candidates:
+        console.print(
+            f"Refreshing {len(candidates)} reviewed securities from {start} through "
+            f"{end} (exclusive) via {provider}. Re-running is safe and resumes only "
+            "unresolved securities."
+        )
+    failures: list[tuple[str, str]] = []
+    refreshed_rows = 0
+    for index, security_id in enumerate(candidates, 1):
+        console.rule(f"[{index}/{len(candidates)}] {security_id}")
+        try:
+            refreshed_rows += _ingest_security_prices(
+                security_id,
+                provider=provider,
+                start=start,
+                end=end,
+                store=store,
+            )
+            remaining = store.unverified_price_action_count(
+                security_id,
+                provider,
+                window_start,
+                window_end,
+            )
+            if remaining:
+                raise ValueError(f"{remaining} rows remain action-unverified")
+        except Exception as exc:
+            failures.append((security_id, str(exc)))
+            console.print(f"[red]Refresh failed:[/red] {exc}")
+        if index < len(candidates):
+            time.sleep(settings.yfinance_sleep_sec)
+
+    for ticker in explicit_tickers:
+        console.rule(f"benchmark/calendar {ticker}")
+        try:
+            rows = fetch_provider_prices(provider, ticker, start, end)
+            if not rows:
+                raise ValueError("provider returned no rows")
+            refreshed_rows += store.upsert_prices(rows)
+            remaining = store.unverified_ticker_action_count(
+                ticker,
+                provider,
+                window_start,
+                window_end,
+            )
+            if remaining:
+                raise ValueError(f"{remaining} rows remain action-unverified")
+        except Exception as exc:
+            failures.append((ticker, str(exc)))
+            console.print(f"[red]Refresh failed:[/red] {exc}")
+
+    console.print(
+        f"[green]Price-action refresh stored {refreshed_rows} rows across "
+        f"{len(candidates) + len(explicit_tickers) - len(failures)} identities.[/green]"
+    )
+    if failures:
+        for security_id, error in failures:
+            console.print(f"  [red]{security_id}:[/red] {error}")
+        raise typer.Exit(code=1)
+
+
+@app.command("build-factor-price-warmup")
+def build_factor_price_warmup(
+    output_dir: Annotated[
+        Path,
+        typer.Option(help="Ignored directory for review CSVs and compressed snapshots."),
+    ] = Path("data/factor_price_warmup"),
+    universe_id: Annotated[str, typer.Option("--universe-id")] = "sp500",
+    start: Annotated[
+        str,
+        typer.Option(help="Inclusive identity-safe history start, YYYY-MM-DD."),
+    ] = "2022-09-01",
+    as_of: Annotated[
+        str | None,
+        typer.Option(
+            help="Optional date selecting only membership and provider mappings active then."
+        ),
+    ] = None,
+    security_ids: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--security-id",
+            help="Optional immutable security ID to build; repeat as needed.",
+        ),
+    ] = None,
+    only_missing: Annotated[
+        bool,
+        typer.Option(
+            "--only-missing",
+            help="With --as-of, build only incomplete 253-session factor histories.",
+        ),
+    ] = False,
+    overlap_days: Annotated[
+        int,
+        typer.Option(help="Calendar days fetched after each verified provider anchor."),
+    ] = 21,
+    minimum_overlap_sessions: Annotated[
+        int,
+        typer.Option(help="Stored sessions that must exactly match the fresh provider fetch."),
+    ] = 5,
+    minimum_warmup_sessions: Annotated[
+        int,
+        typer.Option(help="Pre-anchor sessions required for an accepted snapshot."),
+    ] = 210,
+    refresh: Annotated[
+        bool,
+        typer.Option("--refresh", help="Ignore valid cached snapshots and fetch again."),
+    ] = False,
+    allow_rejections: Annotated[
+        bool,
+        typer.Option(
+            "--allow-rejections",
+            help="Exit successfully after writing a batch with explicitly reviewed exclusions.",
+        ),
+    ] = False,
+) -> None:
+    """Build hashed security-level warm-up snapshots without backdating tickers."""
+    from aios.ingest.factor_price_warmup import (
+        build_factor_price_warmup as _build_factor_price_warmup,
+    )
+
+    try:
+        date.fromisoformat(start)
+        if as_of:
+            date.fromisoformat(as_of)
+
+        def show_progress(index: int, total: int, candidate: dict) -> None:
+            console.rule(
+                f"[{index}/{total}] {candidate['canonical_ticker']} "
+                f"({candidate['provider']}:{candidate['provider_symbol']})"
+            )
+
+        result = _build_factor_price_warmup(
+            output_dir,
+            universe_id=universe_id,
+            start=start,
+            as_of=as_of,
+            security_ids=security_ids,
+            only_missing=only_missing,
+            overlap_days=overlap_days,
+            minimum_overlap_sessions=minimum_overlap_sessions,
+            minimum_warmup_sessions=minimum_warmup_sessions,
+            refresh=refresh,
+            progress=show_progress,
+            rejections_reviewed=allow_rejections,
+        )
+    except Exception as exc:
+        console.print(f"[red]Warm-up build failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(
+        f"[green]Warm-up review complete:[/green] {result['accepted']} accepted, "
+        f"{result['rejected']} rejected, {result['reused']} reused from cache."
+    )
+    if result["skipped_complete"]:
+        console.print(
+            f"  Skipped {result['skipped_complete']} securities whose factor windows "
+            "were already complete."
+        )
+    console.print(f"  Review: {result['review_path']}")
+    console.print(f"  Provenance: {result['provenance_path']}")
+    console.print(f"  Manifest: {result['manifest_path']}")
+    if result["rejected"]:
+        for row in [r for r in result["review_rows"] if r["review_status"] == "rejected"][:25]:
+            console.print(
+                f"  [yellow]{row['canonical_ticker']} ({row['security_id']}):[/yellow] "
+                f"{row['reason']}"
+            )
+        if not allow_rejections:
+            console.print(
+                "[yellow]Review every rejection, then rerun with --allow-rejections "
+                "before treating the batch as complete.[/yellow]"
+            )
+            raise typer.Exit(code=1)
+
+
+@app.command("ingest-factor-price-warmup")
+def ingest_factor_price_warmup(
+    batch_dir: Annotated[
+        Path,
+        typer.Argument(help="Directory produced by build-factor-price-warmup."),
+    ] = Path("data/factor_price_warmup"),
+) -> None:
+    """Hash-check and atomically import accepted factor-price snapshots."""
+    from aios.ingest.factor_price_warmup import (
+        ingest_factor_price_warmup as _ingest_factor_price_warmup,
+    )
+
+    try:
+        counts = _ingest_factor_price_warmup(batch_dir)
+    except Exception as exc:
+        console.print(f"[red]Warm-up ingest failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"[green]Warm-up ingest complete:[/green] {counts['factor_prices']} rows from "
+        f"{counts['snapshots']} reviewed security snapshots."
+    )
+
+
+@app.command("review-factor-price-warmup-rejections")
+def review_factor_price_warmup_rejections(
+    batch_dir: Annotated[
+        Path,
+        typer.Argument(help="Directory produced by build-factor-price-warmup."),
+    ] = Path("data/factor_price_warmup"),
+) -> None:
+    """Approve preserved warm-up exclusions without re-fetching the provider."""
+    from aios.ingest.factor_price_warmup import (
+        mark_factor_price_warmup_rejections_reviewed,
+    )
+
+    try:
+        count = mark_factor_price_warmup_rejections_reviewed(batch_dir)
+    except Exception as exc:
+        console.print(f"[red]Warm-up rejection review failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Warm-up exclusions reviewed:[/green] {count} preserved rejection(s).")
 
 
 @app.command("ingest-batch")

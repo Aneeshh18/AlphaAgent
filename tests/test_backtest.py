@@ -17,13 +17,27 @@ def _row(
     *,
     regime: str = "reflation",
     pit_ready: bool = True,
+    momentum_score: float | None = None,
+    low_volatility_score: float | None = None,
 ) -> CompositeRow:
+    qvml_score = None
+    if momentum_score is not None and low_volatility_score is not None:
+        qvml_score = (
+            quality_score * 0.27
+            + value_score * 0.33
+            + momentum_score * 0.25
+            + low_volatility_score * 0.15
+        )
     return CompositeRow(
         ticker=ticker,
         as_of="2024-03-29",
         quality_score=quality_score,
         value_score=value_score,
         qv_score=quality_score * 0.45 + value_score * 0.55,
+        momentum_score=momentum_score,
+        low_volatility_score=low_volatility_score,
+        qvml_score=qvml_score,
+        market_price_observations=(253 if momentum_score is not None else 0),
         macro_regime=regime,
         quality_weight=0.45 if pit_ready else 0.60,
         value_weight=0.55 if pit_ready else 0.40,
@@ -157,6 +171,73 @@ def test_backtest_config_rejects_unsupported_frequency():
         engine.QVBacktestConfig("2024-01-01", "2024-09-30", rebalance_frequency="monthly")
 
 
+def test_backtest_config_rejects_unknown_factor_model():
+    with pytest.raises(ValueError, match="factor_model"):
+        engine.QVBacktestConfig("2024-01-01", "2024-09-30", factor_model="mystery")
+
+
+def test_qvml_backtest_requires_market_sleeves_and_preserves_baseline(monkeypatch, tmp_path):
+    store = Store(tmp_path / "qvml-backtest.duckdb")
+    try:
+        store.upsert_prices(
+            [
+                {
+                    "ticker": ticker,
+                    "date": observation_date,
+                    "close": price,
+                    "source": "test",
+                }
+                for observation_date, prices in {
+                    "2024-03-29": {"A": 100, "B": 100, "C": 100},
+                    "2024-04-01": {"A": 100, "B": 100, "C": 100},
+                    "2024-06-28": {"A": 110, "B": 90, "C": 105},
+                }.items()
+                for ticker, price in prices.items()
+            ]
+        )
+        _use_pit_regime(monkeypatch)
+        market_flags: list[bool] = []
+
+        def fake_compute(
+            tickers,
+            as_of,
+            store,
+            regime_snapshot=None,
+            *,
+            include_market_factors=False,
+        ):
+            market_flags.append(include_market_factors)
+            return [
+                _row("A", 100, 0, momentum_score=0, low_volatility_score=0),
+                _row("B", 0, 100, momentum_score=0, low_volatility_score=0),
+                _row("C", 0, 0, momentum_score=80, low_volatility_score=80),
+            ]
+
+        monkeypatch.setattr(engine, "compute_composite", fake_compute)
+
+        result = engine.run_qv_policy_backtest(
+            "2024-01-01",
+            "2024-06-28",
+            tickers=["A", "B", "C"],
+            top_n=1,
+            factor_model="qvml",
+            allow_current_universe=True,
+            store=store,
+        )
+
+        assert market_flags == [True]
+        assert result.config.factor_model == "qvml"
+        assert result.periods[0].regime_selected == ("B",)
+        assert result.periods[0].baseline_selected == ("A",)
+        assert result.periods[0].momentum_weight == pytest.approx(0.25)
+        assert result.periods[0].low_volatility_weight == pytest.approx(0.15)
+        assert result.periods[0].qvml_scored_tickers == 3
+        assert all(row.eligible for row in result.periods[0].factor_audit)
+        assert all(row.factor_model == "qvml" for row in result.periods[0].regime_selection_audit)
+    finally:
+        store.close()
+
+
 def test_backtest_refuses_hard_data_quality_failure(monkeypatch, tmp_path):
     store = Store(tmp_path / "backtest-invalid.duckdb")
     try:
@@ -233,7 +314,7 @@ def test_backtest_uses_historical_membership_and_benchmark(monkeypatch, tmp_path
         monkeypatch.setattr(
             store,
             "universe_data_coverage",
-            lambda universe_id, as_of: [
+            lambda universe_id, as_of, effective_on=None: [
                 {
                     "ticker": ticker,
                     "security_id": f"aios:security:{ticker.lower()}",
@@ -263,11 +344,121 @@ def test_backtest_uses_historical_membership_and_benchmark(monkeypatch, tmp_path
         assert result.benchmark_metrics["A"].cumulative_return == pytest.approx(0.21)
         assert len(result.benchmark_equity_curves["A"]) == 5
         assert all(
-            period.price_basis == "raw_close_with_explicit_splits_and_dividends"
+            period.price_basis == "provider_close_with_basis_aware_splits_and_dividends"
             for period in result.benchmark_periods["A"]
         )
         assert result.regime_metrics.total_transaction_costs == 0
         assert all(period.raw_complete_tickers == 2 for period in result.periods)
+    finally:
+        store.close()
+
+
+def test_backtest_targets_membership_effective_on_next_session(monkeypatch, tmp_path):
+    store = Store(tmp_path / "backtest-execution-membership.duckdb")
+    try:
+        _seed_prices(store)
+        _use_pit_regime(monkeypatch)
+        store.upsert_universe_membership(
+            [
+                {
+                    "universe_id": "demo",
+                    "ticker": "A",
+                    "effective_start": "2024-01-01",
+                    "effective_end": "2024-07-01",
+                    "known_date": "2023-12-15",
+                    "end_known_date": "2024-06-15",
+                    "source": "test",
+                },
+                {
+                    "universe_id": "demo",
+                    "ticker": "B",
+                    "effective_start": "2024-07-01",
+                    "effective_end": None,
+                    "known_date": "2024-06-15",
+                    "end_known_date": None,
+                    "source": "test",
+                },
+            ]
+        )
+        store.upsert_security_identities(
+            [
+                {
+                    "universe_id": "demo",
+                    "ticker": "A",
+                    "effective_start": "2024-01-01",
+                    "effective_end": "2024-07-01",
+                    "security_id": "aios:security:a",
+                    "known_date": "2023-12-15",
+                    "identity_status": "bounded_ticker",
+                    "source": "test",
+                },
+                {
+                    "universe_id": "demo",
+                    "ticker": "B",
+                    "effective_start": "2024-07-01",
+                    "effective_end": None,
+                    "security_id": "aios:security:b",
+                    "known_date": "2024-06-15",
+                    "identity_status": "bounded_ticker",
+                    "source": "test",
+                },
+            ]
+        )
+        store.execute(
+            """
+            UPDATE prices
+            SET security_id = CASE ticker
+                WHEN 'A' THEN 'aios:security:a'
+                WHEN 'B' THEN 'aios:security:b'
+            END
+            WHERE ticker IN ('A', 'B')
+            """
+        )
+        monkeypatch.setattr(store, "data_quality_report", lambda: [])
+        calls: list[tuple[str, tuple[str, ...]]] = []
+
+        def fake_compute(tickers, as_of, store, regime_snapshot=None):
+            calls.append((str(as_of), tuple(tickers)))
+            return [_row(ticker, 100, 100) for ticker in tickers]
+
+        monkeypatch.setattr(engine, "compute_composite", fake_compute)
+        monkeypatch.setattr(
+            store,
+            "universe_data_coverage",
+            lambda universe_id, as_of, effective_on=None: [
+                {
+                    "ticker": ticker,
+                    "security_id": f"aios:security:{ticker.lower()}",
+                    "has_price_history": True,
+                    "has_pit_fundamentals": True,
+                    "latest_price_date": as_of,
+                    "latest_fundamental_date": date(2024, 2, 1),
+                }
+                for ticker in (
+                    row["ticker"]
+                    for row in store.universe_membership_known_on(
+                        universe_id,
+                        as_of,
+                        effective_on or as_of,
+                    )
+                )
+            ],
+        )
+
+        result = engine.run_qv_policy_backtest(
+            "2024-01-01",
+            "2024-09-30",
+            universe_id="demo",
+            top_n=1,
+            store=store,
+        )
+
+        assert calls == [
+            ("2024-03-29", ("A",)),
+            ("2024-06-28", ("B",)),
+        ]
+        assert [period.member_tickers for period in result.periods] == [("A",), ("B",)]
+        assert all(period.status == "complete" for period in result.periods)
     finally:
         store.close()
 

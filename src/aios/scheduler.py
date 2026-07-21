@@ -1,0 +1,402 @@
+"""Safe systemd-user scheduling for the single-process local deployment."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import tempfile
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+
+MANAGED_MARKER = "# Managed by AI Investment OS. Re-run `aios scheduler-install` to update."
+TIMER_NAMES = (
+    "aios-us-current.timer",
+    "aios-us-filings.timer",
+    "aios-backup.timer",
+)
+SERVICE_BY_TIMER = {
+    "aios-us-current.timer": "aios-us-current.service",
+    "aios-us-filings.timer": "aios-us-filings.service",
+    "aios-backup.timer": "aios-backup.service",
+}
+STATUS_QUERY_TIMEOUT_SECONDS = 5.0
+UNIT_NAMES = (
+    "aios-us-current.service",
+    "aios-us-current.timer",
+    "aios-us-filings.service",
+    "aios-us-filings.timer",
+    "aios-backup.service",
+    "aios-backup.timer",
+)
+Runner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+@dataclass(frozen=True)
+class SchedulerInstallResult:
+    """Installed unit paths and enabled timer names."""
+
+    unit_dir: Path
+    units: tuple[Path, ...]
+    timers: tuple[str, ...]
+
+
+def render_systemd_units(project_root: Path) -> dict[str, str]:
+    """Render user units with an exact checkout and virtual-environment path."""
+    root = Path(project_root).resolve()
+    launcher = root / ".venv" / "bin" / "aios"
+    root_value = _unit_scalar_path(root)
+    launcher_condition = _unit_scalar_path(launcher)
+    launcher_value = _unit_exec_path(launcher)
+    common_service = f"""{MANAGED_MARKER}
+[Unit]
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists={launcher_condition}
+
+[Service]
+Type=oneshot
+WorkingDirectory={root_value}
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+Nice=10
+TimeoutStartSec=45min
+"""
+    units = {
+        "aios-us-current.service": (
+            common_service.replace(
+                "[Unit]\n",
+                "[Unit]\nDescription=AIOS weekday U.S. price and macro refresh\n",
+                1,
+            )
+            + f"ExecStart={launcher_value} refresh-us-current --no-fundamentals\n"
+            + f"ExecStartPost={launcher_value} health\n"
+        ),
+        "aios-us-current.timer": _timer_unit(
+            "AIOS weekday U.S. current-data refresh",
+            "Mon..Fri *-*-* 07:30:00",
+            "aios-us-current.service",
+        ),
+        "aios-us-filings.service": (
+            common_service.replace(
+                "[Unit]\n",
+                "[Unit]\nDescription=AIOS weekly SEC filing refresh\n",
+                1,
+            )
+            + f"ExecStart={launcher_value} refresh-us-current --no-prices --no-macro\n"
+            + f"ExecStartPost={launcher_value} health\n"
+        ),
+        "aios-us-filings.timer": _timer_unit(
+            "AIOS weekly SEC filing refresh",
+            "Sat *-*-* 09:00:00",
+            "aios-us-filings.service",
+        ),
+        "aios-backup.service": (
+            common_service.replace(
+                "[Unit]\n",
+                "[Unit]\nDescription=AIOS weekly verified local backup\n",
+                1,
+            )
+            + f"ExecStart={launcher_value} backup\n"
+        ),
+        "aios-backup.timer": _timer_unit(
+            "AIOS weekly verified local backup",
+            "Sun *-*-* 09:00:00",
+            "aios-backup.service",
+        ),
+    }
+    if set(units) != set(UNIT_NAMES):
+        raise RuntimeError("internal scheduler unit set is incomplete")
+    return units
+
+
+def install_user_scheduler(
+    project_root: Path,
+    *,
+    confirm: bool = False,
+    unit_dir: Path | None = None,
+    runner: Runner = subprocess.run,
+) -> SchedulerInstallResult:
+    """Install and enable only marked AIOS user timers; never require root."""
+    if not confirm:
+        raise ValueError("scheduler installation requires explicit confirmation")
+    root = Path(project_root).resolve()
+    launcher = root / ".venv" / "bin" / "aios"
+    if launcher.is_symlink() or not launcher.is_file() or not os.access(launcher, os.X_OK):
+        raise ValueError(f"AIOS virtual-environment launcher is missing or unsafe: {launcher}")
+    destination = (
+        Path(unit_dir).expanduser().resolve()
+        if unit_dir is not None
+        else (Path.home() / ".config" / "systemd" / "user").resolve()
+    )
+    units = render_systemd_units(root)
+    _preflight_managed_paths(destination, units)
+    destination.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    for name, content in units.items():
+        target = destination / name
+        _atomic_write(target, content)
+        paths.append(target)
+
+    _run(runner, ["systemctl", "--user", "daemon-reload"])
+    _run(runner, ["systemctl", "--user", "enable", "--now", *TIMER_NAMES])
+    return SchedulerInstallResult(destination, tuple(paths), TIMER_NAMES)
+
+
+def set_user_scheduler_active(
+    active: bool,
+    *,
+    runner: Runner = subprocess.run,
+) -> None:
+    """Resume or pause every managed timer without editing its unit files."""
+    action = "enable" if active else "disable"
+    _run(runner, ["systemctl", "--user", action, "--now", *TIMER_NAMES])
+
+
+def user_scheduler_status(
+    *,
+    runner: Runner = subprocess.run,
+    unit_dir: Path | None = None,
+) -> dict[str, dict[str, bool | str]]:
+    """Return enabled/active state without hanging on an unavailable user bus."""
+    result: dict[str, dict[str, bool | str]] = {}
+    try:
+        for timer in TIMER_NAMES:
+            enabled = _status_query(
+                runner,
+                ["systemctl", "--user", "is-enabled", timer],
+            )
+            active = _status_query(
+                runner,
+                ["systemctl", "--user", "is-active", timer],
+            )
+            timer_properties = _show_properties(
+                runner,
+                timer,
+                ("LastTriggerUSec", "NextElapseUSecRealtime"),
+            )
+            service_properties = _show_properties(
+                runner,
+                SERVICE_BY_TIMER[timer],
+                (
+                    "Result",
+                    "ExecMainStatus",
+                    "ExecMainStartTimestamp",
+                    "ExecMainExitTimestamp",
+                ),
+            )
+            last_trigger = timer_properties.get("LastTriggerUSec", "never")
+            service_last_run = service_properties.get(
+                "ExecMainExitTimestamp",
+                service_properties.get("ExecMainStartTimestamp", "never"),
+            )
+            last_run = last_trigger if last_trigger != "never" else service_last_run
+            service_result = service_properties.get("Result", "not-run")
+            exit_status = service_properties.get("ExecMainStatus", "unknown")
+            # systemd reports Result=success and ExecMainStatus=0 for a freshly
+            # loaded oneshot service even when it has never executed. Do not turn
+            # those defaults into a false successful-run claim.
+            if last_run == "never":
+                service_result = "not-run"
+                exit_status = "unknown"
+            result[timer] = {
+                "enabled": enabled.returncode == 0,
+                "active": active.returncode == 0,
+                "last_trigger": last_trigger,
+                "last_run": last_run,
+                "next_trigger": timer_properties.get("NextElapseUSecRealtime", "unknown"),
+                "service_result": service_result,
+                "exit_status": exit_status,
+                "runtime_verified": True,
+            }
+    except subprocess.TimeoutExpired:
+        return _scheduler_file_status(unit_dir)
+    return result
+
+
+def _scheduler_file_status(unit_dir: Path | None) -> dict[str, dict[str, bool | str]]:
+    """Report safe installation evidence when runtime systemd state is unavailable."""
+    destination = (
+        Path(unit_dir).expanduser().resolve()
+        if unit_dir is not None
+        else (Path.home() / ".config" / "systemd" / "user").resolve()
+    )
+    wants = destination / "timers.target.wants"
+    result: dict[str, dict[str, bool | str]] = {}
+    for timer in TIMER_NAMES:
+        unit = destination / timer
+        enabled_link = wants / timer
+        installed = unit.is_file() and not unit.is_symlink() and _is_managed(unit)
+        enabled = enabled_link.is_symlink() and enabled_link.resolve() == unit
+        result[timer] = {
+            "enabled": installed and enabled,
+            "active": False,
+            "last_trigger": "unavailable",
+            "last_run": "unavailable",
+            "next_trigger": "unavailable",
+            "service_result": "unverified",
+            "exit_status": "unknown",
+            "runtime_verified": False,
+        }
+    return result
+
+
+def remove_user_scheduler(
+    *,
+    confirm: bool = False,
+    unit_dir: Path | None = None,
+    runner: Runner = subprocess.run,
+) -> tuple[Path, ...]:
+    """Disable and remove only files carrying the AIOS managed marker."""
+    if not confirm:
+        raise ValueError("scheduler removal requires explicit confirmation")
+    destination = (
+        Path(unit_dir).expanduser().resolve()
+        if unit_dir is not None
+        else (Path.home() / ".config" / "systemd" / "user").resolve()
+    )
+    existing = [destination / name for name in UNIT_NAMES if (destination / name).exists()]
+    for path in existing:
+        if path.is_symlink() or not _is_managed(path):
+            raise ValueError(f"refusing to remove unmanaged scheduler file: {path}")
+    _run(
+        runner,
+        ["systemctl", "--user", "disable", "--now", *TIMER_NAMES],
+        check=False,
+    )
+    for path in existing:
+        path.unlink()
+    _run(runner, ["systemctl", "--user", "daemon-reload"])
+    return tuple(existing)
+
+
+def _timer_unit(description: str, calendar: str, service: str) -> str:
+    return f"""{MANAGED_MARKER}
+[Unit]
+Description={description}
+
+[Timer]
+OnCalendar={calendar}
+Persistent=true
+AccuracySec=5min
+RandomizedDelaySec=5min
+Unit={service}
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def _preflight_managed_paths(destination: Path, units: dict[str, str]) -> None:
+    for name in units:
+        target = destination / name
+        if target.is_symlink():
+            raise ValueError(f"refusing to replace symbolic-link scheduler file: {target}")
+        if target.exists() and not _is_managed(target):
+            raise ValueError(f"refusing to replace unmanaged scheduler file: {target}")
+
+
+def _is_managed(path: Path) -> bool:
+    try:
+        first_line = path.read_text(encoding="utf-8").splitlines()[0]
+    except (IndexError, OSError, UnicodeError):
+        return False
+    return first_line == MANAGED_MARKER
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.chmod(0o644)
+        os.replace(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _run(runner: Runner, command: list[str], *, check: bool = True) -> None:
+    completed = runner(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if check and completed.returncode:
+        detail = (completed.stderr or completed.stdout or "unknown systemctl error").strip()
+        raise RuntimeError(f"{' '.join(command[:3])} failed: {detail}")
+
+
+def _show_properties(
+    runner: Runner,
+    unit: str,
+    properties: tuple[str, ...],
+) -> dict[str, str]:
+    command = ["systemctl", "--user", "show", unit]
+    for name in properties:
+        command.extend(("--property", name))
+    completed = _status_query(runner, command)
+    if completed.returncode:
+        return {}
+    output: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        name, separator, value = line.partition("=")
+        if separator and name in properties and value.strip():
+            output[name] = value.strip()
+    return output
+
+
+def _status_query(runner: Runner, command: list[str]) -> subprocess.CompletedProcess[str]:
+    """Bound every read-only systemd status call so the CLI always returns."""
+    # ``subprocess.run(timeout=...)`` kills only the direct process. A stuck
+    # systemctl/D-Bus helper can retain the captured pipes and keep
+    # ``communicate()`` blocked. On the real Linux deployment, coreutils
+    # ``timeout`` bounds the complete process group; injected test runners keep
+    # receiving the exact systemctl command.
+    executed_command = command
+    runner_timeout = STATUS_QUERY_TIMEOUT_SECONDS
+    if runner is subprocess.run:
+        executed_command = [
+            "timeout",
+            "--kill-after=1s",
+            f"{STATUS_QUERY_TIMEOUT_SECONDS:g}s",
+            *command,
+        ]
+        runner_timeout += 2.0
+    completed = runner(
+        executed_command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=runner_timeout,
+    )
+    if completed.returncode in {124, 137}:
+        raise subprocess.TimeoutExpired(command, STATUS_QUERY_TIMEOUT_SECONDS)
+    return completed
+
+
+def _path_text(value: Path) -> str:
+    text = str(value)
+    if not text or "\n" in text or "\r" in text or "\0" in text:
+        raise ValueError("project path cannot be represented in a systemd unit")
+    return text
+
+
+def _unit_scalar_path(value: Path) -> str:
+    text = _path_text(value)
+    return (
+        text.replace("\\", "\\x5c")
+        .replace(" ", "\\x20")
+        .replace("\t", "\\x09")
+        .replace("%", "%%")
+    )
+
+
+def _unit_exec_path(value: Path) -> str:
+    text = _path_text(value)
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'"{escaped}"'

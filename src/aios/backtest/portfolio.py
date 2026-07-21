@@ -55,6 +55,28 @@ class PortfolioTrade:
 
 
 @dataclass(frozen=True)
+class PortfolioConversion:
+    """One reviewed, non-trade share conversion applied to an open position."""
+
+    date: date
+    source_ticker: str
+    target_ticker: str
+    source_security_id: str
+    target_security_id: str
+    share_ratio: float
+    source_quantity: float
+    target_quantity: float
+    basis_policy: str
+    source: str
+    basis_source: str
+
+    def to_dict(self) -> dict[str, Any]:
+        result = asdict(self)
+        result["date"] = self.date.isoformat()
+        return result
+
+
+@dataclass(frozen=True)
 class PortfolioEquityPoint:
     """One end-of-session portfolio valuation."""
 
@@ -96,6 +118,7 @@ class PortfolioPeriodResult:
     traded_notional: float
     turnover: float
     trades: tuple[PortfolioTrade, ...] = ()
+    conversions: tuple[PortfolioConversion, ...] = ()
     ending_holdings: tuple[str, ...] = ()
     open_tax_lots: int = 0
     missing: tuple[str, ...] = ()
@@ -106,6 +129,17 @@ class _ResolvedSecurity:
     key: str
     ticker: str
     security_id: str | None
+
+
+@dataclass(frozen=True)
+class _ResolvedConversion:
+    source_key: str
+    target: _ResolvedSecurity
+    effective_date: date
+    share_ratio: float
+    basis_policy: str
+    source: str
+    basis_source: str
 
 
 @dataclass
@@ -164,6 +198,7 @@ class PortfolioBook:
         self.commission = 0.0
         self.slippage = 0.0
         self.fixed_fees = 0.0
+        self.conversions: list[PortfolioConversion] = []
         self.last_date: date | None = None
         self.peak_equity = float(initial_capital)
         self.curve: list[PortfolioEquityPoint] = []
@@ -193,10 +228,236 @@ class PortfolioBook:
         clone.commission = self.commission
         clone.slippage = self.slippage
         clone.fixed_fees = self.fixed_fees
+        clone.conversions = list(self.conversions)
         clone.last_date = self.last_date
         clone.peak_equity = self.peak_equity
         clone.curve = list(self.curve)
         return clone
+
+    @property
+    def equity(self) -> float:
+        """Current marked equity, or cash when the paper book is uninvested."""
+        return self._equity()
+
+    def current_weights(self) -> dict[str, float]:
+        """Return current non-cash weights keyed by visible market ticker."""
+        equity = self._equity()
+        if equity <= 0:
+            raise ValueError("portfolio equity must be positive")
+        return {
+            position.ticker: position.quantity * self.last_prices[key] / equity
+            for key, position in self.positions.items()
+        }
+
+    def to_state(self) -> dict[str, Any]:
+        """Serialize deterministic paper state without the shared Store handle."""
+        return {
+            "schema_version": 1,
+            "initial_capital": self.initial_capital,
+            "transaction_costs": self.transaction_cost_policy.to_dict(),
+            "tax_policy": self.tax_policy.to_dict(),
+            "calendar_ticker": self.calendar_ticker,
+            "cash": self.cash,
+            "positions": [
+                {
+                    "key": key,
+                    "ticker": position.ticker,
+                    "security_id": position.security_id,
+                    "lots": [
+                        {
+                            "ticker": lot.ticker,
+                            "quantity": lot.quantity,
+                            "cost_basis_per_share": lot.cost_basis_per_share,
+                            "acquired_date": lot.acquired_date.isoformat(),
+                        }
+                        for lot in position.lots
+                    ],
+                }
+                for key, position in sorted(self.positions.items())
+            ],
+            "last_prices": dict(sorted(self.last_prices.items())),
+            "last_price_dates": {
+                key: value.isoformat() for key, value in sorted(self.last_price_dates.items())
+            },
+            "tax_ledger": asdict(self.tax_ledger),
+            "short_term_tax": self.short_term_tax,
+            "long_term_tax": self.long_term_tax,
+            "dividend_tax": self.dividend_tax,
+            "transaction_cost_total": self.transaction_costs,
+            "commission_total": self.commission,
+            "slippage_total": self.slippage,
+            "fixed_fee_total": self.fixed_fees,
+            "conversions": [conversion.to_dict() for conversion in self.conversions],
+            "last_date": self.last_date.isoformat() if self.last_date else None,
+            "peak_equity": self.peak_equity,
+            "curve": [point.to_dict() for point in self.curve],
+        }
+
+    @classmethod
+    def from_state(cls, store: Store, state: dict[str, Any]) -> PortfolioBook:
+        """Restore validated paper state produced by :meth:`to_state`."""
+        if not isinstance(state, dict) or state.get("schema_version") != 1:
+            raise ValueError("unsupported portfolio state schema")
+        try:
+            book = cls(
+                store,
+                initial_capital=float(state["initial_capital"]),
+                transaction_costs=TransactionCostPolicy(**state["transaction_costs"]),
+                tax_policy=TaxPolicy(**state["tax_policy"]),
+                calendar_ticker=state.get("calendar_ticker"),
+            )
+            book.cash = float(state["cash"])
+            positions: dict[str, _Position] = {}
+            for raw_position in state.get("positions", []):
+                key = str(raw_position["key"])
+                if not key or key in positions:
+                    raise ValueError("portfolio state has duplicate or blank position key")
+                lots = [
+                    TaxLot(
+                        str(raw_lot["ticker"]).upper(),
+                        float(raw_lot["quantity"]),
+                        float(raw_lot["cost_basis_per_share"]),
+                        date.fromisoformat(str(raw_lot["acquired_date"])),
+                    )
+                    for raw_lot in raw_position.get("lots", [])
+                ]
+                if not lots or any(
+                    lot.quantity <= 0
+                    or not isfinite(lot.quantity)
+                    or lot.cost_basis_per_share <= 0
+                    or not isfinite(lot.cost_basis_per_share)
+                    for lot in lots
+                ):
+                    raise ValueError("portfolio state has an invalid tax lot")
+                positions[key] = _Position(
+                    key=key,
+                    ticker=str(raw_position["ticker"]).upper(),
+                    security_id=raw_position.get("security_id"),
+                    lots=lots,
+                )
+            book.positions = positions
+            book.last_prices = {
+                str(key): float(value) for key, value in state.get("last_prices", {}).items()
+            }
+            book.last_price_dates = {
+                str(key): date.fromisoformat(str(value))
+                for key, value in state.get("last_price_dates", {}).items()
+            }
+            if set(book.positions) - set(book.last_prices):
+                raise ValueError("portfolio state is missing a position mark price")
+            if any(value <= 0 or not isfinite(value) for value in book.last_prices.values()):
+                raise ValueError("portfolio state has an invalid mark price")
+            ledger = state.get("tax_ledger", {})
+            book.tax_ledger = TaxLedger(
+                short_term_gains=float(ledger.get("short_term_gains", 0.0)),
+                long_term_gains=float(ledger.get("long_term_gains", 0.0)),
+                dividend_income=float(ledger.get("dividend_income", 0.0)),
+            )
+            book.short_term_tax = float(state.get("short_term_tax", 0.0))
+            book.long_term_tax = float(state.get("long_term_tax", 0.0))
+            book.dividend_tax = float(state.get("dividend_tax", 0.0))
+            book.transaction_costs = float(state.get("transaction_cost_total", 0.0))
+            book.commission = float(state.get("commission_total", 0.0))
+            book.slippage = float(state.get("slippage_total", 0.0))
+            book.fixed_fees = float(state.get("fixed_fee_total", 0.0))
+            book.conversions = [
+                PortfolioConversion(
+                    date=date.fromisoformat(str(raw["date"])),
+                    source_ticker=str(raw["source_ticker"]).upper(),
+                    target_ticker=str(raw["target_ticker"]).upper(),
+                    source_security_id=str(raw["source_security_id"]),
+                    target_security_id=str(raw["target_security_id"]),
+                    share_ratio=float(raw["share_ratio"]),
+                    source_quantity=float(raw["source_quantity"]),
+                    target_quantity=float(raw["target_quantity"]),
+                    basis_policy=str(raw["basis_policy"]),
+                    source=str(raw["source"]),
+                    basis_source=str(raw["basis_source"]),
+                )
+                for raw in state.get("conversions", [])
+            ]
+            book.last_date = (
+                date.fromisoformat(str(state["last_date"])) if state.get("last_date") else None
+            )
+            book.peak_equity = float(state["peak_equity"])
+            book.curve = [
+                PortfolioEquityPoint(
+                    date=date.fromisoformat(str(raw["date"])),
+                    equity=float(raw["equity"]),
+                    cash=float(raw["cash"]),
+                    gross_exposure=float(raw["gross_exposure"]),
+                    position_count=int(raw["position_count"]),
+                    daily_return=(
+                        float(raw["daily_return"])
+                        if raw.get("daily_return") is not None
+                        else None
+                    ),
+                    drawdown=float(raw["drawdown"]),
+                    cumulative_transaction_costs=float(
+                        raw["cumulative_transaction_costs"]
+                    ),
+                    accrued_taxes=float(raw["accrued_taxes"]),
+                    stale_tickers=tuple(str(value) for value in raw.get("stale_tickers", [])),
+                )
+                for raw in state.get("curve", [])
+            ]
+        except (KeyError, TypeError, ValueError) as exc:
+            if isinstance(exc, ValueError) and str(exc).startswith("portfolio state"):
+                raise
+            raise ValueError("invalid portfolio state payload") from exc
+        if book.curve and book.last_date != book.curve[-1].date:
+            raise ValueError("portfolio state date disagrees with its equity curve")
+        if not isfinite(book.cash) or not isfinite(book.peak_equity) or book.peak_equity <= 0:
+            raise ValueError("portfolio state has invalid capital values")
+        return book
+
+    def mark_through(self, end_date: date) -> tuple[PortfolioEquityPoint, ...]:
+        """Advance an existing paper book without rebalancing."""
+        if self.last_date is None:
+            raise ValueError("paper book has no starting valuation date")
+        if end_date < self.last_date:
+            raise ValueError("paper mark date cannot move backward")
+        if end_date == self.last_date:
+            return ()
+        snapshot = self.clone()
+        initial_curve_length = len(self.curve)
+        try:
+            securities = tuple(
+                _ResolvedSecurity(key, position.ticker, position.security_id)
+                for key, position in self.positions.items()
+            )
+            securities, conversions = self._expand_security_conversions(
+                securities,
+                self.last_date,
+                end_date,
+            )
+            labels = {security.key: security.ticker for security in securities}
+            paths = self._load_paths(securities, self.last_date, end_date)
+            calendar_dates = self._calendar_dates(self.last_date, end_date)
+            if not calendar_dates or calendar_dates[-1] != end_date:
+                raise _PortfolioDataError(f"missing_calendar_mark:{end_date}")
+            for key, dated_rows in paths.items():
+                ticker = labels.get(key, key)
+                for observation_date, row in dated_rows.items():
+                    if row.get("actions_complete") is not True:
+                        raise _PortfolioDataError(
+                            f"{ticker}:unverified_corporate_actions:{observation_date}"
+                        )
+                    if row.get("close_split_adjusted") is None:
+                        raise _PortfolioDataError(f"{ticker}:split_adjustment_basis_unknown")
+            for session_date in calendar_dates:
+                rows_for_date = {
+                    key: rows[session_date]
+                    for key, rows in paths.items()
+                    if session_date in rows
+                }
+                self._apply_conversions(session_date, conversions, rows_for_date)
+                self._apply_session_rows(session_date, rows_for_date)
+                self._record_equity(session_date)
+            return tuple(self.curve[initial_curve_length:])
+        except Exception:
+            self._restore(snapshot)
+            raise
 
     def advance_period(
         self,
@@ -244,7 +505,12 @@ class PortfolioBook:
                 for key, position in self.positions.items()
             }
         )
-        paths = self._load_paths(tuple(securities.values()), decision_date, exit_date)
+        resolved_securities, conversions = self._expand_security_conversions(
+            tuple(securities.values()),
+            decision_date,
+            exit_date,
+        )
+        paths = self._load_paths(resolved_securities, decision_date, exit_date)
         calendar_dates = self._calendar_dates(decision_date, exit_date)
         missing = self._preflight(
             targets,
@@ -252,6 +518,7 @@ class PortfolioBook:
             calendar_dates,
             entry_date,
             exit_date,
+            conversions,
         )
         if missing:
             raise _PortfolioDataError(*missing)
@@ -263,11 +530,13 @@ class PortfolioBook:
         before_short_tax = self.short_term_tax
         before_long_tax = self.long_term_tax
         before_dividend_tax = self.dividend_tax
+        before_conversions = len(self.conversions)
         trades: list[PortfolioTrade] = []
         for session_date in calendar_dates:
             rows_for_date = {
                 key: rows[session_date] for key, rows in paths.items() if session_date in rows
             }
+            self._apply_conversions(session_date, conversions, rows_for_date)
             self._apply_session_rows(session_date, rows_for_date)
             if session_date == entry_date:
                 trades.extend(self._rebalance(targets, rows_for_date, entry_date))
@@ -292,6 +561,7 @@ class PortfolioBook:
             traded_notional=traded_notional,
             turnover=traded_notional / starting_equity,
             trades=tuple(trades),
+            conversions=tuple(self.conversions[before_conversions:]),
             ending_holdings=tuple(sorted(position.ticker for position in self.positions.values())),
             open_tax_lots=sum(len(position.lots) for position in self.positions.values()),
         )
@@ -310,6 +580,7 @@ class PortfolioBook:
         self.commission = snapshot.commission
         self.slippage = snapshot.slippage
         self.fixed_fees = snapshot.fixed_fees
+        self.conversions = list(snapshot.conversions)
         self.last_date = snapshot.last_date
         self.peak_equity = snapshot.peak_equity
         self.curve = list(snapshot.curve)
@@ -335,6 +606,65 @@ class PortfolioBook:
             targets[key] = _ResolvedSecurity(key, normalized, security_id)
         return targets
 
+    def _expand_security_conversions(
+        self,
+        securities: tuple[_ResolvedSecurity, ...],
+        start: date,
+        end: date,
+    ) -> tuple[tuple[_ResolvedSecurity, ...], tuple[_ResolvedConversion, ...]]:
+        """Add reviewed successor paths needed by mid-period conversions."""
+        by_key = {security.key: security for security in securities}
+        frontier = {
+            security.security_id
+            for security in securities
+            if security.security_id is not None
+        }
+        resolved: list[_ResolvedConversion] = []
+        visited: set[str] = set()
+        while frontier:
+            events = self.store.security_conversions_between(frontier, start, end)
+            frontier = set()
+            for row in events:
+                source_security_id = str(row["source_security_id"])
+                if source_security_id in visited:
+                    continue
+                visited.add(source_security_id)
+                if source_security_id not in by_key:
+                    raise _PortfolioDataError(
+                        f"conversion_source_not_loaded:{source_security_id}"
+                    )
+                effective_date = row["effective_date"]
+                target_security_id = str(row["target_security_id"])
+                target_ticker = self.store.ticker_for_security_id(
+                    target_security_id,
+                    effective_date,
+                )
+                if target_ticker is None:
+                    raise _PortfolioDataError(
+                        f"conversion_target_ticker_missing:{target_security_id}:{effective_date}"
+                    )
+                target = _ResolvedSecurity(
+                    target_security_id,
+                    str(target_ticker).upper(),
+                    target_security_id,
+                )
+                by_key.setdefault(target.key, target)
+                resolved.append(
+                    _ResolvedConversion(
+                        source_key=source_security_id,
+                        target=target,
+                        effective_date=effective_date,
+                        share_ratio=float(row["share_ratio"]),
+                        basis_policy=str(row["basis_policy"]),
+                        source=str(row["source"]),
+                        basis_source=str(row["basis_source"]),
+                    )
+                )
+                if target_security_id not in visited:
+                    frontier.add(target_security_id)
+        resolved.sort(key=lambda event: (event.effective_date, event.source_key))
+        return tuple(by_key.values()), tuple(resolved)
+
     def _load_paths(
         self,
         securities: tuple[_ResolvedSecurity, ...],
@@ -346,7 +676,8 @@ class PortfolioBook:
             if security.security_id is not None:
                 rows = self.store.query(
                     """
-                    SELECT ticker, security_id, date, close, dividends, split_ratio
+                    SELECT ticker, security_id, date, close, dividends, split_ratio,
+                           actions_complete, close_split_adjusted
                     FROM prices
                     WHERE security_id = ? AND date > ? AND date <= ?
                     ORDER BY date, ticker
@@ -356,7 +687,8 @@ class PortfolioBook:
             else:
                 rows = self.store.query(
                     """
-                    SELECT ticker, security_id, date, close, dividends, split_ratio
+                    SELECT ticker, security_id, date, close, dividends, split_ratio,
+                           actions_complete, close_split_adjusted
                     FROM prices
                     WHERE ticker = ? AND date > ? AND date <= ?
                     ORDER BY date
@@ -404,6 +736,7 @@ class PortfolioBook:
         calendar_dates: list[date],
         entry_date: date,
         exit_date: date,
+        conversions: tuple[_ResolvedConversion, ...],
     ) -> tuple[str, ...]:
         missing: list[str] = []
         calendar_set = set(calendar_dates)
@@ -411,15 +744,79 @@ class PortfolioBook:
             missing.append(f"missing_calendar_entry:{entry_date}")
         if exit_date not in calendar_set:
             missing.append(f"missing_calendar_exit:{exit_date}")
-        required_at_entry = set(targets) | set(self.positions)
+        target_keys = set(targets)
+        conversions_by_source = {event.source_key: event for event in conversions}
+        labels = {
+            **{key: target.ticker for key, target in targets.items()},
+            **{key: position.ticker for key, position in self.positions.items()},
+            **{event.target.key: event.target.ticker for event in conversions},
+        }
+        for event in conversions:
+            if event.source_key in target_keys and event.effective_date <= entry_date:
+                missing.append(
+                    "target_converts_on_or_before_entry:"
+                    f"{targets[event.source_key].ticker}:{event.effective_date}"
+                )
+            if event.effective_date not in calendar_set:
+                missing.append(
+                    f"conversion_off_calendar:{event.source_key}:{event.effective_date}"
+                )
+            if not self._valid_close(
+                paths.get(event.target.key, {}).get(event.effective_date)
+            ):
+                missing.append(
+                    "conversion_target_price_missing:"
+                    f"{event.target.ticker}:{event.effective_date}"
+                )
+
+        required_at_entry = self._keys_after_conversions(
+            set(targets) | set(self.positions),
+            conversions_by_source,
+            entry_date,
+        )
         for key in required_at_entry:
-            ticker = self._security_label(key, targets)
+            ticker = labels.get(key, key)
             if not self._valid_close(paths.get(key, {}).get(entry_date)):
                 missing.append(f"{ticker}:missing_scheduled_entry_price:{entry_date}")
-        for key, target in targets.items():
+        required_at_exit = self._keys_after_conversions(
+            set(targets),
+            conversions_by_source,
+            exit_date,
+        )
+        for key in required_at_exit:
+            ticker = labels.get(key, key)
             if not self._valid_close(paths.get(key, {}).get(exit_date)):
-                missing.append(f"{target.ticker}:missing_scheduled_exit_price:{exit_date}")
+                missing.append(f"{ticker}:missing_scheduled_exit_price:{exit_date}")
+        for key, dated_rows in paths.items():
+            ticker = labels.get(key, key)
+            split_bases = {row.get("close_split_adjusted") for row in dated_rows.values()}
+            if None in split_bases:
+                missing.append(f"{ticker}:split_adjustment_basis_unknown")
+            if len(split_bases) > 1:
+                missing.append(f"{ticker}:mixed_split_adjustment_basis")
+            for observation_date, row in dated_rows.items():
+                if row.get("actions_complete") is not True:
+                    missing.append(f"{ticker}:unverified_corporate_actions:{observation_date}")
         return tuple(sorted(set(missing)))
+
+    @staticmethod
+    def _keys_after_conversions(
+        keys: set[str],
+        conversions: dict[str, _ResolvedConversion],
+        through: date,
+    ) -> set[str]:
+        output = set(keys)
+        changed = True
+        while changed:
+            changed = False
+            for source_key in list(output):
+                event = conversions.get(source_key)
+                if event is None or event.effective_date > through:
+                    continue
+                output.remove(source_key)
+                output.add(event.target.key)
+                changed = True
+        return output
 
     def _security_label(
         self,
@@ -438,6 +835,65 @@ class PortfolioBook:
         value = float(row["close"])
         return isfinite(value) and value > 0
 
+    def _apply_conversions(
+        self,
+        session_date: date,
+        conversions: tuple[_ResolvedConversion, ...],
+        rows: dict[str, dict[str, Any]],
+    ) -> None:
+        """Apply reviewed share conversions before the effective session mark."""
+        for event in conversions:
+            if event.effective_date != session_date or event.source_key not in self.positions:
+                continue
+            if event.basis_policy != "carryover":
+                raise _PortfolioDataError(
+                    f"unsupported_conversion_basis:{event.source_key}:{event.basis_policy}"
+                )
+            target_row = rows.get(event.target.key)
+            if not self._valid_close(target_row):
+                raise _PortfolioDataError(
+                    f"conversion_target_price_missing:{event.target.ticker}:{session_date}"
+                )
+            source_position = self.positions.pop(event.source_key)
+            source_quantity = source_position.quantity
+            converted_lots = [
+                TaxLot(
+                    event.target.ticker,
+                    lot.quantity * event.share_ratio,
+                    lot.cost_basis_per_share / event.share_ratio,
+                    lot.acquired_date,
+                )
+                for lot in source_position.lots
+            ]
+            target_position = self.positions.get(event.target.key)
+            if target_position is None:
+                target_position = _Position(
+                    key=event.target.key,
+                    ticker=event.target.ticker,
+                    security_id=event.target.security_id,
+                )
+                self.positions[event.target.key] = target_position
+            target_position.ticker = event.target.ticker
+            target_position.lots.extend(converted_lots)
+            self.last_prices.pop(event.source_key, None)
+            self.last_price_dates.pop(event.source_key, None)
+            target_quantity = source_quantity * event.share_ratio
+            self.conversions.append(
+                PortfolioConversion(
+                    date=session_date,
+                    source_ticker=source_position.ticker,
+                    target_ticker=event.target.ticker,
+                    source_security_id=event.source_key,
+                    target_security_id=event.target.key,
+                    share_ratio=event.share_ratio,
+                    source_quantity=source_quantity,
+                    target_quantity=target_quantity,
+                    basis_policy=event.basis_policy,
+                    source=event.source,
+                    basis_source=event.basis_source,
+                )
+            )
+
     def _apply_session_rows(
         self,
         session_date: date,
@@ -448,7 +904,7 @@ class PortfolioBook:
             if row is None:
                 continue
             split_ratio = self._event_number(row.get("split_ratio"), default=1.0)
-            if split_ratio != 1.0:
+            if split_ratio != 1.0 and row.get("close_split_adjusted") is not True:
                 position.lots = [
                     TaxLot(
                         lot.ticker,

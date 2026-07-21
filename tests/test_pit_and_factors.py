@@ -14,7 +14,12 @@ from aios.factors import composite as composite_factor
 from aios.factors import quality as quality_factor
 from aios.factors import value as value_factor
 from aios.factors.common import deduped_history, factor_cache_scope, metric_value, ttm_sum
-from aios.factors.policy import BASELINE_FACTOR_WEIGHTS, REGIME_FACTOR_WEIGHTS
+from aios.factors.market_factors import MarketFactorSnapshot
+from aios.factors.policy import (
+    BASELINE_FACTOR_WEIGHTS,
+    REGIME_FACTOR_WEIGHTS,
+    qvml_weights_for_regime,
+)
 from aios.factors.quality import QualitySnapshot
 from aios.factors.value import ValueSnapshot, compute_value_raw
 from aios.ingest import edgar
@@ -160,6 +165,40 @@ def test_price_upsert_preserves_provider_source(tmp_path):
 
         assert store.price_on("TEST", "2024-01-02")["source"] == "stooq"
         assert store.latest_price_date("TEST") == date(2024, 1, 2)
+    finally:
+        store.close()
+
+
+def test_value_restores_contemporaneous_price_before_combining_sec_facts(tmp_path):
+    store = Store(tmp_path / "split-factor-price.duckdb")
+    try:
+        store.upsert_fundamentals(
+            [
+                _fundamental("TEST", "2023-12-31", "2024-02-01", "shares_out", 10),
+                _fundamental("TEST", "2023-12-31", "2024-02-01", "debt_total", 0),
+                _fundamental("TEST", "2023-12-31", "2024-02-01", "cash", 0),
+                _fundamental("TEST", "2023-12-31", "2024-02-01", "stockholders_equity", 100),
+            ]
+        )
+        store.upsert_prices(
+            [
+                {
+                    "ticker": "TEST",
+                    "date": "2024-02-01",
+                    "close": 20,
+                    "actions_complete": True,
+                    "close_split_adjusted": True,
+                    "split_normalization_factor": 5,
+                    "split_normalization_through": "2025-01-01",
+                    "source": "yfinance",
+                }
+            ]
+        )
+
+        snap = compute_value_raw("TEST", "2024-02-01", store)
+
+        assert snap.price == 100
+        assert snap.market_cap == 1_000
     finally:
         store.close()
 
@@ -1080,6 +1119,129 @@ def test_regime_factor_weights_are_explicit_and_normalized():
         assert weights.quality >= 0
         assert weights.value >= 0
         assert weights.quality + weights.value == pytest.approx(1.0)
+
+
+def test_qvml_weights_preserve_regime_qv_tilt_and_are_normalized():
+    for regime, qv_weights in REGIME_FACTOR_WEIGHTS.items():
+        weights = qvml_weights_for_regime(regime)
+        assert (
+            weights.quality,
+            weights.value,
+            weights.momentum,
+            weights.low_volatility,
+        ) == pytest.approx(
+            (
+                qv_weights.quality * 0.60,
+                qv_weights.value * 0.60,
+                0.25,
+                0.15,
+            )
+        )
+        assert sum(
+            (
+                weights.quality,
+                weights.value,
+                weights.momentum,
+                weights.low_volatility,
+            )
+        ) == pytest.approx(1.0)
+
+
+def test_qvml_is_opt_in_and_requires_all_four_factor_scores(monkeypatch, tmp_path):
+    store = Store(tmp_path / "qvml-composite.duckdb")
+    try:
+        quality = {
+            "A": QualitySnapshot(
+                ticker="A",
+                as_of="2024-12-31",
+                roic=0.20,
+                fcf_margin=0.10,
+            ),
+            "B": QualitySnapshot(
+                ticker="B",
+                as_of="2024-12-31",
+                roic=0.10,
+                fcf_margin=0.05,
+            ),
+        }
+        monkeypatch.setattr(
+            composite_factor,
+            "compute_quality",
+            lambda ticker, as_of, store: quality[ticker],
+        )
+        monkeypatch.setattr(
+            composite_factor,
+            "compute_value_ranked",
+            lambda tickers, as_of, store: {
+                ticker: ValueSnapshot(
+                    ticker=ticker,
+                    as_of=str(as_of),
+                    value_score=80.0 if ticker == "A" else 40.0,
+                    multiples_available=2,
+                )
+                for ticker in tickers
+            },
+        )
+        market_calls = 0
+
+        def market_snapshots(tickers, as_of, store):
+            nonlocal market_calls
+            market_calls += 1
+            return {
+                "A": MarketFactorSnapshot(
+                    ticker="A",
+                    as_of=str(as_of),
+                    momentum_score=70.0,
+                    low_volatility_score=90.0,
+                ),
+                "B": MarketFactorSnapshot(
+                    ticker="B",
+                    as_of=str(as_of),
+                    momentum_score=30.0,
+                    low_volatility_score=None,
+                ),
+            }
+
+        monkeypatch.setattr(
+            composite_factor,
+            "compute_market_factors_ranked",
+            market_snapshots,
+        )
+        no_regime = SimpleNamespace(
+            as_of="2024-12-31",
+            is_pit_ready=False,
+            regime="unknown",
+            missing=[],
+        )
+
+        qv_rows = composite_factor.compute_composite(
+            ["A", "B"], "2024-12-31", store, regime_snapshot=no_regime
+        )
+        assert market_calls == 0
+        assert all(row.qvml_score is None for row in qv_rows)
+
+        qvml_rows = {
+            row.ticker: row
+            for row in composite_factor.compute_composite(
+                ["A", "B"],
+                "2024-12-31",
+                store,
+                regime_snapshot=no_regime,
+                include_market_factors=True,
+            )
+        }
+        assert market_calls == 1
+        assert qvml_rows["A"].qvml_score == pytest.approx(
+            0.36 * qvml_rows["A"].quality_score
+            + 0.24 * qvml_rows["A"].value_score
+            + 0.25 * qvml_rows["A"].momentum_score
+            + 0.15 * qvml_rows["A"].low_volatility_score
+        )
+        assert qvml_rows["A"].qvml_rank == 1
+        assert qvml_rows["B"].qvml_score is None
+        assert qvml_rows["B"].qvml_rank is None
+    finally:
+        store.close()
 
 
 def test_composite_uses_pit_regime_weights(monkeypatch, tmp_path):

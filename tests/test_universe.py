@@ -8,6 +8,7 @@ from aios.ingest.universe import (
     build_membership_from_events,
     load_membership_csv,
     load_universe_events_csv,
+    merge_universe_event_batches,
     reconcile_event_boundaries,
 )
 from aios.storage.store import Store
@@ -20,6 +21,7 @@ def _membership(ticker: str, start: str, end: str | None, known: str) -> dict:
         "effective_start": start,
         "effective_end": end,
         "known_date": known,
+        "end_known_date": known if end is not None else None,
         "source": "test",
     }
 
@@ -43,6 +45,31 @@ def test_membership_is_point_in_time_and_half_open(tmp_path):
         assert store.universe_membership_on("demo", "2024-06-01")[0]["known_date"] == date(
             2023, 12, 15
         )
+    finally:
+        store.close()
+
+
+def test_membership_separates_decision_knowledge_from_execution_effective_date(tmp_path):
+    store = Store(tmp_path / "universe-execution.duckdb")
+    try:
+        ending = _membership("A", "2024-01-01", "2024-07-01", "2023-12-15")
+        ending["end_known_date"] = "2024-06-15"
+        store.upsert_universe_membership(
+            [
+                ending,
+                _membership("B", "2024-07-01", None, "2024-06-15"),
+            ]
+        )
+
+        before = store.universe_membership_known_on(
+            "demo", "2024-06-14", "2024-07-01"
+        )
+        after = store.universe_membership_known_on(
+            "demo", "2024-06-15", "2024-07-01"
+        )
+
+        assert [row["ticker"] for row in before] == ["A"]
+        assert [row["ticker"] for row in after] == ["B"]
     finally:
         store.close()
 
@@ -87,6 +114,7 @@ def test_membership_csv_applies_defaults(tmp_path):
             "effective_start": date(2024, 1, 1),
             "effective_end": None,
             "known_date": date(2023, 12, 15),
+            "end_known_date": None,
             "source": "test-csv",
         }
     ]
@@ -120,6 +148,20 @@ def test_event_csv_requires_actionable_dates_and_official_source(tmp_path):
     )
     with pytest.raises(ValueError, match="not an official"):
         load_universe_events_csv(path, require_official_sources=True)
+
+
+def test_reviewed_event_batches_refuse_overlapping_keys():
+    event = UniverseEvent(
+        "sp500",
+        "A",
+        date(2024, 1, 2),
+        "addition",
+        date(2024, 1, 1),
+        "https://press.spglobal.com/release",
+    )
+
+    with pytest.raises(ValueError, match="duplicate event across reviewed batches"):
+        merge_universe_event_batches([event], [event])
 
 
 def test_reference_reconciliation_catches_false_replacement():
@@ -203,4 +245,8 @@ def test_event_builder_handles_deletion_reentry_and_certified_end():
         ("C", date(2024, 2, 1), date(2024, 3, 1)),
     ]
     assert rows[1]["known_date"] == date(2024, 2, 20)
+    assert rows[0]["end_known_date"] == date(2024, 1, 20)
+    assert rows[1]["end_known_date"] == date(2024, 3, 31)
     assert rows[2]["known_date"] == date(2024, 1, 1)
+    assert rows[2]["end_known_date"] == date(2024, 3, 31)
+    assert rows[3]["end_known_date"] == date(2024, 2, 20)

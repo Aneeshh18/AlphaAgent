@@ -12,6 +12,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from itertools import pairwise
+from math import isfinite
 
 from aios.storage.store import Store
 
@@ -50,6 +51,7 @@ class FactorDataCache:
         self._histories: dict[tuple[str, str, str], list[dict]] = {}
         self._ttm_values: dict[tuple[str, str, str], float | None] = {}
         self._prices: dict[tuple[str, str], float | None] = {}
+        self._price_histories: dict[tuple[str, str, int], list[dict]] = {}
         self._financials: dict[str, bool] = {}
         self._preload_financial_classification(tickers or [])
 
@@ -123,10 +125,27 @@ class FactorDataCache:
     def latest_price(self, ticker: str, as_of: str) -> float | None:
         key = (ticker.upper(), as_of)
         if key not in self._prices:
-            row = self.store.latest_price(ticker, as_of)
-            close = None if row is None else row["close"]
-            self._prices[key] = float(close) if close is not None else None
+            cached_history = next(
+                (
+                    rows
+                    for (history_ticker, history_as_of, _), rows in self._price_histories.items()
+                    if history_ticker == key[0] and history_as_of == key[1] and rows
+                ),
+                None,
+            )
+            row = cached_history[-1] if cached_history else self.store.latest_price(ticker, as_of)
+            self._prices[key] = factor_price_from_row(row)
         return self._prices[key]
+
+    def price_history(self, ticker: str, as_of: str, observations: int) -> list[dict]:
+        key = (ticker.upper(), as_of, observations)
+        if key not in self._price_histories:
+            self._price_histories[key] = self.store.pit_factor_price_history(
+                ticker,
+                as_of,
+                observations=observations,
+            )
+        return self._price_histories[key]
 
     def is_financials(self, ticker: str) -> bool:
         normalized = ticker.upper()
@@ -325,16 +344,48 @@ def shift_year(as_of: str) -> str:
         return as_of
 
 
+def factor_price_from_row(row: dict | None) -> float | None:
+    """Return a contemporaneous-basis price suitable for SEC factor inputs."""
+    if row is None or row.get("close") is None:
+        return None
+    close = float(row["close"])
+    split_adjusted = row.get("close_split_adjusted")
+    if split_adjusted is True:
+        factor = row.get("split_normalization_factor")
+        if factor is None:
+            return None
+        factor = float(factor)
+        if not isfinite(factor) or factor <= 0:
+            return None
+        return close * factor
+    if split_adjusted is False:
+        return close
+    return None
+
+
 def latest_price(store: Store, ticker: str, as_of: str) -> float | None:
-    """Most recent close price on or before `as_of` (PIT-correct market data)."""
+    """Most recent close restored to its contemporaneous split basis."""
     cache = _factor_cache(store)
     if cache is not None:
         return cache.latest_price(ticker, as_of)
     row = store.latest_price(ticker, as_of)
     if row is None:
         return None
-    c = row["close"]
-    return float(c) if c is not None else None
+    return factor_price_from_row(row)
+
+
+def factor_price_history(
+    store: Store,
+    ticker: str,
+    as_of: str,
+    *,
+    observations: int,
+) -> list[dict]:
+    """Identity-safe raw-price/action rows for one market-factor window."""
+    cache = _factor_cache(store)
+    if cache is not None:
+        return cache.price_history(ticker, as_of, observations)
+    return store.pit_factor_price_history(ticker, as_of, observations=observations)
 
 
 def market_cap(

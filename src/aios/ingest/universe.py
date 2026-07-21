@@ -7,7 +7,7 @@ same date would reintroduce survivorship and membership look-ahead bias.
 
 Expected CSV columns::
 
-    universe_id,ticker,effective_start,effective_end,known_date,source
+    universe_id,ticker,effective_start,effective_end,known_date,end_known_date,source
 
 ``universe_id`` and ``source`` may be supplied as command-line defaults, but
 ``effective_start`` and ``known_date`` are always required per row.
@@ -25,7 +25,7 @@ from uuid import uuid4
 from aios.storage.store import Store, get_store
 
 REQUIRED_COLUMNS = {"ticker", "effective_start", "known_date"}
-OPTIONAL_COLUMNS = {"universe_id", "effective_end", "source"}
+OPTIONAL_COLUMNS = {"universe_id", "effective_end", "end_known_date", "source"}
 SPAN_COLUMNS = {"ticker", "start_date", "end_date"}
 EVENT_REQUIRED_COLUMNS = {"ticker", "effective_date", "action", "known_date", "source"}
 EVENT_OPTIONAL_COLUMNS = {"universe_id", "index_name", "source_kind"}
@@ -35,6 +35,7 @@ MEMBERSHIP_COLUMNS = (
     "effective_start",
     "effective_end",
     "known_date",
+    "end_known_date",
     "source",
 )
 
@@ -216,6 +217,34 @@ def load_universe_events_csv(
     )
 
 
+def merge_universe_event_batches(
+    *batches: list[UniverseEvent],
+) -> list[UniverseEvent]:
+    """Merge immutable reviewed batches while refusing overlapping event keys."""
+    merged: list[UniverseEvent] = []
+    seen: set[tuple[str, str, date, str]] = set()
+    for batch in batches:
+        for event in batch:
+            key = (
+                event.universe_id,
+                event.ticker,
+                event.effective_date,
+                event.action,
+            )
+            if key in seen:
+                raise ValueError(f"duplicate event across reviewed batches: {key}")
+            seen.add(key)
+            merged.append(event)
+    return sorted(
+        merged,
+        key=lambda event: (
+            event.effective_date,
+            0 if event.action == "deletion" else 1,
+            event.ticker,
+        ),
+    )
+
+
 def reconcile_event_boundaries(
     spans: list[EffectiveSpan],
     events: list[UniverseEvent],
@@ -342,6 +371,7 @@ def build_membership_from_events(
                     start_date,
                     event.effective_date,
                     known_date,
+                    event.known_date,
                     f"{start_source}|end:{event.source}",
                 )
             )
@@ -365,6 +395,7 @@ def build_membership_from_events(
                 start_date,
                 certified_end,
                 known_date,
+                coverage_end,
                 f"{start_source}|coverage-end:{coverage_end.isoformat()}",
             )
         )
@@ -424,6 +455,11 @@ def load_membership_csv(
                     if row.get("effective_end")
                     else None
                 )
+                end_known_date = (
+                    _parse_date(row["end_known_date"], "end_known_date", row_number)
+                    if row.get("end_known_date")
+                    else (known_date if effective_end is not None else None)
+                )
             except KeyError as exc:
                 raise ValueError(f"membership CSV row {row_number} has an empty field") from exc
             if known_date > effective_start:
@@ -434,6 +470,17 @@ def load_membership_csv(
                 raise ValueError(
                     f"membership CSV row {row_number}: effective_end must follow start"
                 )
+            if end_known_date is not None and effective_end is None:
+                raise ValueError(
+                    f"membership CSV row {row_number}: open interval has end_known_date"
+                )
+            if end_known_date is not None and (
+                end_known_date < known_date or end_known_date > effective_end
+            ):
+                raise ValueError(
+                    f"membership CSV row {row_number}: end_known_date must fall between "
+                    "known_date and effective_end"
+                )
             rows.append(
                 {
                     "universe_id": row_universe.strip(),
@@ -441,6 +488,7 @@ def load_membership_csv(
                     "effective_start": effective_start,
                     "effective_end": effective_end,
                     "known_date": known_date,
+                    "end_known_date": end_known_date,
                     "source": row_source.strip(),
                 }
             )
@@ -537,6 +585,7 @@ def _membership_row(
     effective_start: date,
     effective_end: date | None,
     known_date: date,
+    end_known_date: date | None,
     source: str,
 ) -> dict:
     return {
@@ -545,6 +594,7 @@ def _membership_row(
         "effective_start": effective_start,
         "effective_end": effective_end,
         "known_date": known_date,
+        "end_known_date": end_known_date,
         "source": source,
     }
 

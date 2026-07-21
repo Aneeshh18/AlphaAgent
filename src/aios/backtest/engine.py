@@ -27,12 +27,19 @@ from aios.backtest.costs import (
 )
 from aios.backtest.portfolio import (
     PortfolioBook,
+    PortfolioConversion,
     PortfolioEquityPoint,
     PortfolioPeriodResult,
     PortfolioTrade,
 )
 from aios.factors.composite import CompositeRow, compute_composite
-from aios.factors.policy import BASELINE_FACTOR_WEIGHTS, FactorWeights, weights_for_regime
+from aios.factors.policy import (
+    BASELINE_FACTOR_WEIGHTS,
+    FactorWeights,
+    QVMLFactorWeights,
+    qvml_weights_for_regime,
+    weights_for_regime,
+)
 from aios.macro.regime import MacroRegimeSnapshot, compute_regime
 from aios.storage.store import Store, get_store
 
@@ -54,6 +61,7 @@ class QVBacktestConfig:
     benchmark_tickers: tuple[str, ...] = ()
     calendar_ticker: str | None = None
     excluded_tickers: tuple[str, ...] = ()
+    factor_model: str = "qv"
 
     def __post_init__(self) -> None:
         start = _parse_date(self.start)
@@ -66,6 +74,10 @@ class QVBacktestConfig:
             raise ValueError("only quarterly rebalancing is supported in this phase")
         if self.initial_capital <= 0:
             raise ValueError("initial_capital must be positive")
+        factor_model = self.factor_model.strip().lower()
+        if factor_model not in {"qv", "qvml"}:
+            raise ValueError("factor_model must be 'qv' or 'qvml'")
+        object.__setattr__(self, "factor_model", factor_model)
         object.__setattr__(self, "start", start.isoformat())
         object.__setattr__(self, "end", end.isoformat())
         if self.universe_id is not None:
@@ -103,8 +115,13 @@ class FactorAuditRow:
     latest_fundamental_date: str | None
     quality_score: float | None
     value_score: float | None
+    momentum_score: float | None
+    low_volatility_score: float | None
+    qv_score: float | None
+    qvml_score: float | None
     quality_components_available: int
     value_multiples_available: int
+    market_price_observations: int
     reasons: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
@@ -123,6 +140,9 @@ class SelectionAuditRow:
     policy_score: float
     rank: int
     target_weight: float
+    momentum_score: float | None = None
+    low_volatility_score: float | None = None
+    factor_model: str = "qv"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -140,7 +160,7 @@ class BenchmarkPeriod:
     period_return: float | None
     status: str
     warning: str | None = None
-    price_basis: str = "raw_close_with_explicit_splits_and_dividends"
+    price_basis: str = "provider_close_with_basis_aware_splits_and_dividends"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -178,8 +198,11 @@ class BacktestPeriod:
     entry_date: str | None
     exit_date: str | None
     regime: str
+    factor_model: str
     quality_weight: float
     value_weight: float
+    momentum_weight: float
+    low_volatility_weight: float
     eligible_tickers: int
     member_tickers: tuple[str, ...] = ()
     member_list_sha256: str = ""
@@ -188,6 +211,9 @@ class BacktestPeriod:
     raw_complete_tickers: int | None = None
     quality_scored_tickers: int = 0
     value_scored_tickers: int = 0
+    momentum_scored_tickers: int = 0
+    low_volatility_scored_tickers: int = 0
+    qvml_scored_tickers: int = 0
     factor_audit: tuple[FactorAuditRow, ...] = ()
     macro_snapshot: dict[str, Any] = field(default_factory=dict)
     regime_selected: tuple[str, ...] = ()
@@ -230,6 +256,8 @@ class BacktestPeriod:
     baseline_traded_notional: float = 0.0
     regime_trades: tuple[PortfolioTrade, ...] = ()
     baseline_trades: tuple[PortfolioTrade, ...] = ()
+    regime_conversions: tuple[PortfolioConversion, ...] = ()
+    baseline_conversions: tuple[PortfolioConversion, ...] = ()
     regime_ending_holdings: tuple[str, ...] = ()
     baseline_ending_holdings: tuple[str, ...] = ()
     regime_open_tax_lots: int = 0
@@ -248,6 +276,12 @@ class BacktestPeriod:
         ]
         result["regime_trades"] = [trade.to_dict() for trade in self.regime_trades]
         result["baseline_trades"] = [trade.to_dict() for trade in self.baseline_trades]
+        result["regime_conversions"] = [
+            conversion.to_dict() for conversion in self.regime_conversions
+        ]
+        result["baseline_conversions"] = [
+            conversion.to_dict() for conversion in self.baseline_conversions
+        ]
         result["regime_ending_holdings"] = list(self.regime_ending_holdings)
         result["baseline_ending_holdings"] = list(self.baseline_ending_holdings)
         return result
@@ -356,12 +390,13 @@ def run_qv_policy_backtest(
     benchmark_tickers: list[str] | None = None,
     calendar_ticker: str | None = None,
     excluded_tickers: list[str] | None = None,
+    factor_model: str = "qv",
     initial_capital: float = 100_000.0,
     transaction_costs: TransactionCostPolicy | None = None,
     tax_policy: TaxPolicy | None = None,
     store: Store | None = None,
 ) -> QVBacktestResult:
-    """Run regime-aware QV beside fixed 60/40 with PIT universe controls."""
+    """Run regime-aware QV/QVML beside its fixed-baseline counterpart."""
     db = store or get_store()
     config = QVBacktestConfig(
         start=start,
@@ -376,6 +411,7 @@ def run_qv_policy_backtest(
         benchmark_tickers=tuple(benchmark_tickers or ()),
         calendar_ticker=calendar_ticker,
         excluded_tickers=tuple(excluded_tickers or ()),
+        factor_model=factor_model,
     )
     quality_report = db.data_quality_report()
     failures = [row["check"] for row in quality_report if row["status"] == "fail"]
@@ -395,12 +431,27 @@ def run_qv_policy_backtest(
     if len(decision_dates) < 2:
         raise ValueError("backtest range needs at least two quarterly decision dates")
     requested = _normalize_tickers(tickers, db) if tickers else None
+    execution_dates = {
+        decision_date: _scheduled_execution_dates(
+            db,
+            decision_date,
+            next_decision_date,
+            config.calendar_ticker,
+        )
+        for decision_date, next_decision_date in zip(
+            decision_dates, decision_dates[1:], strict=False
+        )
+    }
     decision_universes = _resolve_decision_universes(
         db,
         decision_dates[:-1],
         requested,
         config.universe_id,
         config.allow_current_universe,
+        {
+            decision_date: execution_dates[decision_date][0] or decision_date
+            for decision_date in decision_dates[:-1]
+        },
     )
     all_tickers = sorted({ticker for members in decision_universes.values() for ticker in members})
     if not all_tickers:
@@ -417,6 +468,12 @@ def run_qv_policy_backtest(
         result.warnings.append(
             "Historical membership was not supplied; this run uses the current/fixed universe "
             "and is not survivorship-bias safe."
+        )
+    else:
+        result.warnings.append(
+            "Each target universe is membership known at the decision close and effective "
+            "on the scheduled execution date; announced additions/removals are not shifted "
+            "backward into the factor snapshot."
         )
     if config.calendar_ticker is None:
         result.warnings.append(
@@ -435,12 +492,18 @@ def run_qv_policy_backtest(
         )
     if config.excluded_tickers:
         result.warnings.append("Explicit policy exclusions: " + ", ".join(config.excluded_tickers))
+    if config.factor_model == "qvml":
+        result.warnings.append(
+            "Experimental QVML requires complete Q, V, Momentum, and Low-Volatility evidence; "
+            "missing sleeves are never reweighted away."
+        )
     result.warnings.append(
         "Positions and FIFO tax lots persist across quarters; each rebalance trades only the "
         "equal-weight target deltas at the scheduled close."
     )
     result.warnings.append(
-        "Daily equity uses raw closes plus explicit split/dividend cash accounting. Missing "
+        "Daily equity uses provider closes, explicit dividends, and split ratios only when "
+        "the provider close is not already split-normalized. Missing "
         "individual session prices are carried forward and exposed as stale_tickers; scheduled "
         "entry and exit prices remain strict."
     )
@@ -460,18 +523,27 @@ def run_qv_policy_backtest(
     benchmark_state_contiguous = {ticker: True for ticker in config.benchmark_tickers}
     portfolio_state_contiguous = True
     for decision_date, next_decision_date in zip(decision_dates, decision_dates[1:], strict=False):
+        scheduled_entry_date, scheduled_exit_date = execution_dates[decision_date]
         members = decision_universes[decision_date]
         coverage = (
-            db.universe_data_coverage(config.universe_id, decision_date)
+            db.universe_data_coverage(
+                config.universe_id,
+                decision_date,
+                scheduled_entry_date or decision_date,
+            )
             if config.universe_id is not None
             else []
         )
         macro_snapshot = compute_regime(decision_date, db)
+        composite_kwargs: dict[str, Any] = {}
+        if config.factor_model == "qvml":
+            composite_kwargs["include_market_factors"] = True
         rows = compute_composite(
             members,
             decision_date.isoformat(),
             db,
             regime_snapshot=macro_snapshot,
+            **composite_kwargs,
         )
         member_set = set(members)
         factor_tickers = [row.ticker for row in rows]
@@ -485,12 +557,6 @@ def run_qv_policy_backtest(
                 raise ValueError(
                     f"coverage output does not partition the PIT universe on {decision_date}"
                 )
-        scheduled_entry_date, scheduled_exit_date = _scheduled_execution_dates(
-            db,
-            decision_date,
-            next_decision_date,
-            config.calendar_ticker,
-        )
         period = _evaluate_period(
             rows,
             members,
@@ -503,6 +569,7 @@ def run_qv_policy_backtest(
             scheduled_exit_date,
             config.top_n,
             config.require_pit_regime,
+            config.factor_model,
         )
         if period.status == "ready":
             if not portfolio_state_contiguous:
@@ -792,6 +859,8 @@ def _apply_portfolio_results(
         baseline_traded_notional=baseline.traded_notional,
         regime_trades=regime.trades,
         baseline_trades=baseline.trades,
+        regime_conversions=regime.conversions,
+        baseline_conversions=baseline.conversions,
         regime_ending_holdings=regime.ending_holdings,
         baseline_ending_holdings=baseline.ending_holdings,
         regime_open_tax_lots=regime.open_tax_lots,
@@ -834,6 +903,7 @@ def _resolve_decision_universes(
     requested: list[str] | None,
     universe_id: str | None,
     allow_current_universe: bool,
+    effective_dates: dict[date, date],
 ) -> dict[date, list[str]]:
     if universe_id is None:
         if not allow_current_universe:
@@ -848,12 +918,19 @@ def _resolve_decision_universes(
     requested_set = set(requested or ())
     resolved: dict[date, list[str]] = {}
     for decision_date in decision_dates:
+        effective_date = effective_dates[decision_date]
         members = {
-            row["ticker"] for row in store.universe_membership_on(universe_id, decision_date)
+            row["ticker"]
+            for row in store.universe_membership_known_on(
+                universe_id,
+                decision_date,
+                effective_date,
+            )
         }
         if not members:
             raise ValueError(
-                f"historical universe {universe_id!r} has no PIT membership on {decision_date}; "
+                f"historical universe {universe_id!r} has no membership known on "
+                f"{decision_date} and effective on {effective_date}; "
                 "load effective_start/effective_end and known_date coverage first"
             )
         if requested_set:
@@ -861,7 +938,7 @@ def _resolve_decision_universes(
             if missing:
                 raise ValueError(
                     f"requested ticker(s) not in historical universe {universe_id!r} on "
-                    f"{decision_date}: {', '.join(missing)}"
+                    f"execution date {effective_date}: {', '.join(missing)}"
                 )
             members &= requested_set
         resolved[decision_date] = sorted(members)
@@ -880,17 +957,25 @@ def _evaluate_period(
     scheduled_exit_date: date | None,
     top_n: int,
     require_pit_regime: bool,
+    factor_model: str,
 ) -> BacktestPeriod:
     decision_text = decision_date.isoformat()
     next_decision_text = next_decision_date.isoformat()
     regime_ready = macro_snapshot.is_pit_ready and macro_snapshot.regime != "unknown"
     regime = macro_snapshot.regime if regime_ready else "unknown"
-    regime_weights = weights_for_regime(regime) if regime_ready else BASELINE_FACTOR_WEIGHTS
+    qv_weights = weights_for_regime(regime) if regime_ready else BASELINE_FACTOR_WEIGHTS
+    if factor_model == "qvml":
+        regime_weights: FactorWeights | QVMLFactorWeights = qvml_weights_for_regime(regime)
+        baseline_weights: FactorWeights | QVMLFactorWeights = qvml_weights_for_regime("unknown")
+    else:
+        regime_weights = qv_weights
+        baseline_weights = BASELINE_FACTOR_WEIGHTS
     factor_audit = _build_factor_audit(
         rows,
         coverage,
         decision_date,
         excluded_tickers=excluded_tickers,
+        factor_model=factor_model,
     )
     eligible_tickers = {row.ticker for row in factor_audit if row.eligible}
     eligible = [row for row in rows if row.ticker in eligible_tickers]
@@ -920,8 +1005,11 @@ def _evaluate_period(
         ),
         "exit_date": (scheduled_exit_date.isoformat() if scheduled_exit_date is not None else None),
         "regime": regime,
+        "factor_model": factor_model,
         "quality_weight": regime_weights.quality,
         "value_weight": regime_weights.value,
+        "momentum_weight": getattr(regime_weights, "momentum", 0.0),
+        "low_volatility_weight": getattr(regime_weights, "low_volatility", 0.0),
         "eligible_tickers": len(eligible),
         "member_tickers": member_tickers,
         "member_list_sha256": sha256("\n".join(member_tickers).encode()).hexdigest(),
@@ -930,6 +1018,9 @@ def _evaluate_period(
         "raw_complete_tickers": raw_complete,
         "quality_scored_tickers": sum(row.quality_score is not None for row in rows),
         "value_scored_tickers": sum(row.value_score is not None for row in rows),
+        "momentum_scored_tickers": sum(row.momentum_score is not None for row in rows),
+        "low_volatility_scored_tickers": sum(row.low_volatility_score is not None for row in rows),
+        "qvml_scored_tickers": sum(row.qvml_score is not None for row in rows),
         "factor_audit": factor_audit,
         "macro_snapshot": macro_snapshot.to_dict(),
     }
@@ -953,12 +1044,12 @@ def _evaluate_period(
             missing=(f"eligible_tickers:{len(eligible)}<top_n:{top_n}",),
         )
 
-    regime_ranked = _rank_rows(eligible, regime_weights)
-    baseline_ranked = _rank_rows(eligible, BASELINE_FACTOR_WEIGHTS)
+    regime_ranked = _rank_rows(eligible, regime_weights, factor_model)
+    baseline_ranked = _rank_rows(eligible, baseline_weights, factor_model)
     regime_tickers = tuple(row.ticker for _, row in regime_ranked[:top_n])
     baseline_tickers = tuple(row.ticker for _, row in baseline_ranked[:top_n])
-    regime_selection_audit = _selection_audit(regime_ranked, top_n)
-    baseline_selection_audit = _selection_audit(baseline_ranked, top_n)
+    regime_selection_audit = _selection_audit(regime_ranked, top_n, factor_model)
+    baseline_selection_audit = _selection_audit(baseline_ranked, top_n, factor_model)
     return BacktestPeriod(
         **base_kwargs,
         regime_selected=regime_tickers,
@@ -975,6 +1066,7 @@ def _build_factor_audit(
     decision_date: date,
     *,
     excluded_tickers: set[str] | None = None,
+    factor_model: str = "qv",
 ) -> tuple[FactorAuditRow, ...]:
     """Partition every member into eligible or a deterministic exclusion reason."""
     coverage_by_ticker = {str(row["ticker"]).upper(): row for row in coverage}
@@ -1002,9 +1094,13 @@ def _build_factor_audit(
             reasons.append("quality_score_unavailable")
         if row.value_score is None:
             reasons.append("value_score_unavailable")
+        if factor_model == "qvml" and row.momentum_score is None:
+            reasons.append("momentum_score_unavailable")
+        if factor_model == "qvml" and row.low_volatility_score is None:
+            reasons.append("low_volatility_score_unavailable")
         if row.ticker in exclusions:
             reasons.append("explicit_policy_exclusion")
-        eligible = bool(
+        core_eligible = bool(
             row.quality_score is not None
             and row.value_score is not None
             and row.ticker not in exclusions
@@ -1016,6 +1112,10 @@ def _build_factor_audit(
                     and has_fundamentals
                 )
             )
+        )
+        eligible = core_eligible and (
+            factor_model == "qv"
+            or (row.momentum_score is not None and row.low_volatility_score is not None)
         )
         audit.append(
             FactorAuditRow(
@@ -1030,8 +1130,13 @@ def _build_factor_audit(
                 latest_fundamental_date=latest_fundamental_text,
                 quality_score=row.quality_score,
                 value_score=row.value_score,
+                momentum_score=row.momentum_score,
+                low_volatility_score=row.low_volatility_score,
+                qv_score=row.qv_score,
+                qvml_score=row.qvml_score,
                 quality_components_available=row.quality_components_available,
                 value_multiples_available=row.value_multiples_available,
+                market_price_observations=row.market_price_observations,
                 reasons=tuple(sorted(set(reasons))),
             )
         )
@@ -1039,7 +1144,7 @@ def _build_factor_audit(
 
 
 def _selection_audit(
-    ranked: list[tuple[float, CompositeRow]], top_n: int
+    ranked: list[tuple[float, CompositeRow]], top_n: int, factor_model: str
 ) -> tuple[SelectionAuditRow, ...]:
     target_weight = 1.0 / top_n
     return tuple(
@@ -1050,19 +1155,36 @@ def _selection_audit(
             policy_score=float(score),
             rank=rank,
             target_weight=target_weight,
+            momentum_score=row.momentum_score,
+            low_volatility_score=row.low_volatility_score,
+            factor_model=factor_model,
         )
         for rank, (score, row) in enumerate(ranked[:top_n], start=1)
     )
 
 
 def _rank_rows(
-    rows: list[CompositeRow], weights: FactorWeights
+    rows: list[CompositeRow],
+    weights: FactorWeights | QVMLFactorWeights,
+    factor_model: str,
 ) -> list[tuple[float, CompositeRow]]:
-    scored = [
-        (weights.quality * row.quality_score + weights.value * row.value_score, row)
-        for row in rows
-        if row.quality_score is not None and row.value_score is not None
-    ]
+    scored: list[tuple[float, CompositeRow]] = []
+    for row in rows:
+        if row.quality_score is None or row.value_score is None:
+            continue
+        score = weights.quality * row.quality_score + weights.value * row.value_score
+        if factor_model == "qvml":
+            if (
+                row.momentum_score is None
+                or row.low_volatility_score is None
+                or not isinstance(weights, QVMLFactorWeights)
+            ):
+                continue
+            score += (
+                weights.momentum * row.momentum_score
+                + weights.low_volatility * row.low_volatility_score
+            )
+        scored.append((score, row))
     scored.sort(key=lambda item: (-item[0], item[1].ticker))
     return scored
 

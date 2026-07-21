@@ -14,6 +14,25 @@ It currently answers questions such as:
 
 It does not buy or sell anything. It is research software, not financial advice.
 
+## Which market is this for?
+
+The finished product is intended mainly for Indian stocks. The current data is
+the carefully reviewed U.S. reference build used to prove that dates,
+identities, scores, costs, and backtests behave correctly. NSE/BSE data is not
+loaded yet and the current rankings must not be described as Indian-market
+coverage.
+
+India will be added through market and data-source adapters, not by copying the
+whole system. The formulas, risk checks, portfolio accounting, and reports stay
+shared. Exchange calendars, identifiers, filings, prices, index membership,
+taxes, benchmarks, and brokers remain market-specific and reviewed.
+
+You should not need to understand DuckDB or Streamlit for normal use. DuckDB is
+the internal data file and Streamlit draws the screen. Use `aios dashboard`,
+`aios health`, `aios refresh-us-current`, and the backup/restore commands. On a
+Linux computer, optional AIOS-managed timers provide simple start, stop, status,
+refresh, and backup automation. Hosted or multi-user deployment is not ready.
+
 ## The big picture
 
 ```text
@@ -56,15 +75,18 @@ whose release date is on or before the decision date. Older rows from before
 this protection was added are marked `legacy_unversioned` and are not used by
 the regime layer.
 
-Historical universe membership has three dates/ideas:
+Historical universe membership has four dates/ideas:
 
 - `effective_start`: when a ticker begins belonging to the investable universe.
 - `effective_end`: the first date when it no longer belongs; blank means open-ended.
-- `known_date`: when that membership change was publicly knowable.
+- `known_date`: when the interval's start was publicly knowable.
+- `end_known_date`: when a finite interval's end was publicly knowable.
 
-The backtester uses membership only when both the effective interval and
-`known_date` pass the decision date. This prevents a later index constituent
-list from leaking into an earlier simulation.
+The backtester chooses a target that was knowable at decision close and is
+effective on the scheduled execution date. This matters when an announced
+addition or removal becomes effective on the next session: the trade uses the
+new execution-date universe without leaking an announcement that was not yet
+public.
 
 ## Where the code lives
 
@@ -126,7 +148,8 @@ The initial, deliberately modest policy is:
 | Risk-off | 70% | 30% |
 | Unknown or incomplete macro data | 60% | 40% |
 
-These are starting hypotheses that still need a point-in-time backtest. If
+These remain research hypotheses. They have passed short point-in-time
+engineering tests but have not established future investment performance. If
 macro evidence is missing or not PIT-ready, the system uses the baseline 60/40
 blend and labels the row so the fallback is visible.
 
@@ -214,17 +237,16 @@ PYTHONPATH=src .venv/bin/python -m aios.cli build-universe-membership \
 The builder refuses missing event edges, false replacements, future known
 dates, duplicate actions, and source disagreements. It deliberately ends every
 open interval on 2025-01-01 so the bounded data cannot be used outside its
-certified window. The generated membership CSV must
-include `ticker`, `effective_start`, and `known_date`; it may also include
-`universe_id`, `effective_end`, and `source`:
+certified window. The generated membership CSV includes separate provenance
+for both interval edges. Every finite interval must have `end_known_date`:
 
 ```text
-universe_id,ticker,effective_start,effective_end,known_date,source
-sp500,AAPL,2015-01-01,2024-06-24,2014-12-12,provider-export
-sp500,AAPL,2024-06-24,,2024-06-14,provider-export
+universe_id,ticker,effective_start,effective_end,known_date,end_known_date,source
+sp500,BBWI,2023-08-01,2024-10-01,2023-08-01,2024-09-24,<reviewed sources>
 ```
 
-The dates above are only a format example. Import the generated file with:
+The shortened source cell above is only a readability example; use the
+builder's complete generated row, not this excerpt. Import it with:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m aios.cli import-universe \
@@ -520,30 +542,54 @@ than backdating data or substituting successor securities.
 Validate the initial QV regime-weight policy:
 
 ```bash
-# SPY is a benchmark, so ingest its prices once if it is not already present.
-PYTHONPATH=src .venv/bin/python -m aios.cli ingest-ticker SPY --no-fundamentals
+# Repair/verify explicit benchmark actions for the exact audit window.
+PYTHONPATH=src .venv/bin/python -m aios.cli refresh-price-actions \
+  --start 2023-08-01 --end 2025-01-01 --ticker SPY
+
+# Build resumable security-level history for Momentum/Low Volatility.
+# The first pass exits non-zero when any identity needs explicit review.
+PYTHONPATH=src .venv/bin/python -m aios.cli build-factor-price-warmup
+
+# Read data/factor_price_warmup/factor_price_warmup_review.csv first. Once each
+# rejection is confirmed as a real blocked/short-history exclusion:
+PYTHONPATH=src .venv/bin/python -m aios.cli build-factor-price-warmup \
+  --allow-rejections
+PYTHONPATH=src .venv/bin/python -m aios.cli ingest-factor-price-warmup
 
 PYTHONPATH=src .venv/bin/python -m aios.cli backtest-qv \
   --start 2023-08-01 --end 2024-12-31 --top-n 10 \
+  --factor-model qv \
   --universe-id sp500 --benchmark SPY --calendar SPY \
   --commission-bps 5 --slippage-bps 5 \
   --exclude-ticker PEAK --exclude-ticker WRK --exclude-ticker AMTM \
   --explain-ticker PEAK --explain-ticker WRK --explain-ticker AMTM \
-  --output data/backtests/qv_sp500_pit_2023-08_2024-12.json
+  --output data/backtests/qv_sp500_pit_schema_v4_2023-08_2024-12.json
+
+# Repeat the exact experiment with all four factors.
+PYTHONPATH=src .venv/bin/python -m aios.cli backtest-qv \
+  --start 2023-08-01 --end 2024-12-31 --top-n 10 \
+  --factor-model qvml \
+  --universe-id sp500 --benchmark SPY --calendar SPY \
+  --commission-bps 5 --slippage-bps 5 \
+  --exclude-ticker PEAK --exclude-ticker WRK --exclude-ticker AMTM \
+  --explain-ticker PEAK --explain-ticker WRK --explain-ticker AMTM \
+  --output data/backtests/qvml_sp500_pit_schema_v4_2023-08_2024-12.json
 ```
 
 This compares the regime-aware ranking with fixed 60/40 after explicit
 commission, slippage, fixed-fee, and supplied tax assumptions. Positions and
 FIFO lots persist, prior holdings remain invested until the next-session close,
 and only equal-weight deltas trade. SPY is a persistent zero-friction book using
-the same raw-close/split/dividend convention and daily sessions. Tax rates
+the same provider-basis/dividend convention and daily sessions. Split ratios
+are applied only when a provider close is not already split-normalized. Tax rates
 default to zero because tax law depends on jurisdiction; pass rates only after
 deciding what tax model applies. The output is research evidence, not a promise
 of future returns.
 
-The final command keeps the real 503–504 members in the denominator while
-marking PEAK, WRK, and pre-filing AMTM as explicit policy exclusions. It uses
-SPY to define every decision, entry, exit, and benchmark date. `--output`
+The commands keep the real 503–504 execution-date members in the denominator
+while marking PEAK, WRK, and pre-filing AMTM as explicit policy exclusions.
+Membership must be known at decision close and effective at the scheduled
+entry. SPY defines every decision, entry, exit, and benchmark date. `--output`
 writes a local, gitignored JSON audit containing every member's eligibility
 reason, selected scores, macro evidence, database hash, and Git state.
 
@@ -587,14 +633,58 @@ Regime-aware QV returned 74.24% net, fixed 60/40 returned 76.55%, and stitched
 interval SPY returned 41.49%. That artifact is retained only as the
 forced-liquidation regression baseline.
 
-The schema-v2 stateful rerun on 2026-07-20 preserved the same membership,
+The provider-basis schema-v3 rerun on 2026-07-20 preserved the same membership,
 coverage, eligibility, regimes, and selections. All three books have 316 daily
 observations from 2023-09-29 through 2024-12-31 and no stale marks. Regime-aware
-returned 70.25% net (71.13% gross), fixed 60/40 returned 72.58% net (73.51%
-gross), and persistent SPY returned 37.16%. Daily annualized volatility was
-17.66%, 17.31%, and 12.49%; max drawdown was -9.94%, -8.32%, and -8.41%.
-Delta-only strategy turnover was 5.17x and 5.37x, roughly half the forced-round-
-trip baseline, with $671.32 and $700.79 in modeled costs.
+returned 74.25% net (75.14% gross), fixed 60/40 returned 76.73% net (77.68%
+gross), and persistent SPY returned 39.47%. Daily annualized volatility was
+17.62%, 17.29%, and 12.46%; max drawdown was -9.87%, -8.25%, and -8.41%.
+Delta-only strategy turnover was 5.16x and 5.36x, with $678.13 and $707.48 in
+modeled costs.
+
+Why schema v3? Older yfinance calls did not explicitly request dividends and
+splits. After those fields were restored, a diagnostic briefly showed an
+impossible 764.69% return because Yahoo's historical Close is already
+split-normalized and the engine applied the split a second time. That run was
+rejected. Every price row now declares its split basis, the engine refuses
+unknown/mixed paths, and split ratios are applied only to truly unnormalized
+closes.
+
+That schema-v3 performance result is **superseded**, not certified. Yahoo
+also rewrites old `Close` values onto today's split basis, while SEC shares and
+earnings remain on the basis known when filed. The old Value calculation could
+therefore pair a post-split-normalized historical price with pre-split shares.
+The database now stores a later-split restoration factor and Value uses the
+contemporaneous price basis. Fresh schema-v4 QV and QVML backtests were required
+before any newer strategy return could be evaluated.
+
+The warm-up command solves a separate issue: a one-year market factor needs
+prices before the bounded index window. It does not pretend today's ticker
+existed then. Accepted rows live under the immutable security ID and must match
+the reviewed provider series at the boundary. `Adj Close` is not an identity
+gate because future dividends can legitimately rewrite it; raw close,
+dividends, splits, and split basis are checked instead. The corrected v3 review
+accepted 520 of 528 identities and atomically imported 122,466 rows. AMTM,
+GEHC, GEV, KVUE, SOLV, and VLTO genuinely lacked 210 pre-anchor sessions; SW
+and the Healthpeak/DOC predecessor were blocked by reviewed identity history.
+Yahoo's daily split scan-through date is provenance metadata, not an economic
+equality field, while every cache reuse rechecks the hashed economic overlap.
+
+Both matched schema-v4 runs then completed all five periods and 316 daily
+observations from one database snapshot:
+
+| Policy | Net cumulative | Gross cumulative | Annualized | Max drawdown | Costs | Turnover |
+|---|---:|---:|---:|---:|---:|---:|
+| Regime-aware QV | 51.12% | 51.92% | 38.90% | -8.35% | $625.80 | 5.33x |
+| Fixed 60/40 QV | 50.98% | 51.72% | 38.79% | -8.01% | $573.47 | 4.97x |
+| Regime-aware QVML | 24.97% | 25.80% | 19.41% | -11.08% | $737.24 | 6.68x |
+| Fixed QVML | 34.96% | 35.69% | 26.94% | -7.95% | $615.88 | 5.52x |
+| Persistent SPY | 39.47% | 39.47% | 30.31% | -8.41% | $0.00 | 0.00x |
+
+QVML market-factor coverage was 499, 498, 498, 496, and 497 names; strict
+four-factor eligibility was 291, 293, 347, 307, and 300. QVML did not improve
+the result in this short window. That is useful negative engineering evidence,
+not permission to tune its weights to these five in-sample decisions.
 
 Those returns are **not a trading claim**. The window is short and in-sample,
 tax rates were zero, and jurisdiction-specific tax behavior is not certified.
@@ -637,34 +727,184 @@ impossible chronology automatically.
 Open the dashboard:
 
 ```bash
-.venv/bin/streamlit run src/aios/dashboard.py
+.venv/bin/aios dashboard
 ```
 
-The first ranking load currently takes roughly 12–20 seconds on this checkout.
-That is normal: the app is rebuilding PIT Quality and Value evidence for about
-500 companies. The cache exists only for that calculation and is then thrown
-away, so a later data refresh cannot leave an old filing hidden in memory.
+For ordinary use, you do not need to open DuckDB or run Streamlit yourself.
+These are the four main checks:
+
+```bash
+.venv/bin/aios doctor
+.venv/bin/aios validate
+.venv/bin/aios readiness --report-only
+.venv/bin/aios health
+```
+
+Create a timestamped backup of the database and local paper state:
+
+```bash
+.venv/bin/aios backup
+```
+
+The command checkpoints the database, writes checksums for every copied file,
+and excludes `.env`, logs, caches, and backtest artifacts. It tells you the
+new folder path. Verify that folder later with:
+
+```bash
+.venv/bin/aios verify-backup backups/aios-YYYYMMDDTHHMMSSZ
+```
+
+Close the dashboard before backup or restore because DuckDB permits one writing
+process. Restore first verifies every checksum, automatically backs up the
+current database and paper state, and then replaces the snapshot only after an
+explicit confirmation:
+
+```bash
+.venv/bin/aios restore backups/aios-YYYYMMDDTHHMMSSZ --confirm-restore
+```
+
+If restored data has any hard validation failure, the command returns an error
+and prints the automatic pre-restore backup path. Never replace DuckDB files by
+hand.
+
+Refresh current U.S. data only after closing the dashboard:
+
+```bash
+.venv/bin/aios refresh-us-current
+.venv/bin/aios health
+```
+
+The refresh uses the issuer, security, and provider identities that were
+already reviewed. It updates prices, SPY, SEC filings, and macro releases, and
+returns an error if any source fails. It does **not** silently add a company
+from a news page or guess an S&P announcement date.
+
+On Linux, you can enable the same work automatically in your computer's local
+time. These timers run prices/macro on weekdays at 07:30, filings Saturday at
+09:00, and a verified backup Sunday at 09:00:
+
+```bash
+.venv/bin/aios scheduler-install --confirm-install
+.venv/bin/aios scheduler-status
+
+# Use these when needed
+.venv/bin/aios scheduler-pause
+.venv/bin/aios scheduler-resume
+.venv/bin/aios scheduler-remove --confirm-remove
+```
+
+Installation is deliberately explicit. It was enabled for this checkout on
+2026-07-21, and the backup, prices/economic-data, and company-filings services
+all passed real manual first runs. Keep the dashboard closed during a scheduled
+run because the local DuckDB file permits only one AIOS process. A collision
+fails safely; the status command shows whether the last service passed and when
+it runs next.
+
+The status check will not wait forever if Linux's desktop scheduler interface
+is temporarily unavailable. After five seconds it shows which managed timer
+files are installed/enabled and labels the live state **not verified**. Run the
+same command again from your normal logged-in terminal; do not interpret
+“not verified” as either a passed or failed scheduled job.
+
+If today's index membership has not been reviewed yet, the refresh may collect
+data for the newest reviewed member list up to seven days old. It displays that
+older date clearly. This keeps data moving but does **not** claim that the older
+list is today's index or permit a new portfolio decision for today.
+
+A newly reviewed company can exist before its first SEC Company Facts file. It
+stays visible as “company filings pending” and is tried again each week. If a
+company that previously had valid filings suddenly returns nothing, the refresh
+still stops and asks for investigation.
+
+The dashboard now opens on the latest broadly covered reviewed market date,
+not blindly on yesterday. Choose **Quality + Value (baseline)** or the
+experimental **Quality + Value + Trend + Stability** method.
+Every page uses plain-language labels, explains missing information, and says
+clearly that a high rank is a research shortlist rather than a buy instruction.
+The first four-factor load can take longer because it rebuilds dated evidence
+for about 500 companies. The decision cache is then discarded, so a later data
+refresh cannot leave an old filing or price window hidden in memory.
 
 ### Is it ready to use?
 
-It is ready **today as a supervised research beta**. You can explore rankings,
-inspect factor evidence, and run the bounded historical experiment. It is not
-ready to place trades automatically or justify real-money decisions by itself.
+It is ready **today for supervised U.S. research and local paper simulation**.
+You can explore rankings, inspect factor evidence, create a reviewed model
+portfolio proposal, and monitor simulated holdings. It cannot place a broker
+order and it cannot decide what you personally should buy or sell.
 
-If development continues steadily from 2026-07-20, the practical targets are:
+There is now a separate current-use check:
 
-- 2–4 focused weeks for a paper-trading beta with Momentum/Low Volatility,
-  risk rules, refresh monitoring, a backtest/report screen, and a holdout test;
-- at least 8–12 focused weeks before considering a small controlled capital
-  pilot, and only after longer PIT history, walk-forward evidence, broker/data
-  reconciliation, alerts, and your tax/risk assumptions are certified; and
-- 12–20+ focused weeks for broader institutional-style completeness. Historical
-  delisted data may still require a licensed source, so this is not a guaranteed
-  free-data completion date.
+```bash
+.venv/bin/aios readiness --report-only
+```
+
+On 2026-07-22 the latest reviewed decision close is 2026-07-20. The current
+snapshot has 503 S&P 500 members, stable identities for all 503, PIT filings for
+500, action-safe prices for all 503, and SPY through the same close. The latest
+required macro release is dated 2026-07-20. The readiness command passes this
+supervised paper-use boundary while still showing warnings and source dates.
+
+The risk gate checks position and broad business-group concentration, leverage,
+turnover, trading liquidity, and account drawdown. It is connected to a local,
+checksum-protected paper account, but its defaults are engineering safeguards,
+not your final personal risk limits.
+
+The normal paper-simulation sequence is:
+
+```bash
+# Already created in this checkout; use only for a brand-new account
+.venv/bin/aios paper-init
+
+# Create a reviewable plan; this does not buy anything
+.venv/bin/aios paper-propose
+.venv/bin/aios paper-status
+
+# Only after the scheduled closing prices are reviewed
+.venv/bin/aios paper-execute \
+  --proposal data/paper/proposals/us-qv-YYYY-MM-DD.json \
+  --confirm-simulated
+
+# Add later reviewed daily values without changing the portfolio
+.venv/bin/aios paper-mark
+```
+
+The untouched forward test has a separate policy lock:
+
+```bash
+# One deliberate start; this never freezes the changing market database
+.venv/bin/aios forward-freeze --confirm-freeze
+
+# Safe to run at any time
+.venv/bin/aios forward-status
+```
+
+The lock remembers checksums for the stock-ranking rules, macro regime, risk
+limits, modeled costs/taxes, market calendar, readiness checks, and paper
+workflow. It also records every later proposal. If one of those rules changes,
+the dashboard says "drift detected" and simulated execution stops until the
+change is reviewed and a new trial is deliberately started. New prices,
+filings, macro releases, and reviewed membership are expected to keep updating
+and therefore are not frozen.
+
+The existing account is still simulated cash. Its 2026-07-20 proposal is not a
+holding and cannot be recorded before the reviewed 2026-07-21 close exists.
+
+The historical U.S. technical gate is complete. The current refresh, scheduler,
+backup/recovery, local dashboard smoke, and untouched-policy gate are complete
+in code, and the full six-period rerun now passes. The reviewed baseline is now
+frozen; the remaining local technical-beta step is to observe 1–3 naturally
+triggered clean timer cycles.
+A real-capital pilot is a different gate and needs at least 8–12 weeks of
+untouched forward observation plus broker/data reconciliation, alerts, and your
+tax/risk assumptions. That elapsed evidence period cannot be sped up.
 
 Use the dashboard as a research notebook, not as an autonomous adviser. A high
 rank or attractive backtest is a question to investigate, not an instruction
 to buy.
+
+The dashboard uses everyday labels and keeps technical methodology in an
+optional section. It also states clearly that current coverage is the U.S.
+reference dataset and that no score is a buy, hold, or sell rating.
 
 Run tests:
 
@@ -699,23 +939,31 @@ corrections; a first-time ticker download still requests its full history.
 
 ## What is unfinished
 
-The foundation, first QV factor layer, release-aware macro regime layer,
-initial regime-aware weights, bounded historical membership, stable security
-IDs, friction-aware PIT policy harness, and certified-window identity program
-are working. The identity program is complete through stable Batch 20, Window
-Batch 01, and Exception Batch 10. All 533 assignment spans have reviewed
-owners; 51/53 shorter spans have safe price histories, while PEAK and WRK are
-documented terminal provider gaps.
+The foundation, QV/QVML factors, release-aware macro layer, reviewed membership
+and identities, action-safe current prices, costs, persistent holdings, FIFO
+tax lots, daily account values, benchmark comparison, risk gates, paper monitor,
+and current U.S. readiness path are working through the 2026-07-20 close.
 
-The near-complete factor-eligibility audit and stateful execution layer are now
-complete. The factor query optimization is also complete: the 503-member test
-fell from 42,235 database queries and 174.1 seconds to 3,874 queries and 17.4
-seconds. A complete five-decision rerun finished in about 92 seconds and matched
-the certified result exactly. The next step is adding Momentum and Low
-Volatility, a paper-portfolio/risk layer, monitored refreshes, and an untouched
-walk-forward test. Exact announcement/identity provenance must also be extended
-before August 2023, and jurisdiction-specific tax assumptions still require a
-user decision. LLM report synthesis comes later because it depends on these
-deterministic outputs being trustworthy first.
+The 2025-to-current stateful historical rerun is complete: six of six periods,
+327 date-aligned strategy and SPY observations, exact quarter-to-quarter state
+continuity, and no stale strategy values. It applies the reviewed HES-to-CVX
+share conversion and sells MTCH/PAYC on 2026-04-01 using liquidation-only price
+extensions that do not make them index members again. Regime-aware QV returned
+31.13% net, fixed QV 27.73%, and SPY 34.12%; taxes were set to zero. These are
+software checks over a short historical period, not forecasts or proof that the
+strategy will beat the market.
+
+What remains is elapsed operational evidence: observe naturally triggered
+refresh/health/filing/backup cycles during the frozen untouched forward test.
+Older
+announcement provenance before August 2023 remains a separate long-history
+expansion.
+
+Jurisdiction, account type, broker, tax rules, and final risk limits still
+require your decision before after-tax or controlled-capital certification.
+India work starts after these U.S. technical gates.
+The deterministic engine needs no language model; a weaker model can handle
+optional summaries, but no model output is accepted as a numeric or provenance
+source.
 
 For the compact technical handoff, read [`agent.md`](./agent.md).

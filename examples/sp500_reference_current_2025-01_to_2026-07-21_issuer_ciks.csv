@@ -1,0 +1,500 @@
+issuer_id,canonical_name,canonical_ticker,cik,effective_start,effective_end,verified_date,source
+aios:issuer:sec:0001090872,"AGILENT TECHNOLOGIES, INC.",A,0001090872,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001090872.json
+aios:issuer:sec:0000320193,Apple Inc.,AAPL,0000320193,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000320193.json
+aios:issuer:sec:0001551152,AbbVie Inc.,ABBV,0001551152,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001551152.json
+aios:issuer:sec:0001559720,"Airbnb, Inc.",ABNB,0001559720,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001559720.json
+aios:issuer:sec:0000001800,ABBOTT LABORATORIES,ABT,0000001800,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000001800.json
+aios:issuer:sec:0000947484,ARCH CAPITAL GROUP LTD.,ACGL,0000947484,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000947484.json
+aios:issuer:sec:0001467373,Accenture plc,ACN,0001467373,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001467373.json
+aios:issuer:sec:0000796343,ADOBE INC.,ADBE,0000796343,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000796343.json
+aios:issuer:sec:0000006281,ANALOG DEVICES INC,ADI,0000006281,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000006281.json
+aios:issuer:sec:0000007084,Archer-Daniels-Midland Co,ADM,0000007084,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000007084.json
+aios:issuer:sec:0000008670,AUTOMATIC DATA PROCESSING INC,ADP,0000008670,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000008670.json
+aios:issuer:sec:0000769397,"Autodesk, Inc.",ADSK,0000769397,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000769397.json
+aios:issuer:sec:0001002910,AMEREN CORP,AEE,0001002910,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001002910.json
+aios:issuer:sec:0000004904,AMERICAN ELECTRIC POWER CO INC,AEP,0000004904,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000004904.json
+aios:issuer:sec:0000874761,AES CORP,AES,0000874761,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000874761.json
+aios:issuer:sec:0000004977,AFLAC INC,AFL,0000004977,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000004977.json
+aios:issuer:sec:0000005272,"AMERICAN INTERNATIONAL GROUP, INC.",AIG,0000005272,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000005272.json
+aios:issuer:sec:0001267238,"ASSURANT, INC.",AIZ,0001267238,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001267238.json
+aios:issuer:sec:0000354190,Arthur J. Gallagher & Co.,AJG,0000354190,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000354190.json
+aios:issuer:sec:0001086222,AKAMAI TECHNOLOGIES INC,AKAM,0001086222,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001086222.json
+aios:issuer:sec:0000915913,ALBEMARLE CORP,ALB,0000915913,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000915913.json
+aios:issuer:sec:0001097149,ALIGN TECHNOLOGY INC,ALGN,0001097149,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001097149.json
+aios:issuer:sec:0000899051,ALLSTATE CORP,ALL,0000899051,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000899051.json
+aios:issuer:sec:0001579241,Allegion plc,ALLE,0001579241,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001579241.json
+aios:issuer:sec:0000006951,APPLIED MATERIALS INC /DE,AMAT,0000006951,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000006951.json
+aios:issuer:sec:0001748790,Amcor plc,AMCR,0001748790,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001748790.json
+aios:issuer:sec:0000002488,ADVANCED MICRO DEVICES INC,AMD,0000002488,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000002488.json
+aios:issuer:sec:0001037868,AMETEK INC/,AME,0001037868,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001037868.json
+aios:issuer:sec:0000318154,AMGEN INC,AMGN,0000318154,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000318154.json
+aios:issuer:sec:0000820027,AMERIPRISE FINANCIAL INC,AMP,0000820027,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000820027.json
+aios:issuer:sec:0001053507,AMERICAN TOWER CORP /MA/,AMT,0001053507,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001053507.json
+aios:issuer:sec:0001018724,AMAZON COM INC,AMZN,0001018724,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001018724.json
+aios:issuer:sec:0001596532,"Arista Networks, Inc.",ANET,0001596532,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001596532.json
+aios:issuer:sec:0000315293,Aon plc,AON,0000315293,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000315293.json
+aios:issuer:sec:0000091142,SMITH A O CORP,AOS,0000091142,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000091142.json
+aios:issuer:sec:0001841666,APA Corp,APA,0001841666,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001841666.json
+aios:issuer:sec:0000002969,"Air Products & Chemicals, Inc.",APD,0000002969,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000002969.json
+aios:issuer:sec:0000820313,AMPHENOL CORP /DE/,APH,0000820313,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000820313.json
+aios:issuer:sec:0001858681,"Apollo Global Management, Inc.",APO,0001858681,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001858681.json
+aios:issuer:sec:0001751008,AppLovin Corp,APP,0001751008,2025-09-22,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001751008.json
+aios:issuer:sec:0001521332,Aptiv PLC,APTV,0001521332,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001521332.json
+aios:issuer:sec:0001035443,"ALEXANDRIA REAL ESTATE EQUITIES, INC.",ARE,0001035443,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001035443.json
+aios:issuer:sec:0001176948,Ares Management Corp,ARES,0001176948,2025-12-11,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001176948.json
+aios:issuer:sec:0000731802,ATMOS ENERGY CORP,ATO,0000731802,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000731802.json
+aios:issuer:sec:0000915912,AVALONBAY COMMUNITIES INC,AVB,0000915912,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000915912.json
+aios:issuer:sec:0001730168,Broadcom Inc.,AVGO,0001730168,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001730168.json
+aios:issuer:sec:0000008818,Avery Dennison Corp,AVY,0000008818,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000008818.json
+aios:issuer:sec:0001410636,"American Water Works Company, Inc.",AWK,0001410636,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001410636.json
+aios:issuer:sec:0001069183,"AXON ENTERPRISE, INC.",AXON,0001069183,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001069183.json
+aios:issuer:sec:0000004962,AMERICAN EXPRESS CO,AXP,0000004962,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000004962.json
+aios:issuer:sec:0000866787,AUTOZONE INC,AZO,0000866787,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000866787.json
+aios:issuer:sec:0000012927,BOEING CO,BA,0000012927,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000012927.json
+aios:issuer:sec:0000070858,BANK OF AMERICA CORP /DE/,BAC,0000070858,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000070858.json
+aios:issuer:sec:0000009389,BALL Corp,BALL,0000009389,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000009389.json
+aios:issuer:sec:0000010456,BAXTER INTERNATIONAL INC,BAX,0000010456,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000010456.json
+aios:issuer:sec:0000764478,BEST BUY CO INC,BBY,0000764478,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000764478.json
+aios:issuer:sec:0000010795,BECTON DICKINSON & CO,BDX,0000010795,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000010795.json
+aios:issuer:sec:0000038777,FRANKLIN RESOURCES INC,BEN,0000038777,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000038777.json
+aios:issuer:sec:0000014693,BROWN FORMAN CORP,BF-A,0000014693,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000014693.json
+aios:issuer:sec:0001996862,Bunge Global SA,BG,0001996862,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001996862.json
+aios:issuer:sec:0000875045,BIOGEN INC.,BIIB,0000875045,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000875045.json
+aios:issuer:sec:0001075531,Booking Holdings Inc.,BKNG,0001075531,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001075531.json
+aios:issuer:sec:0001701605,Baker Hughes Co,BKR,0001701605,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001701605.json
+aios:issuer:sec:0001316835,"Builders FirstSource, Inc.",BLDR,0001316835,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001316835.json
+aios:issuer:sec:0002012383,"BlackRock, Inc.",BLK,0002012383,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0002012383.json
+aios:issuer:sec:0000014272,BRISTOL MYERS SQUIBB CO,BMY,0000014272,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000014272.json
+aios:issuer:sec:0001390777,Bank of New York Mellon Corp,BNY,0001390777,2026-05-21,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001390777.json
+aios:issuer:sec:0001383312,"BROADRIDGE FINANCIAL SOLUTIONS, INC.",BR,0001383312,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001383312.json
+aios:issuer:sec:0001067983,BERKSHIRE HATHAWAY INC,BRK-B,0001067983,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001067983.json
+aios:issuer:sec:0000079282,"BROWN & BROWN, INC.",BRO,0000079282,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000079282.json
+aios:issuer:sec:0000885725,BOSTON SCIENTIFIC CORP,BSX,0000885725,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000885725.json
+aios:issuer:sec:0001393818,Blackstone Inc.,BX,0001393818,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001393818.json
+aios:issuer:sec:0001037540,"BXP, Inc.",BXP,0001037540,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001037540.json
+aios:issuer:sec:0000831001,CITIGROUP INC,C,0000831001,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000831001.json
+aios:issuer:sec:0000721371,CARDINAL HEALTH INC,CAH,0000721371,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000721371.json
+aios:issuer:sec:0001783180,CARRIER GLOBAL Corp,CARR,0001783180,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001783180.json
+aios:issuer:sec:0000726958,CASEYS GENERAL STORES INC,CASY,0000726958,2026-04-09,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000726958.json
+aios:issuer:sec:0000018230,CATERPILLAR INC,CAT,0000018230,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000018230.json
+aios:issuer:sec:0000896159,Chubb Ltd,CB,0000896159,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000896159.json
+aios:issuer:sec:0001374310,"Cboe Global Markets, Inc.",CBOE,0001374310,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001374310.json
+aios:issuer:sec:0001138118,"CBRE GROUP, INC.",CBRE,0001138118,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001138118.json
+aios:issuer:sec:0001051470,CROWN CASTLE INC.,CCI,0001051470,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001051470.json
+aios:issuer:sec:0000815097,Carnival Corp Ltd.,CCL,0000815097,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000815097.json
+aios:issuer:sec:0000813672,CADENCE DESIGN SYSTEMS INC,CDNS,0000813672,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000813672.json
+aios:issuer:sec:0001402057,CDW Corp,CDW,0001402057,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001402057.json
+aios:issuer:sec:0001868275,Constellation Energy Corp,CEG,0001868275,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001868275.json
+aios:issuer:sec:0001324404,"CF Industries Holdings, Inc.",CF,0001324404,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001324404.json
+aios:issuer:sec:0000759944,CITIZENS FINANCIAL GROUP INC/RI,CFG,0000759944,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000759944.json
+aios:issuer:sec:0000313927,CHURCH & DWIGHT CO INC /DE/,CHD,0000313927,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000313927.json
+aios:issuer:sec:0001043277,"C. H. ROBINSON WORLDWIDE, INC.",CHRW,0001043277,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001043277.json
+aios:issuer:sec:0001091667,"CHARTER COMMUNICATIONS, INC. /MO/",CHTR,0001091667,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001091667.json
+aios:issuer:sec:0001739940,Cigna Group,CI,0001739940,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001739940.json
+aios:issuer:sec:0000936395,CIENA CORP,CIEN,0000936395,2026-02-09,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000936395.json
+aios:issuer:sec:0000020286,CINCINNATI FINANCIAL CORP,CINF,0000020286,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000020286.json
+aios:issuer:sec:0000021665,COLGATE PALMOLIVE CO,CL,0000021665,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000021665.json
+aios:issuer:sec:0000021076,CLOROX CO /DE/,CLX,0000021076,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000021076.json
+aios:issuer:sec:0001166691,COMCAST CORP,CMCSA,0001166691,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001166691.json
+aios:issuer:sec:0001156375,CME GROUP INC.,CME,0001156375,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001156375.json
+aios:issuer:sec:0001058090,CHIPOTLE MEXICAN GRILL INC,CMG,0001058090,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001058090.json
+aios:issuer:sec:0000026172,CUMMINS INC,CMI,0000026172,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000026172.json
+aios:issuer:sec:0000811156,CMS ENERGY CORP,CMS,0000811156,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000811156.json
+aios:issuer:sec:0001071739,CENTENE CORP,CNC,0001071739,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001071739.json
+aios:issuer:sec:0001130310,CENTERPOINT ENERGY INC,CNP,0001130310,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001130310.json
+aios:issuer:sec:0000927628,CAPITAL ONE FINANCIAL CORP,COF,0000927628,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000927628.json
+aios:issuer:sec:0000820318,COHERENT CORP.,COHR,0000820318,2026-03-23,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000820318.json
+aios:issuer:sec:0001679788,"Coinbase Global, Inc.",COIN,0001679788,2025-05-19,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001679788.json
+aios:issuer:sec:0000711404,"COOPER COMPANIES, INC.",COO,0000711404,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000711404.json
+aios:issuer:sec:0001163165,CONOCOPHILLIPS,COP,0001163165,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001163165.json
+aios:issuer:sec:0001140859,"Cencora, Inc.",COR,0001140859,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001140859.json
+aios:issuer:sec:0000909832,COSTCO WHOLESALE CORP /NEW,COST,0000909832,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000909832.json
+aios:issuer:sec:0001175454,"CORPAY, INC.",CPAY,0001175454,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001175454.json
+aios:issuer:sec:0000900075,COPART INC,CPRT,0000900075,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000900075.json
+aios:issuer:sec:0000906345,CAMDEN PROPERTY TRUST,CPT,0000906345,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000906345.json
+aios:issuer:sec:0000849395,CRH PUBLIC LTD CO,CRH,0000849395,2025-12-22,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000849395.json
+aios:issuer:sec:0001100682,"CHARLES RIVER LABORATORIES INTERNATIONAL, INC.",CRL,0001100682,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001100682.json
+aios:issuer:sec:0001108524,"Salesforce, Inc.",CRM,0001108524,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001108524.json
+aios:issuer:sec:0001535527,"CrowdStrike Holdings, Inc.",CRWD,0001535527,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001535527.json
+aios:issuer:sec:0000858877,"CISCO SYSTEMS, INC.",CSCO,0000858877,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000858877.json
+aios:issuer:sec:0001057352,"COSTAR GROUP, INC.",CSGP,0001057352,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001057352.json
+aios:issuer:sec:0000277948,CSX CORP,CSX,0000277948,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000277948.json
+aios:issuer:sec:0000723254,CINTAS CORP,CTAS,0000723254,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000723254.json
+aios:issuer:sec:0001058290,COGNIZANT TECHNOLOGY SOLUTIONS CORP,CTSH,0001058290,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001058290.json
+aios:issuer:sec:0001755672,"Corteva, Inc.",CTVA,0001755672,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001755672.json
+aios:issuer:sec:0001690820,CARVANA CO.,CVNA,0001690820,2025-12-22,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001690820.json
+aios:issuer:sec:0000064803,CVS HEALTH Corp,CVS,0000064803,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000064803.json
+aios:issuer:sec:0000093410,CHEVRON CORP,CVX,0000093410,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000093410.json
+aios:issuer:sec:0000715957,"DOMINION ENERGY, INC",D,0000715957,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000715957.json
+aios:issuer:sec:0000027904,"DELTA AIR LINES, INC.",DAL,0000027904,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000027904.json
+aios:issuer:sec:0001792789,"DoorDash, Inc.",DASH,0001792789,2025-03-24,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001792789.json
+aios:issuer:sec:0001666700,"DuPont de Nemours, Inc.",DD,0001666700,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001666700.json
+aios:issuer:sec:0001561550,"Datadog, Inc.",DDOG,0001561550,2025-07-09,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001561550.json
+aios:issuer:sec:0000315189,DEERE & CO,DE,0000315189,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000315189.json
+aios:issuer:sec:0000910521,DECKERS OUTDOOR CORP,DECK,0000910521,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000910521.json
+aios:issuer:sec:0001571996,Dell Technologies Inc.,DELL,0001571996,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001571996.json
+aios:issuer:sec:0000029534,DOLLAR GENERAL CORP,DG,0000029534,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000029534.json
+aios:issuer:sec:0001022079,QUEST DIAGNOSTICS INC,DGX,0001022079,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001022079.json
+aios:issuer:sec:0000882184,HORTON D R INC /DE/,DHI,0000882184,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000882184.json
+aios:issuer:sec:0000313616,DANAHER CORP /DE/,DHR,0000313616,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000313616.json
+aios:issuer:sec:0001744489,Walt Disney Co,DIS,0001744489,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001744489.json
+aios:issuer:sec:0001297996,"DIGITAL REALTY TRUST, INC.",DLR,0001297996,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001297996.json
+aios:issuer:sec:0000935703,"DOLLAR TREE, INC.",DLTR,0000935703,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000935703.json
+aios:issuer:sec:0000765880,"HEALTHPEAK PROPERTIES, INC.",DOC,0000765880,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000765880.json
+aios:issuer:sec:0000029905,DOVER Corp,DOV,0000029905,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000029905.json
+aios:issuer:sec:0001751788,DOW INC.,DOW,0001751788,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001751788.json
+aios:issuer:sec:0001286681,DOMINOS PIZZA INC,DPZ,0001286681,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001286681.json
+aios:issuer:sec:0000940944,DARDEN RESTAURANTS INC,DRI,0000940944,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000940944.json
+aios:issuer:sec:0000936340,DTE ENERGY CO,DTE,0000936340,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000936340.json
+aios:issuer:sec:0001326160,Duke Energy CORP,DUK,0001326160,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001326160.json
+aios:issuer:sec:0000927066,DAVITA INC.,DVA,0000927066,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000927066.json
+aios:issuer:sec:0001090012,DEVON ENERGY CORP/DE,DVN,0001090012,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001090012.json
+aios:issuer:sec:0001093557,DEXCOM INC,DXCM,0001093557,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001093557.json
+aios:issuer:sec:0000712515,ELECTRONIC ARTS INC.,EA,0000712515,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000712515.json
+aios:issuer:sec:0001065088,EBAY INC,EBAY,0001065088,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001065088.json
+aios:issuer:sec:0001415404,EchoStar CORP,ECHO,0001415404,2026-06-24,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001415404.json
+aios:issuer:sec:0000031462,ECOLAB INC.,ECL,0000031462,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000031462.json
+aios:issuer:sec:0001047862,CONSOLIDATED EDISON INC,ED,0001047862,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001047862.json
+aios:issuer:sec:0000033185,EQUIFAX INC,EFX,0000033185,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000033185.json
+aios:issuer:sec:0001095073,"EVEREST GROUP, LTD.",EG,0001095073,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001095073.json
+aios:issuer:sec:0000827052,EDISON INTERNATIONAL,EIX,0000827052,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000827052.json
+aios:issuer:sec:0001001250,ESTEE LAUDER COMPANIES INC,EL,0001001250,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001001250.json
+aios:issuer:sec:0001156039,"Elevance Health, Inc.",ELV,0001156039,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001156039.json
+aios:issuer:sec:0000105634,"EMCOR Group, Inc.",EME,0000105634,2025-09-22,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000105634.json
+aios:issuer:sec:0000032604,EMERSON ELECTRIC CO,EMR,0000032604,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000032604.json
+aios:issuer:sec:0000821189,EOG RESOURCES INC,EOG,0000821189,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000821189.json
+aios:issuer:sec:0001101239,EQUINIX INC,EQIX,0001101239,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001101239.json
+aios:issuer:sec:0000906107,EQUITY RESIDENTIAL,EQR,0000906107,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000906107.json
+aios:issuer:sec:0000033213,EQT Corp,EQT,0000033213,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000033213.json
+aios:issuer:sec:0000922621,ERIE INDEMNITY CO,ERIE,0000922621,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000922621.json
+aios:issuer:sec:0000072741,EVERSOURCE ENERGY,ES,0000072741,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000072741.json
+aios:issuer:sec:0000920522,"ESSEX PROPERTY TRUST, INC.",ESS,0000920522,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000920522.json
+aios:issuer:sec:0001551182,Eaton Corp plc,ETN,0001551182,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001551182.json
+aios:issuer:sec:0000065984,ENTERGY CORP /DE/,ETR,0000065984,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000065984.json
+aios:issuer:sec:0001711269,"Evergy, Inc.",EVRG,0001711269,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001711269.json
+aios:issuer:sec:0001099800,Edwards Lifesciences Corp,EW,0001099800,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001099800.json
+aios:issuer:sec:0001109357,EXELON CORP,EXC,0001109357,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001109357.json
+aios:issuer:sec:0000895126,EXPAND ENERGY Corp,EXE,0000895126,2025-03-24,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000895126.json
+aios:issuer:sec:0000746515,EXPEDITORS INTERNATIONAL OF WASHINGTON INC,EXPD,0000746515,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000746515.json
+aios:issuer:sec:0001324424,"Expedia Group, Inc.",EXPE,0001324424,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001324424.json
+aios:issuer:sec:0001289490,Extra Space Storage Inc.,EXR,0001289490,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001289490.json
+aios:issuer:sec:0000037996,FORD MOTOR CO,F,0000037996,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000037996.json
+aios:issuer:sec:0001539838,"Diamondback Energy, Inc.",FANG,0001539838,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001539838.json
+aios:issuer:sec:0000815556,FASTENAL CO,FAST,0000815556,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000815556.json
+aios:issuer:sec:0000831259,FREEPORT-MCMORAN INC,FCX,0000831259,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000831259.json
+aios:issuer:sec:0001013237,FACTSET RESEARCH SYSTEMS INC,FDS,0001013237,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001013237.json
+aios:issuer:sec:0001048911,FEDEX CORP,FDX,0001048911,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001048911.json
+aios:issuer:sec:0002082247,"FedEx Freight Holding Company, Inc.",FDXF,0002082247,2026-06-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0002082247.json
+aios:issuer:sec:0001031296,FIRSTENERGY CORP,FE,0001031296,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001031296.json
+aios:issuer:sec:0001048695,"F5, INC.",FFIV,0001048695,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001048695.json
+aios:issuer:sec:0000814547,FAIR ISAAC CORP,FICO,0000814547,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000814547.json
+aios:issuer:sec:0001136893,"Fidelity National Information Services, Inc.",FIS,0001136893,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001136893.json
+aios:issuer:sec:0000798354,FISERV INC,FISV,0000798354,2025-11-11,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000798354.json
+aios:issuer:sec:0000035527,FIFTH THIRD BANCORP,FITB,0000035527,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000035527.json
+aios:issuer:sec:0001035983,COMFORT SYSTEMS USA INC,FIX,0001035983,2025-12-22,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001035983.json
+aios:issuer:sec:0000866374,FLEX LTD.,FLEX,0000866374,2026-06-22,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000866374.json
+aios:issuer:sec:0001754301,Fox Corp,FOXA,0001754301,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001754301.json
+aios:issuer:sec:0000034903,FEDERAL REALTY INVESTMENT TRUST,FRT,0000034903,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000034903.json
+aios:issuer:sec:0001274494,"FIRST SOLAR, INC.",FSLR,0001274494,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001274494.json
+aios:issuer:sec:0001262039,"Fortinet, Inc.",FTNT,0001262039,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001262039.json
+aios:issuer:sec:0001659166,Fortive Corp,FTV,0001659166,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001659166.json
+aios:issuer:sec:0000040533,GENERAL DYNAMICS CORP,GD,0000040533,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000040533.json
+aios:issuer:sec:0001609711,GoDaddy Inc.,GDDY,0001609711,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001609711.json
+aios:issuer:sec:0000040545,GENERAL ELECTRIC CO,GE,0000040545,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000040545.json
+aios:issuer:sec:0001932393,GE HealthCare Technologies Inc.,GEHC,0001932393,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001932393.json
+aios:issuer:sec:0000849399,Gen Digital Inc.,GEN,0000849399,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000849399.json
+aios:issuer:sec:0001996810,GE Vernova Inc.,GEV,0001996810,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001996810.json
+aios:issuer:sec:0000882095,"GILEAD SCIENCES, INC.",GILD,0000882095,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000882095.json
+aios:issuer:sec:0000040704,GENERAL MILLS INC,GIS,0000040704,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000040704.json
+aios:issuer:sec:0000320335,GLOBE LIFE INC.,GL,0000320335,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000320335.json
+aios:issuer:sec:0000024741,CORNING INC /NY,GLW,0000024741,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000024741.json
+aios:issuer:sec:0001467858,General Motors Co,GM,0001467858,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001467858.json
+aios:issuer:sec:0001474735,GENERAC HOLDINGS INC.,GNRC,0001474735,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001474735.json
+aios:issuer:sec:0001652044,Alphabet Inc.,GOOGL,0001652044,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001652044.json
+aios:issuer:sec:0000040987,GENUINE PARTS CO,GPC,0000040987,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000040987.json
+aios:issuer:sec:0001123360,GLOBAL PAYMENTS INC,GPN,0001123360,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001123360.json
+aios:issuer:sec:0001121788,GARMIN LTD,GRMN,0001121788,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001121788.json
+aios:issuer:sec:0000886982,GOLDMAN SACHS GROUP INC,GS,0000886982,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000886982.json
+aios:issuer:sec:0000277135,"W.W. GRAINGER, INC.",GWW,0000277135,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000277135.json
+aios:issuer:sec:0000045012,HALLIBURTON CO,HAL,0000045012,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000045012.json
+aios:issuer:sec:0000046080,"HASBRO, INC.",HAS,0000046080,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000046080.json
+aios:issuer:sec:0000049196,HUNTINGTON BANCSHARES INC /MD/,HBAN,0000049196,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000049196.json
+aios:issuer:sec:0000860730,"HCA Healthcare, Inc.",HCA,0000860730,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000860730.json
+aios:issuer:sec:0000354950,"HOME DEPOT, INC.",HD,0000354950,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000354950.json
+aios:issuer:sec:0000874766,"HARTFORD INSURANCE GROUP, INC.",HIG,0000874766,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000874766.json
+aios:issuer:sec:0001501585,"HUNTINGTON INGALLS INDUSTRIES, INC.",HII,0001501585,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001501585.json
+aios:issuer:sec:0001585689,Hilton Worldwide Holdings Inc.,HLT,0001585689,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001585689.json
+aios:issuer:sec:0000773840,HONEYWELL INTERNATIONAL INC,HON,0000773840,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000773840.json
+aios:issuer:sec:0002089271,Honeywell Aerospace Inc.,HONA,0002089271,2026-06-29,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0002089271.json
+aios:issuer:sec:0001783879,"Robinhood Markets, Inc.",HOOD,0001783879,2025-09-22,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001783879.json
+aios:issuer:sec:0001645590,Hewlett Packard Enterprise Co,HPE,0001645590,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001645590.json
+aios:issuer:sec:0000047217,HP INC,HPQ,0000047217,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000047217.json
+aios:issuer:sec:0000048465,HORMEL FOODS CORP /DE/,HRL,0000048465,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000048465.json
+aios:issuer:sec:0001000228,HENRY SCHEIN INC,HSIC,0001000228,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001000228.json
+aios:issuer:sec:0001070750,"HOST HOTELS & RESORTS, INC.",HST,0001070750,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001070750.json
+aios:issuer:sec:0000047111,HERSHEY CO,HSY,0000047111,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000047111.json
+aios:issuer:sec:0000048898,HUBBELL INC,HUBB,0000048898,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000048898.json
+aios:issuer:sec:0000049071,HUMANA INC,HUM,0000049071,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000049071.json
+aios:issuer:sec:0000004281,Howmet Aerospace Inc.,HWM,0000004281,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000004281.json
+aios:issuer:sec:0001381197,"Interactive Brokers Group, Inc.",IBKR,0001381197,2025-08-28,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001381197.json
+aios:issuer:sec:0000051143,INTERNATIONAL BUSINESS MACHINES CORP,IBM,0000051143,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000051143.json
+aios:issuer:sec:0001571949,"Intercontinental Exchange, Inc.",ICE,0001571949,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001571949.json
+aios:issuer:sec:0000874716,IDEXX LABORATORIES INC /DE,IDXX,0000874716,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000874716.json
+aios:issuer:sec:0000832101,IDEX CORP /DE/,IEX,0000832101,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000832101.json
+aios:issuer:sec:0000051253,INTERNATIONAL FLAVORS & FRAGRANCES INC,IFF,0000051253,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000051253.json
+aios:issuer:sec:0000879169,INCYTE CORP,INCY,0000879169,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000879169.json
+aios:issuer:sec:0000050863,INTEL CORP,INTC,0000050863,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000050863.json
+aios:issuer:sec:0000896878,INTUIT INC.,INTU,0000896878,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000896878.json
+aios:issuer:sec:0001687229,Invitation Homes Inc.,INVH,0001687229,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001687229.json
+aios:issuer:sec:0000051434,INTERNATIONAL PAPER CO /NEW/,IP,0000051434,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000051434.json
+aios:issuer:sec:0001478242,IQVIA HOLDINGS INC.,IQV,0001478242,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001478242.json
+aios:issuer:sec:0001699150,Ingersoll Rand Inc.,IR,0001699150,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001699150.json
+aios:issuer:sec:0001020569,IRON MOUNTAIN INC,IRM,0001020569,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001020569.json
+aios:issuer:sec:0001035267,INTUITIVE SURGICAL INC,ISRG,0001035267,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001035267.json
+aios:issuer:sec:0000749251,GARTNER INC,IT,0000749251,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000749251.json
+aios:issuer:sec:0000049826,ILLINOIS TOOL WORKS INC,ITW,0000049826,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000049826.json
+aios:issuer:sec:0000914208,Invesco Ltd.,IVZ,0000914208,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000914208.json
+aios:issuer:sec:0000052988,JACOBS SOLUTIONS INC.,J,0000052988,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000052988.json
+aios:issuer:sec:0000728535,HUNT J B TRANSPORT SERVICES INC,JBHT,0000728535,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000728535.json
+aios:issuer:sec:0000898293,JABIL INC,JBL,0000898293,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000898293.json
+aios:issuer:sec:0000833444,Johnson Controls International plc,JCI,0000833444,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000833444.json
+aios:issuer:sec:0000779152,JACK HENRY & ASSOCIATES INC,JKHY,0000779152,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000779152.json
+aios:issuer:sec:0000200406,JOHNSON & JOHNSON,JNJ,0000200406,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000200406.json
+aios:issuer:sec:0000019617,JPMORGAN CHASE & CO,JPM,0000019617,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000019617.json
+aios:issuer:sec:0001418135,Keurig Dr Pepper Inc.,KDP,0001418135,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001418135.json
+aios:issuer:sec:0000091576,KEYCORP /NEW/,KEY,0000091576,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000091576.json
+aios:issuer:sec:0001601046,"Keysight Technologies, Inc.",KEYS,0001601046,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001601046.json
+aios:issuer:sec:0001637459,Kraft Heinz Co,KHC,0001637459,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001637459.json
+aios:issuer:sec:0000879101,KIMCO REALTY CORP,KIM,0000879101,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000879101.json
+aios:issuer:sec:0001404912,KKR & Co. Inc.,KKR,0001404912,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001404912.json
+aios:issuer:sec:0000319201,KLA CORP,KLAC,0000319201,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000319201.json
+aios:issuer:sec:0000055785,KIMBERLY CLARK CORP,KMB,0000055785,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000055785.json
+aios:issuer:sec:0001506307,"KINDER MORGAN, INC.",KMI,0001506307,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001506307.json
+aios:issuer:sec:0000021344,COCA COLA CO,KO,0000021344,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000021344.json
+aios:issuer:sec:0000056873,KROGER CO,KR,0000056873,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000056873.json
+aios:issuer:sec:0001944048,Kenvue Inc.,KVUE,0001944048,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001944048.json
+aios:issuer:sec:0000060086,LOEWS CORP,L,0000060086,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000060086.json
+aios:issuer:sec:0001336920,"Leidos Holdings, Inc.",LDOS,0001336920,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001336920.json
+aios:issuer:sec:0000920760,LENNAR CORP /NEW/,LEN,0000920760,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000920760.json
+aios:issuer:sec:0000920148,LABCORP HOLDINGS INC.,LH,0000920148,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000920148.json
+aios:issuer:sec:0000202058,"L3HARRIS TECHNOLOGIES, INC. /DE/",LHX,0000202058,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000202058.json
+aios:issuer:sec:0001069202,LENNOX INTERNATIONAL INC,LII,0001069202,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001069202.json
+aios:issuer:sec:0001707925,LINDE PLC,LIN,0001707925,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001707925.json
+aios:issuer:sec:0001633978,Lumentum Holdings Inc.,LITE,0001633978,2026-03-23,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001633978.json
+aios:issuer:sec:0000059478,ELI LILLY & Co,LLY,0000059478,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000059478.json
+aios:issuer:sec:0000936468,LOCKHEED MARTIN CORP,LMT,0000936468,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000936468.json
+aios:issuer:sec:0000352541,ALLIANT ENERGY CORP,LNT,0000352541,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000352541.json
+aios:issuer:sec:0000060667,LOWES COMPANIES INC,LOW,0000060667,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000060667.json
+aios:issuer:sec:0000707549,LAM RESEARCH CORP,LRCX,0000707549,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000707549.json
+aios:issuer:sec:0001397187,lululemon athletica inc.,LULU,0001397187,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001397187.json
+aios:issuer:sec:0000092380,SOUTHWEST AIRLINES CO,LUV,0000092380,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000092380.json
+aios:issuer:sec:0001300514,LAS VEGAS SANDS CORP,LVS,0001300514,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001300514.json
+aios:issuer:sec:0001489393,LyondellBasell Industries N.V.,LYB,0001489393,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001489393.json
+aios:issuer:sec:0001335258,"Live Nation Entertainment, Inc.",LYV,0001335258,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001335258.json
+aios:issuer:sec:0001141391,Mastercard Inc,MA,0001141391,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001141391.json
+aios:issuer:sec:0000912595,MID AMERICA APARTMENT COMMUNITIES INC.,MAA,0000912595,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000912595.json
+aios:issuer:sec:0001048286,MARRIOTT INTERNATIONAL INC /MD/,MAR,0001048286,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001048286.json
+aios:issuer:sec:0000062996,MASCO CORP /DE/,MAS,0000062996,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000062996.json
+aios:issuer:sec:0000063908,MCDONALDS CORP,MCD,0000063908,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000063908.json
+aios:issuer:sec:0000827054,MICROCHIP TECHNOLOGY INC,MCHP,0000827054,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000827054.json
+aios:issuer:sec:0000927653,MCKESSON CORP,MCK,0000927653,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000927653.json
+aios:issuer:sec:0001059556,MOODYS CORP /DE/,MCO,0001059556,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001059556.json
+aios:issuer:sec:0001103982,"Mondelez International, Inc.",MDLZ,0001103982,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001103982.json
+aios:issuer:sec:0001613103,Medtronic plc,MDT,0001613103,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001613103.json
+aios:issuer:sec:0001099219,METLIFE INC,MET,0001099219,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001099219.json
+aios:issuer:sec:0001326801,"Meta Platforms, Inc.",META,0001326801,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001326801.json
+aios:issuer:sec:0000789570,MGM Resorts International,MGM,0000789570,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000789570.json
+aios:issuer:sec:0000063754,MCCORMICK & CO INC,MKC,0000063754,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000063754.json
+aios:issuer:sec:0000916076,MARTIN MARIETTA MATERIALS INC,MLM,0000916076,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000916076.json
+aios:issuer:sec:0000066740,3M CO,MMM,0000066740,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000066740.json
+aios:issuer:sec:0000865752,Monster Beverage Corp,MNST,0000865752,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000865752.json
+aios:issuer:sec:0000764180,"ALTRIA GROUP, INC.",MO,0000764180,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000764180.json
+aios:issuer:sec:0001285785,MOSAIC CO,MOS,0001285785,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001285785.json
+aios:issuer:sec:0001510295,Marathon Petroleum Corp,MPC,0001510295,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001510295.json
+aios:issuer:sec:0001280452,"MONOLITHIC POWER SYSTEMS, INC.",MPWR,0001280452,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001280452.json
+aios:issuer:sec:0000310158,"Merck & Co., Inc.",MRK,0000310158,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000310158.json
+aios:issuer:sec:0001682852,"Moderna, Inc.",MRNA,0001682852,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001682852.json
+aios:issuer:sec:0000062709,"MARSH & MCLENNAN COMPANIES, INC.",MRSH,0000062709,2026-01-14,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000062709.json
+aios:issuer:sec:0001835632,"Marvell Technology, Inc.",MRVL,0001835632,2026-06-22,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001835632.json
+aios:issuer:sec:0000895421,MORGAN STANLEY,MS,0000895421,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000895421.json
+aios:issuer:sec:0001408198,MSCI Inc.,MSCI,0001408198,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001408198.json
+aios:issuer:sec:0000789019,MICROSOFT CORP,MSFT,0000789019,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000789019.json
+aios:issuer:sec:0000068505,"Motorola Solutions, Inc.",MSI,0000068505,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000068505.json
+aios:issuer:sec:0000036270,M&T BANK CORP,MTB,0000036270,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000036270.json
+aios:issuer:sec:0001037646,METTLER TOLEDO INTERNATIONAL INC/,MTD,0001037646,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001037646.json
+aios:issuer:sec:0000723125,MICRON TECHNOLOGY INC,MU,0000723125,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000723125.json
+aios:issuer:sec:0001513761,Norwegian Cruise Line Holdings Ltd.,NCLH,0001513761,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001513761.json
+aios:issuer:sec:0001120193,"NASDAQ, INC.",NDAQ,0001120193,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001120193.json
+aios:issuer:sec:0000072331,NORDSON CORP,NDSN,0000072331,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000072331.json
+aios:issuer:sec:0000753308,NEXTERA ENERGY INC,NEE,0000753308,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000753308.json
+aios:issuer:sec:0001164727,NEWMONT Corp /DE/,NEM,0001164727,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001164727.json
+aios:issuer:sec:0001065280,NETFLIX INC,NFLX,0001065280,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001065280.json
+aios:issuer:sec:0001111711,NISOURCE INC.,NI,0001111711,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001111711.json
+aios:issuer:sec:0000320187,"NIKE, Inc.",NKE,0000320187,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000320187.json
+aios:issuer:sec:0001133421,NORTHROP GRUMMAN CORP /DE/,NOC,0001133421,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001133421.json
+aios:issuer:sec:0001373715,"ServiceNow, Inc.",NOW,0001373715,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001373715.json
+aios:issuer:sec:0001013871,"NRG ENERGY, INC.",NRG,0001013871,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001013871.json
+aios:issuer:sec:0000702165,NORFOLK SOUTHERN CORP,NSC,0000702165,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000702165.json
+aios:issuer:sec:0001002047,"NetApp, Inc.",NTAP,0001002047,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001002047.json
+aios:issuer:sec:0000073124,NORTHERN TRUST CORP,NTRS,0000073124,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000073124.json
+aios:issuer:sec:0000073309,NUCOR CORP,NUE,0000073309,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000073309.json
+aios:issuer:sec:0001045810,NVIDIA CORP,NVDA,0001045810,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001045810.json
+aios:issuer:sec:0000906163,NVR INC,NVR,0000906163,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000906163.json
+aios:issuer:sec:0001564708,NEWS CORP,NWSA,0001564708,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001564708.json
+aios:issuer:sec:0001413447,NXP Semiconductors N.V.,NXPI,0001413447,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001413447.json
+aios:issuer:sec:0000726728,REALTY INCOME CORP,O,0000726728,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000726728.json
+aios:issuer:sec:0000878927,"OLD DOMINION FREIGHT LINE, INC.",ODFL,0000878927,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000878927.json
+aios:issuer:sec:0001039684,ONEOK INC /NEW/,OKE,0001039684,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001039684.json
+aios:issuer:sec:0000029989,OMNICOM GROUP INC.,OMC,0000029989,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000029989.json
+aios:issuer:sec:0001097864,ON SEMICONDUCTOR CORP,ON,0001097864,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001097864.json
+aios:issuer:sec:0001341439,ORACLE CORP,ORCL,0001341439,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001341439.json
+aios:issuer:sec:0000898173,O REILLY AUTOMOTIVE INC,ORLY,0000898173,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000898173.json
+aios:issuer:sec:0001781335,Otis Worldwide Corp,OTIS,0001781335,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001781335.json
+aios:issuer:sec:0000797468,OCCIDENTAL PETROLEUM CORP /DE/,OXY,0000797468,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000797468.json
+aios:issuer:sec:0001327567,Palo Alto Networks Inc,PANW,0001327567,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001327567.json
+aios:issuer:sec:0000723531,PAYCHEX INC,PAYX,0000723531,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000723531.json
+aios:issuer:sec:0000075362,PACCAR INC,PCAR,0000075362,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000075362.json
+aios:issuer:sec:0001004980,PG&E Corp,PCG,0001004980,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001004980.json
+aios:issuer:sec:0000788784,PUBLIC SERVICE ENTERPRISE GROUP INC,PEG,0000788784,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000788784.json
+aios:issuer:sec:0000077476,PEPSICO INC,PEP,0000077476,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000077476.json
+aios:issuer:sec:0000078003,PFIZER INC,PFE,0000078003,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000078003.json
+aios:issuer:sec:0001126328,PRINCIPAL FINANCIAL GROUP INC,PFG,0001126328,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001126328.json
+aios:issuer:sec:0000080424,PROCTER & GAMBLE Co,PG,0000080424,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000080424.json
+aios:issuer:sec:0000080661,PROGRESSIVE CORP/OH/,PGR,0000080661,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000080661.json
+aios:issuer:sec:0000076334,Parker-Hannifin Corp,PH,0000076334,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000076334.json
+aios:issuer:sec:0000822416,PULTEGROUP INC/MI/,PHM,0000822416,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000822416.json
+aios:issuer:sec:0000075677,PACKAGING CORP OF AMERICA,PKG,0000075677,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000075677.json
+aios:issuer:sec:0001045609,"Prologis, Inc.",PLD,0001045609,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001045609.json
+aios:issuer:sec:0001321655,Palantir Technologies Inc.,PLTR,0001321655,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001321655.json
+aios:issuer:sec:0001413329,Philip Morris International Inc.,PM,0001413329,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001413329.json
+aios:issuer:sec:0000713676,"PNC FINANCIAL SERVICES GROUP, INC.",PNC,0000713676,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000713676.json
+aios:issuer:sec:0000077360,PENTAIR plc,PNR,0000077360,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000077360.json
+aios:issuer:sec:0000764622,PINNACLE WEST CAPITAL CORP,PNW,0000764622,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000764622.json
+aios:issuer:sec:0001145197,INSULET CORP,PODD,0001145197,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001145197.json
+aios:issuer:sec:0000079879,PPG INDUSTRIES INC,PPG,0000079879,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000079879.json
+aios:issuer:sec:0000922224,PPL Corp,PPL,0000922224,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000922224.json
+aios:issuer:sec:0001137774,PRUDENTIAL FINANCIAL INC,PRU,0001137774,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001137774.json
+aios:issuer:sec:0001393311,Public Storage,PSA,0001393311,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001393311.json
+aios:issuer:sec:0002041610,Paramount Skydance Corp,PSKY,0002041610,2025-08-07,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0002041610.json
+aios:issuer:sec:0001534701,Phillips 66,PSX,0001534701,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001534701.json
+aios:issuer:sec:0000857005,PTC INC.,PTC,0000857005,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000857005.json
+aios:issuer:sec:0001050915,"QUANTA SERVICES, INC.",PWR,0001050915,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001050915.json
+aios:issuer:sec:0001633917,"PayPal Holdings, Inc.",PYPL,0001633917,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001633917.json
+aios:issuer:sec:0002058873,"Qnity Electronics, Inc.",Q,0002058873,2025-11-03,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0002058873.json
+aios:issuer:sec:0000804328,QUALCOMM INC/DE,QCOM,0000804328,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000804328.json
+aios:issuer:sec:0000884887,ROYAL CARIBBEAN CRUISES LTD,RCL,0000884887,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000884887.json
+aios:issuer:sec:0000910606,REGENCY CENTERS CORP,REG,0000910606,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000910606.json
+aios:issuer:sec:0000872589,"REGENERON PHARMACEUTICALS, INC.",REGN,0000872589,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000872589.json
+aios:issuer:sec:0001281761,REGIONS FINANCIAL CORP,RF,0001281761,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001281761.json
+aios:issuer:sec:0000720005,RAYMOND JAMES FINANCIAL INC,RJF,0000720005,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000720005.json
+aios:issuer:sec:0001037038,RALPH LAUREN CORP,RL,0001037038,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001037038.json
+aios:issuer:sec:0000943819,RESMED INC,RMD,0000943819,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000943819.json
+aios:issuer:sec:0001024478,"ROCKWELL AUTOMATION, INC",ROK,0001024478,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001024478.json
+aios:issuer:sec:0000084839,ROLLINS INC,ROL,0000084839,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000084839.json
+aios:issuer:sec:0000882835,ROPER TECHNOLOGIES INC,ROP,0000882835,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000882835.json
+aios:issuer:sec:0000745732,"ROSS STORES, INC.",ROST,0000745732,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000745732.json
+aios:issuer:sec:0001060391,"REPUBLIC SERVICES, INC.",RSG,0001060391,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001060391.json
+aios:issuer:sec:0000101829,RTX Corp,RTX,0000101829,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000101829.json
+aios:issuer:sec:0000031791,"REVVITY, INC.",RVTY,0000031791,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000031791.json
+aios:issuer:sec:0001034054,SBA COMMUNICATIONS CORP,SBAC,0001034054,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001034054.json
+aios:issuer:sec:0000829224,STARBUCKS CORP,SBUX,0000829224,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000829224.json
+aios:issuer:sec:0000316709,SCHWAB CHARLES CORP,SCHW,0000316709,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000316709.json
+aios:issuer:sec:0000089800,SHERWIN WILLIAMS CO,SHW,0000089800,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000089800.json
+aios:issuer:sec:0000091419,J M SMUCKER Co,SJM,0000091419,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000091419.json
+aios:issuer:sec:0000087347,SLB LIMITED/NV,SLB,0000087347,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000087347.json
+aios:issuer:sec:0001375365,"Super Micro Computer, Inc.",SMCI,0001375365,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001375365.json
+aios:issuer:sec:0000091440,Snap-on Inc,SNA,0000091440,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000091440.json
+aios:issuer:sec:0002023554,Sandisk Corp,SNDK,0002023554,2025-11-28,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0002023554.json
+aios:issuer:sec:0000883241,SYNOPSYS INC,SNPS,0000883241,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000883241.json
+aios:issuer:sec:0000092122,SOUTHERN CO,SO,0000092122,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000092122.json
+aios:issuer:sec:0001964738,Solventum Corp,SOLV,0001964738,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001964738.json
+aios:issuer:sec:0001063761,SIMON PROPERTY GROUP INC.,SPG,0001063761,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001063761.json
+aios:issuer:sec:0000064040,S&P Global Inc.,SPGI,0000064040,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000064040.json
+aios:issuer:sec:0001032208,SEMPRA,SRE,0001032208,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001032208.json
+aios:issuer:sec:0001757898,STERIS plc,STE,0001757898,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001757898.json
+aios:issuer:sec:0001022671,STEEL DYNAMICS INC,STLD,0001022671,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001022671.json
+aios:issuer:sec:0000093751,STATE STREET CORP,STT,0000093751,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000093751.json
+aios:issuer:sec:0001137789,Seagate Technology Holdings plc,STX,0001137789,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001137789.json
+aios:issuer:sec:0000016918,"CONSTELLATION BRANDS, INC.",STZ,0000016918,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000016918.json
+aios:issuer:sec:0002005951,Smurfit Westrock plc,SW,0002005951,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0002005951.json
+aios:issuer:sec:0000093556,"STANLEY BLACK & DECKER, INC.",SWK,0000093556,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000093556.json
+aios:issuer:sec:0000004127,"SKYWORKS SOLUTIONS, INC.",SWKS,0000004127,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000004127.json
+aios:issuer:sec:0001601712,Synchrony Financial,SYF,0001601712,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001601712.json
+aios:issuer:sec:0000310764,STRYKER CORP,SYK,0000310764,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000310764.json
+aios:issuer:sec:0000096021,SYSCO CORP,SYY,0000096021,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000096021.json
+aios:issuer:sec:0000732717,AT&T INC.,T,0000732717,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000732717.json
+aios:issuer:sec:0000024545,MOLSON COORS BEVERAGE CO,TAP,0000024545,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000024545.json
+aios:issuer:sec:0001260221,TransDigm Group INC,TDG,0001260221,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001260221.json
+aios:issuer:sec:0001094285,TELEDYNE TECHNOLOGIES INC,TDY,0001094285,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001094285.json
+aios:issuer:sec:0000842023,BIO-TECHNE Corp,TECH,0000842023,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000842023.json
+aios:issuer:sec:0001385157,TE Connectivity plc,TEL,0001385157,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001385157.json
+aios:issuer:sec:0000097210,"TERADYNE, INC",TER,0000097210,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000097210.json
+aios:issuer:sec:0000092230,TRUIST FINANCIAL CORP,TFC,0000092230,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000092230.json
+aios:issuer:sec:0000027419,TARGET CORP,TGT,0000027419,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000027419.json
+aios:issuer:sec:0000109198,TJX COMPANIES INC /DE/,TJX,0000109198,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000109198.json
+aios:issuer:sec:0001973266,"TKO Group Holdings, Inc.",TKO,0001973266,2025-03-24,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001973266.json
+aios:issuer:sec:0000097745,THERMO FISHER SCIENTIFIC INC.,TMO,0000097745,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000097745.json
+aios:issuer:sec:0001283699,"T-Mobile US, Inc.",TMUS,0001283699,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001283699.json
+aios:issuer:sec:0001811074,Texas Pacific Land Corp,TPL,0001811074,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001811074.json
+aios:issuer:sec:0001116132,"TAPESTRY, INC.",TPR,0001116132,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001116132.json
+aios:issuer:sec:0001389170,Targa Resources Corp.,TRGP,0001389170,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001389170.json
+aios:issuer:sec:0000864749,TRIMBLE INC.,TRMB,0000864749,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000864749.json
+aios:issuer:sec:0001113169,PRICE T ROWE GROUP INC,TROW,0001113169,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001113169.json
+aios:issuer:sec:0000086312,"TRAVELERS COMPANIES, INC.",TRV,0000086312,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000086312.json
+aios:issuer:sec:0000916365,TRACTOR SUPPLY CO /DE/,TSCO,0000916365,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000916365.json
+aios:issuer:sec:0001318605,"Tesla, Inc.",TSLA,0001318605,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001318605.json
+aios:issuer:sec:0000100493,"TYSON FOODS, INC.",TSN,0000100493,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000100493.json
+aios:issuer:sec:0001466258,Trane Technologies plc,TT,0001466258,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001466258.json
+aios:issuer:sec:0001671933,"Trade Desk, Inc.",TTD,0001671933,2025-07-18,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001671933.json
+aios:issuer:sec:0000946581,TAKE TWO INTERACTIVE SOFTWARE INC,TTWO,0000946581,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000946581.json
+aios:issuer:sec:0000097476,TEXAS INSTRUMENTS INC,TXN,0000097476,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000097476.json
+aios:issuer:sec:0000217346,TEXTRON INC,TXT,0000217346,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000217346.json
+aios:issuer:sec:0000860731,TYLER TECHNOLOGIES INC,TYL,0000860731,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000860731.json
+aios:issuer:sec:0000100517,"United Airlines Holdings, Inc.",UAL,0000100517,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000100517.json
+aios:issuer:sec:0001543151,"Uber Technologies, Inc",UBER,0001543151,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001543151.json
+aios:issuer:sec:0000074208,"UDR, Inc.",UDR,0000074208,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000074208.json
+aios:issuer:sec:0000352915,UNIVERSAL HEALTH SERVICES INC,UHS,0000352915,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000352915.json
+aios:issuer:sec:0001403568,"Ulta Beauty, Inc.",ULTA,0001403568,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001403568.json
+aios:issuer:sec:0000731766,UNITEDHEALTH GROUP INC,UNH,0000731766,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000731766.json
+aios:issuer:sec:0000100885,UNION PACIFIC CORP,UNP,0000100885,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000100885.json
+aios:issuer:sec:0001090727,UNITED PARCEL SERVICE INC,UPS,0001090727,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001090727.json
+aios:issuer:sec:0001067701,"UNITED RENTALS, INC.",URI,0001067701,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001067701.json
+aios:issuer:sec:0000036104,US BANCORP \DE\,USB,0000036104,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000036104.json
+aios:issuer:sec:0001403161,VISA INC.,V,0001403161,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001403161.json
+aios:issuer:sec:0001393052,VEEVA SYSTEMS INC,VEEV,0001393052,2026-05-07,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001393052.json
+aios:issuer:sec:0001705696,VICI PROPERTIES INC.,VICI,0001705696,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001705696.json
+aios:issuer:sec:0001035002,VALERO ENERGY CORP/TX,VLO,0001035002,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001035002.json
+aios:issuer:sec:0001967680,Veralto Corp,VLTO,0001967680,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001967680.json
+aios:issuer:sec:0001396009,Vulcan Materials CO,VMC,0001396009,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001396009.json
+aios:issuer:sec:0001442145,"Verisk Analytics, Inc.",VRSK,0001442145,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001442145.json
+aios:issuer:sec:0001014473,VERISIGN INC/CA,VRSN,0001014473,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001014473.json
+aios:issuer:sec:0001674101,Vertiv Holdings Co,VRT,0001674101,2026-03-23,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001674101.json
+aios:issuer:sec:0000875320,VERTEX PHARMACEUTICALS INC / MA,VRTX,0000875320,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000875320.json
+aios:issuer:sec:0001692819,Vistra Corp.,VST,0001692819,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001692819.json
+aios:issuer:sec:0000740260,"Ventas, Inc.",VTR,0000740260,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000740260.json
+aios:issuer:sec:0001792044,Viatris Inc,VTRS,0001792044,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001792044.json
+aios:issuer:sec:0000732712,VERIZON COMMUNICATIONS INC,VZ,0000732712,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000732712.json
+aios:issuer:sec:0000943452,WESTINGHOUSE AIR BRAKE TECHNOLOGIES CORP,WAB,0000943452,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000943452.json
+aios:issuer:sec:0001000697,WATERS CORP /DE/,WAT,0001000697,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001000697.json
+aios:issuer:sec:0001437107,"Warner Bros. Discovery, Inc.",WBD,0001437107,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001437107.json
+aios:issuer:sec:0001327811,"Workday, Inc.",WDAY,0001327811,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001327811.json
+aios:issuer:sec:0000106040,WESTERN DIGITAL CORP,WDC,0000106040,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000106040.json
+aios:issuer:sec:0000783325,"WEC ENERGY GROUP, INC.",WEC,0000783325,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000783325.json
+aios:issuer:sec:0000766704,WELLTOWER INC.,WELL,0000766704,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000766704.json
+aios:issuer:sec:0000072971,WELLS FARGO & COMPANY/MN,WFC,0000072971,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000072971.json
+aios:issuer:sec:0000823768,WASTE MANAGEMENT INC,WM,0000823768,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000823768.json
+aios:issuer:sec:0000107263,"WILLIAMS COMPANIES, INC.",WMB,0000107263,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000107263.json
+aios:issuer:sec:0000104169,Walmart Inc.,WMT,0000104169,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000104169.json
+aios:issuer:sec:0000011544,BERKLEY W R CORP,WRB,0000011544,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000011544.json
+aios:issuer:sec:0000719955,WILLIAMS SONOMA INC,WSM,0000719955,2025-03-24,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000719955.json
+aios:issuer:sec:0000105770,WEST PHARMACEUTICAL SERVICES INC,WST,0000105770,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000105770.json
+aios:issuer:sec:0001140536,WILLIS TOWERS WATSON PLC,WTW,0001140536,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001140536.json
+aios:issuer:sec:0000106535,WEYERHAEUSER CO,WY,0000106535,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000106535.json
+aios:issuer:sec:0001174922,WYNN RESORTS LTD,WYNN,0001174922,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001174922.json
+aios:issuer:sec:0000072903,XCEL ENERGY INC,XEL,0000072903,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000072903.json
+aios:issuer:sec:0001524472,Xylem Inc.,XYL,0001524472,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001524472.json
+aios:issuer:sec:0001512673,"Block, Inc.",XYZ,0001512673,2025-07-23,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001512673.json
+aios:issuer:sec:0001041061,YUM BRANDS INC,YUM,0001041061,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001041061.json
+aios:issuer:sec:0001136869,"ZIMMER BIOMET HOLDINGS, INC.",ZBH,0001136869,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001136869.json
+aios:issuer:sec:0000877212,ZEBRA TECHNOLOGIES CORP,ZBRA,0000877212,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0000877212.json
+aios:issuer:sec:0001555280,Zoetis Inc.,ZTS,0001555280,2025-01-01,2026-07-22,2026-07-21,https://data.sec.gov/submissions/CIK0001555280.json

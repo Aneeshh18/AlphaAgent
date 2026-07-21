@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import date
 from types import SimpleNamespace
 from zipfile import ZipFile
 
 import duckdb
+import pandas as pd
 import pytest
 
 from aios.ingest import edgar, prices
@@ -20,6 +22,42 @@ SECURITY_ID = "aios:security:demo-common"
 ISSUER_ID = "aios:issuer:demo"
 EVIDENCE = "https://www.sec.gov/Archives/edgar/data/1/example.htm"
 PROVIDER_EVIDENCE = "https://query1.finance.yahoo.com/v8/finance/chart/NEW"
+
+
+def test_yfinance_fetch_explicitly_requests_and_marks_actions(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_download(*args, **kwargs):
+        captured.update(kwargs)
+        return pd.DataFrame(
+            {
+                "Open": [100.0, 50.0],
+                "High": [101.0, 51.0],
+                "Low": [99.0, 49.0],
+                "Close": [100.0, 50.0],
+                "Adj Close": [99.0, 50.0],
+                "Volume": [1000, 2000],
+                "Dividends": [1.0, 0.0],
+                "Stock Splits": [0.0, 2.0],
+            },
+            # The later split is outside the caller's requested window, but
+            # Yahoo has already normalized the earlier close for it.
+            index=[pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-04")],
+        )
+
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(download=fake_download))
+
+    rows = prices.fetch_yfinance("TEST", start="2024-01-01", end="2024-01-03")
+
+    assert captured["actions"] is True
+    assert date.fromisoformat(captured["end"]) > date(2024, 1, 3)
+    assert len(rows) == 1
+    assert rows[0]["dividends"] == 1.0
+    assert rows[0]["split_ratio"] == 1.0
+    assert rows[0]["actions_complete"] is True
+    assert rows[0]["close_split_adjusted"] is True
+    assert rows[0]["split_normalization_factor"] == 2.0
+    assert rows[0]["split_normalization_through"] == date.today().isoformat()
 
 
 def test_companyfacts_archive_reads_reviewed_cik_and_rejects_wrong_payload(tmp_path):
@@ -192,12 +230,30 @@ def test_existing_price_and_fundamental_tables_migrate_additively(tmp_path):
     try:
         price_columns = {row["column_name"] for row in store.query("DESCRIBE prices")}
         fundamental_columns = {row["column_name"] for row in store.query("DESCRIBE fundamentals")}
-        assert {"security_id", "provider_symbol"} <= price_columns
+        assert {
+            "security_id",
+            "provider_symbol",
+            "actions_complete",
+            "close_split_adjusted",
+            "split_normalization_factor",
+            "split_normalization_through",
+        } <= price_columns
         assert {"issuer_id", "security_id"} <= fundamental_columns
         assert store.query("SELECT close, security_id FROM prices")[0] == {
             "close": 10.0,
             "security_id": None,
         }
+        assert store.query("SELECT actions_complete FROM prices")[0]["actions_complete"] is False
+        assert (
+            store.query("SELECT close_split_adjusted FROM prices")[0]["close_split_adjusted"]
+            is None
+        )
+        assert (
+            store.query("SELECT split_normalization_factor FROM prices")[0][
+                "split_normalization_factor"
+            ]
+            is None
+        )
         assert store.query("SELECT value, issuer_id FROM fundamentals")[0] == {
             "value": 100.0,
             "issuer_id": None,
@@ -446,6 +502,10 @@ def test_tiingo_fetch_uses_header_token_and_preserves_exclusive_end(monkeypatch)
         "volume": 1000,
         "dividends": 0.25,
         "split_ratio": 1.0,
+        "actions_complete": True,
+        "close_split_adjusted": False,
+        "split_normalization_factor": 1.0,
+        "split_normalization_through": None,
         "source": "tiingo",
     }
 
@@ -480,6 +540,15 @@ def test_identity_price_ingest_preserves_transition_and_coverage(monkeypatch, tm
         assert [row["ticker"] for row in stored] == ["OLD", "NEW"]
         assert all(row["security_id"] == SECURITY_ID for row in stored)
         assert store.latest_price("NEW", "2024-07-01")["close"] == 100.0
+        factor_rows = store.pit_factor_price_history("NEW", "2024-07-01", observations=2)
+        assert [row["ticker"] for row in factor_rows] == ["OLD", "NEW"]
+        assert store.price_action_refresh_candidates("yfinance", "2024-01-01", "2025-01-01") == [
+            SECURITY_ID
+        ]
+        assert (
+            store.unverified_price_action_count(SECURITY_ID, "yfinance", "2024-01-01", "2025-01-01")
+            == 2
+        )
         coverage = store.universe_data_coverage("demo", "2024-07-01")[0]
         assert coverage["issuer_id"] == ISSUER_ID
         assert coverage["has_price_history"] is True
@@ -504,6 +573,7 @@ def test_terminal_provider_mapping_cannot_reactivate_legacy_price_rows(tmp_path)
         store.upsert_reference_identities(issuers, ciks, owners, providers)
 
         assert store.latest_price("OLD", "2024-06-30") is None
+        assert store.pit_factor_price_history("OLD", "2024-06-30", observations=2) == []
         coverage = store.universe_data_coverage("demo", "2024-06-30")[0]
         assert coverage["has_price_history"] is False
         assert coverage["latest_price_date"] is None

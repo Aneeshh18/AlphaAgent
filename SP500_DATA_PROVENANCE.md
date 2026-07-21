@@ -1,5 +1,89 @@
 # S&P 500 point-in-time universe provenance
 
+## Current operating extension — reviewed through 2026-07-21
+
+The original bounded 2023–2024 certification described below is still the
+reproducible base. The active database now also carries a reviewed current path:
+
+- `examples/sp500_events_verified_2025-01_to_2026-07-21.csv` contains 70
+  source-dated addition/deletion or same-security ticker-transition edges.
+  Official S&P DJI announcements control index changes; issuer announcements
+  control ticker-only changes.
+- `examples/sp500_security_transitions_verified_2023-08_to_2026-07-21.csv`
+  preserves the reviewed same-security transitions instead of treating a market
+  label as a permanent identity.
+- reviewed reference batches 21–42 plus the consolidated current manifests
+  extend issuer, SEC CIK, security-owner, and provider-symbol evidence for the
+  2025-current additions/removals.
+- on the 2026-07-20 decision close, 503/503 members have stable security IDs,
+  500/503 have PIT filings, and 503/503 have current action-safe prices. SPY is
+  reviewed through the same close and required macro releases through
+  2026-07-20. `aios readiness` passes with zero hard integrity failures.
+
+This current path does **not** turn the repository into a complete
+1996-present S&P announcement archive. Pre-August-2023 provenance and broader
+delisted histories remain separate long-history work.
+
+### Mid-period held-security evidence
+
+The stateful portfolio exposed two cases that a membership table alone cannot
+solve:
+
+1. Hess stopped trading when Chevron completed its acquisition on 2025-07-18,
+   before the next quarterly rebalance. The reviewed
+   `examples/sp500_security_conversions_verified.csv` row converts HES to CVX at
+   1.025 shares, preserving acquisition date and carry-over basis. Completion
+   and ratio come from Chevron's completion release; basis treatment comes from
+   the filed Chevron/Hess S-4.
+2. MTCH and PAYC left the S&P 500 effective 2026-03-23 but remained listed while
+   already-held positions needed a 2026-03-31 exit price. The reviewed
+   `examples/sp500_liquidation_price_extensions_2026_q1.csv` manifest permits a
+   short provider continuation solely for liquidation. It cannot restore index
+   membership or factor eligibility.
+
+Liquidation-extension import is fail-closed: exact prior security/provider end
+anchors, a maximum 45-day half-open window, complete expected U.S. sessions,
+reviewed dividend/split fields, HTTPS evidence, and a canonical payload hash are
+mandatory. Validation re-hashes stored rows to catch later alteration. The
+MTCH/PAYC manifest was imported on 2026-07-21: two extension records and 16
+price rows, eight expected sessions per security from 2026-03-23 through
+2026-04-01. Every row is action-complete and the stored payloads match their
+canonical hashes. `security_ticker_extensions` now contains both reviewed
+paths.
+
+The exact rebuild/reproduction sequence is:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m aios.cli ingest-liquidation-prices \
+  examples/sp500_liquidation_price_extensions_2026_q1.csv
+
+PYTHONPATH=src .venv/bin/python -m aios.cli backtest-qv \
+  --start 2025-01-01 --end 2026-07-20 \
+  --universe-id sp500 --benchmark SPY --calendar SPY \
+  --factor-model qv --exclude-ticker FDXF --exclude-ticker HONA \
+  --commission-bps 5 --slippage-bps 5 \
+  --output data/backtests/us_pit_2025_to_2026-07-20_qv.json
+
+PYTHONPATH=src .venv/bin/python -m aios.cli validate
+```
+
+The replacement schema-v4 artifact completed all six periods. Its 327
+regime-aware, fixed-QV, and SPY daily observations are date-aligned; strategy
+curves contain no stale values and quarter-to-quarter capital continuity is
+exact. HES converted to CVX on 2025-07-18 at the reviewed 1.025 ratio, while
+MTCH and PAYC were sold on 2026-04-01 through the liquidation-only paths. The
+run used historical membership, PIT macro/fundamentals, 5 bps commission plus
+5 bps slippage per side, and zero tax rates. Regime-aware QV returned 31.13%
+net, fixed QV returned 27.73%, and SPY returned 34.12%; maximum drawdowns were
+-14.69%, -14.69%, and -12.05%. The artifact is
+`data/backtests/us_pit_2025_to_2026-07-20_qv.json`, run
+`ccbff90a-c339-42e8-a9c4-ea93aa7f344d`, database SHA-256
+`86c7ff27df5801f32b08255d40c5e78a41ac73b3c8713e633a01933cd81c51d7`.
+
+This is reproducible held-security and portfolio-accounting evidence, not an
+investment-performance claim. The window is short and in-sample, taxes are
+unset, and SPY outperformed both strategies.
+
 ## Approved coverage
 
 The repository now has a verified event manifest for the bounded window
@@ -21,12 +105,18 @@ The generated local file is
 `data/sp500_membership_2023-08_to_2024-12.csv`. It contains 533 bounded
 membership intervals. There are 503 members on the baseline date and every
 still-active interval ends on 2025-01-01, so a query outside the certified
-window returns no members instead of silently extrapolating history.
+window returns no members instead of silently extrapolating history. The
+current file SHA-256 is
+`319755785298f8b43b3e8432913bd5ba28ff1761c9f94a12bd005a4932a9d03b`.
+Each row independently records when its start became public (`known_date`) and,
+for a finite interval, when its end became public (`end_known_date`).
 
 ## Quality checks and findings
 
 - Required dates and provenance are non-null and ISO-formatted.
-- `known_date <= effective_date` for every event.
+- `known_date <= effective_start` for every interval start.
+- Every finite interval has `end_known_date <= effective_end`; missing or
+  impossible endpoint knowledge is a hard validation failure.
 - Event actions are restricted to `Addition` and `Deletion`.
 - Index announcements must use an HTTPS `press.spglobal.com` URL; issuer
   ticker-change evidence must also be HTTPS and be labeled
@@ -38,6 +128,14 @@ window returns no members instead of silently extrapolating history.
 - A temporary DuckDB import accepted all 533 intervals. Membership counts were
   503 on normal dates, briefly 504/505 during officially staggered spin-offs,
   and zero after 2024-12-31.
+
+The backtest resolves two clocks: the target must be knowable at decision close
+and effective on the scheduled execution session. For the 2024-09-30 decision,
+S&P's 2024-09-24 announcement made BBWI's 2024-10-01 deletion public, so BBWI
+is correctly absent from the 2024-10-01 execution universe. AMTM is effective
+that day but remains an explicit factor exclusion because its first public
+Company Facts evidence arrived later. This is why one `known_date` for the
+whole interval was insufficient.
 
 Three effective-date conflicts were found in the free reference file. The
 official release dates are retained:
@@ -697,10 +795,12 @@ This checkpoint verifies denominator, PIT, execution-cost, and benchmark
 behavior only. It is not an investable S&P 500 backtest and is not evidence of
 regime alpha.
 
-## Final near-complete bounded eligibility and stateful policy audit
+## Superseded near-complete bounded audit and schema-v4 repair
 
 The forced-liquidation schema-v1 baseline was recorded on 2026-07-18. The
-persistent schema-v2 certification was recorded on 2026-07-20.
+persistent schema-v2 audit and the action/provider-basis-corrected schema-v3
+artifact were recorded on 2026-07-20. Both are retained as engineering history,
+not current performance certification.
 
 This is the first rerun after the complete reviewed identity program and the
 factor-correctness repair. The repair requires exact prior-year fiscal-quarter
@@ -731,20 +831,77 @@ Value. The cache is destroyed after each decision and the next call rereads the
 database, so a later filing or identity correction cannot be hidden by stale
 state. The optimized five-decision command completed in about 92 seconds. Its
 entire `result` object and `ticker_explanations` array matched the prior
-schema-v2 artifact exactly before the canonical artifact was regenerated with
-the optimized repository fingerprint.
+schema-v2 artifact exactly before corporate-action provenance was repaired.
+
+The action audit then found that the installed yfinance client had downloaded
+historical rows without `actions=True`. A resumable corrective refresh restored
+dividends and splits for all 509 reviewed yfinance securities and SPY; the 19
+reviewed Tiingo securities already had explicit actions. Every price row now
+declares `actions_complete` and `close_split_adjusted`. Held paths reject
+unknown, incomplete, or mixed provenance. `aios validate` still reports 155,750
+older action-unverified rows as an explicit warning; none is silently admitted
+to an action-aware factor or certified held path.
+
+One intermediate diagnostic reached an impossible 764.69% cumulative return.
+Inspection of WMT, NVDA, and CMG split dates proved that Yahoo's historical
+`Close` series was already split-normalized, so multiplying positions by the
+split ratio applied the same economic event twice. That run was rejected and
+never promoted to the canonical artifact. Schema v3 applies a split ratio only
+when the provider close is declared not split-normalized. The corrected full
+five-decision run completed in about 77 seconds.
+
+A second, independent basis defect was then found in the Value input. Yahoo's
+historical `Close` is not merely safe from double-applied return splits; it is
+rewritten onto the latest split basis. SEC shares and per-share facts remain on
+the contemporaneous basis known at filing. Before NVDA's 2024 10:1 split, for
+example, schema v3 used a roughly $90 normalized close with roughly 2.464
+billion pre-split shares, understating market capitalization by about 10x. The
+same class of error affected other later splitters such as WMT and CMG.
+
+Every reviewed Yahoo row now stores the cumulative later-split factor and the
+date through which splits were scanned. Value restores contemporaneous price
+before combining it with PIT SEC facts. A full corrective refresh completed for
+all 509 reviewed Yahoo securities plus SPY; unresolved reviewed action/factor
+candidates are zero. NVDA on 2024-03-28 now restores from about $90.36 to
+about $903.56 and produces a roughly $2.226 trillion contemporaneous market
+capitalization. Replacement schema-v4 artifacts were required after this
+correction and are recorded below.
+
+QVML also requires pre-window observations. The new factor warm-up workflow
+stores those rows by immutable security ID without inventing a historical
+ticker. Each accepted snapshot must match at least five stored provider-anchor
+sessions on raw close, dividends, splits, declared basis, and normalization
+factor. Retrospective `Adj Close` is hashed but is not an equality gate because
+later dividends legitimately revise it. Blocked predecessor histories and
+insufficient listing histories remain explicit rejections; accepted compressed
+snapshots are hash-checked and imported atomically. The corrected v3 review
+accepted 520/528 identities and imported 122,466 rows. AMTM, GEHC, GEV, KVUE,
+SOLV, and VLTO had fewer than 210 pre-anchor sessions; SW and Healthpeak/DOC
+were blocked by reviewed wrong-security or unavailable predecessor intervals.
+Yahoo's daily split scan-through date is provenance rather than an equality
+field. Every cache reuse still rechecks raw close, dividends, splits, basis, and
+normalization factor against the current stored overlap, so economic drift
+fails closed.
+
+The first schema-v4 QV retry exposed a separate universe-endpoint defect rather
+than a price gap: BBWI was selected at the 2024-09-30 decision even though its
+announced deletion was effective at the 2024-10-01 entry. Membership now stores
+`end_known_date`, and the engine queries membership known at decision close but
+effective on the scheduled entry. The 533-row bounded file was rebuilt and
+reimported with zero finite intervals missing endpoint knowledge.
 
 SPY defines every quarter end, next-session rebalance close, quarter-end close,
 and daily valuation session. Existing positions remain invested between the
 decision close and next-session close; only equal-weight deltas trade. FIFO lots
-and their acquisition dates survive quarter boundaries. Raw closes plus
-explicit splits and dividend cash drive strategy and benchmark valuation. Net
-books and zero-friction shadow books use the same selections; SPY is a
+and their acquisition dates survive quarter boundaries. Declared provider
+closes plus explicit dividends and basis-aware splits drive strategy and
+benchmark valuation. Net books and zero-friction shadow books use the same
+selections; SPY is a
 persistent zero-friction book under the same timing convention.
 
 A missing scheduled entry/exit price rejects the whole atomic transition and
 stops later stateful periods. A missing individual daily mark may carry forward
-and is listed in `stale_tickers`; this certified run had zero stale marks across
+and is listed in `stale_tickers`; this schema-v3 run had zero stale marks across
 all three 316-observation curves. Price paths follow reviewed `security_id`, so
 ticker changes do not become false sales. All five strategy and SPY periods
 completed.
@@ -775,39 +932,91 @@ The 2026-07-18 interval-v1 regression baseline was:
 | Fixed 60/40 QV | 5 | 76.55% | 78.22% | 57.66% | 12.27% | $1,366.76 | 10.59x |
 | Stitched SPY intervals | 5 | 41.49% | 41.49% | 32.04% | 7.66% | $0.00 | N/A |
 
-The 2026-07-20 schema-v2 stateful result is the current certification:
+The 2026-07-20 schema-v3 provider-basis result is a superseded regression artifact:
 
 | Policy | Paired periods | Net cumulative | Gross cumulative | Annualized | Daily annualized volatility | Max drawdown | Modeled costs | Turnover | Daily observations |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Regime-aware QV | 5 | 70.25% | 71.13% | 52.72% | 17.66% | -9.94% | $671.32 | 5.17x | 316 |
-| Fixed 60/40 QV | 5 | 72.58% | 73.51% | 54.37% | 17.31% | -8.32% | $700.79 | 5.37x | 316 |
-| Persistent SPY | 5 | 37.16% | 37.16% | 28.58% | 12.49% | -8.41% | $0.00 | 0.00x | 316 |
+| Regime-aware QV | 5 | 74.25% | 75.14% | 55.56% | 17.62% | -9.87% | $678.13 | 5.16x | 316 |
+| Fixed 60/40 QV | 5 | 76.73% | 77.68% | 57.33% | 17.29% | -8.25% | $707.48 | 5.36x | 316 |
+| Persistent SPY | 5 | 39.47% | 39.47% | 30.31% | 12.46% | -8.41% | $0.00 | 0.00x | 316 |
 
 The two policies selected different top-10 sets on 2023-09-29, 2024-03-28,
-and 2024-06-28; the fixed policy finished 2.32 percentage points ahead in this
+and 2024-06-28; the fixed policy finished 2.48 percentage points ahead in this
 short sample. Every period remained positive, so period win rate is 100%, but
 the daily curves now expose the drawdowns that quarter endpoints hid. Strategy
 turnover and modeled costs roughly halved because unchanged holdings/lots were
-not sold and rebuilt. The SPY number changed because v2 is one continuously
-held raw-price/action book; v1 stitched five adjusted-close intervals and
-omitted each quarter-end-to-next-entry transition.
+not sold and rebuilt. The SPY number changed from v1 because the stateful books
+hold one continuous provider-close/action path; v1 stitched five adjusted-close
+intervals and omitted each quarter-end-to-next-entry transition.
 
-These values are pipeline diagnostics, not investable performance or evidence
-that either policy has alpha. The window is short and in-sample; tax rates were
+These values must not be cited as current performance because their Value
+rankings predate the contemporaneous-price restoration. They remain useful for
+testing persistent holdings, tax lots, costs, and daily curves. The window is
+also short and in-sample; tax rates were
 zero; wash sales, cross-bucket offsets, carryforwards, and filing calendars are
 not modeled. The earlier batch checkpoints also used older factor logic,
 changing eligible samples, and interval accounting, so they are preserved as
 engineering history rather than like-for-like strategy comparisons.
 
-The canonical local gitignored schema-v2 audit is
+The superseded local gitignored schema-v3 audit is
 `data/backtests/qv_sp500_pit_2023-08_2024-12.json`. The preserved v1 baseline is
 `data/backtests/qv_sp500_pit_2023-08_2024-12_interval_v1.json` with SHA-256
 `44ee2921118971c318048377615d87d4873dcf189a1c7e0cfbdc806d65811aaa`.
 Each audit records a unique run ID, runtime, base commit, tracked-diff SHA-256,
 untracked-tree SHA-256, dirty-worktree flag, and DuckDB SHA-256
-`1584cad36f0231ee14f538cc02ddc75189d497608dc61a2736e130f269dda0cd`.
-The database hash is independently matched against the closed file after every
-certification run.
+`42357d704cff9fbf13abee253a9e0c68cd869e1745820aab4d370eb36dac689f`.
+The database hash was independently matched against the closed file for that
+historical run. The replacement schema-v4 artifacts below use a new shared
+database snapshot and new evidence hashes.
+
+### Current matched schema-v4 engineering audits (2026-07-21)
+
+After the split/share-basis, warm-up, and membership-end repairs, QV and QVML
+were rerun from the same closed DuckDB snapshot. Both commands used the bounded
+S&P 500 universe, SPY calendar and benchmark, top 10, $100,000 initial capital,
+5 bps commission plus 5 bps slippage per side, no fixed fee, zero tax rates,
+required PIT macro evidence, and explicit PEAK/WRK/AMTM exclusions. All five
+strategy periods and SPY periods completed with 316 aligned daily observations.
+
+Membership below is the target known at decision close and effective on the
+listed entry session:
+
+| Decision | Entry | Execution members | Raw complete | QV eligible | Momentum/Low Vol scored | QVML eligible |
+|---|---|---:|---:|---:|---:|---:|
+| 2023-09-29 | 2023-10-02 | 504 | 501 | 291 | 499 | 291 |
+| 2023-12-29 | 2024-01-02 | 503 | 500 | 293 | 498 | 293 |
+| 2024-03-28 | 2024-04-01 | 504 | 502 | 350 | 498 | 347 |
+| 2024-06-28 | 2024-07-01 | 503 | 502 | 308 | 496 | 307 |
+| 2024-09-30 | 2024-10-01 | 503 | 502 | 300 | 497 | 300 |
+
+| Policy | Net cumulative | Gross cumulative | Annualized | Daily annualized volatility | Max drawdown | Modeled costs | Turnover |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Regime-aware QV | 51.12% | 51.92% | 38.90% | 16.87% | -8.35% | $625.80 | 5.33x |
+| Fixed 60/40 QV | 50.98% | 51.72% | 38.79% | 16.15% | -8.01% | $573.47 | 4.97x |
+| Regime-aware QVML | 24.97% | 25.80% | 19.41% | 14.20% | -11.08% | $737.24 | 6.68x |
+| Fixed QVML | 34.96% | 35.69% | 26.94% | 12.53% | -7.95% | $615.88 | 5.52x |
+| Persistent SPY | 39.47% | 39.47% | 30.31% | 12.46% | -8.41% | $0.00 | 0.00x |
+
+The immutable local evidence is:
+
+- QV run `faad1b5a-134d-4b40-b016-9352d4e9a1b6`, artifact
+  `data/backtests/qv_sp500_pit_schema_v4_2023-08_2024-12.json`, SHA-256
+  `10446a5bdff7e0347b2e975304b15283c2de57c968adc43bde3c54b29fd68db4`;
+- QVML run `9f5fb3ac-551d-4ce0-a56f-8f8d66f9ef41`, artifact
+  `data/backtests/qvml_sp500_pit_schema_v4_2023-08_2024-12.json`, SHA-256
+  `102eaee31d9961ffae859440fd12babf9d453bef14020c677714e9c16bb97f49`;
+  and
+- shared DuckDB SHA-256
+  `72dc91c41840855536e3ad24ca27865ecbb7b6d973628992cac543e7a9f7a869`.
+
+Both artifacts stamp commit `3fd3e6db67f1a1c02fbd096b4f0803666627a450`
+and the exact dirty-worktree fingerprints used for the runs. QV completed in
+about 107 seconds and QVML in about 132 seconds on this checkout.
+
+QV was stronger than QVML in this five-decision window; regime-aware QVML was
+also weaker than fixed QVML. This is useful negative engineering evidence. The
+window is short, in-sample, and pre-tax, so these numbers neither certify alpha
+nor justify tuning QVML weights to improve this sample.
 
 ## Remaining limitations
 
@@ -818,9 +1027,9 @@ certification run.
 - Daily marks use stored EOD data. Scheduled execution and period-end prices
   fail closed; intermediate absent marks carry forward with an explicit stale
   flag. The certified window had zero stale strategy or SPY marks.
-- The 500-name factor path takes roughly three minutes per decision date on the
-  current local database. Query batching/caching is an optimization target, but
-  it must preserve the certified PIT and identity behavior.
+- The current matched schema-v4 QV/QVML audits take about 107/132 seconds on
+  this local checkout. Keep profiling, but never trade PIT or identity safety
+  for speed.
 - Exact announcement provenance before August 2023 is not complete.
 - The historical reference is community-maintained and its own README warns
   that early rows may be incomplete. Official events override it only inside

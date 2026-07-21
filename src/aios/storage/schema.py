@@ -69,6 +69,10 @@ CREATE TABLE IF NOT EXISTS prices (
     volume          BIGINT,
     dividends       DOUBLE DEFAULT 0,
     split_ratio     DOUBLE DEFAULT 1,
+    actions_complete BOOLEAN DEFAULT FALSE, -- provider response included actions
+    close_split_adjusted BOOLEAN,        -- whether close already reflects splits
+    split_normalization_factor DOUBLE,   -- restores contemporaneous price basis
+    split_normalization_through DATE,    -- last date scanned for later splits
     source          VARCHAR DEFAULT 'yfinance',
     fetched_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (ticker, date)
@@ -233,11 +237,96 @@ CREATE TABLE IF NOT EXISTS provider_symbol_history (
     PRIMARY KEY (provider, security_id, data_start)
 );
 
+-- Reviewed share-for-share events that replace one listed security with
+-- another during a holding period.  These are deliberately separate from
+-- ticker changes: a conversion changes the immutable security identity and
+-- must carry explicit public-date, ratio, basis, and source evidence.
+CREATE TABLE IF NOT EXISTS security_conversions (
+    source_security_id VARCHAR NOT NULL,
+    target_security_id VARCHAR NOT NULL,
+    effective_date     DATE NOT NULL,
+    known_date         DATE NOT NULL,
+    share_ratio        DOUBLE NOT NULL,
+    basis_policy       VARCHAR NOT NULL,
+    review_status      VARCHAR NOT NULL,
+    verified_date      DATE NOT NULL,
+    source             VARCHAR NOT NULL, -- completion/date/ratio evidence
+    basis_source       VARCHAR NOT NULL, -- carry-over basis/holding-period evidence
+    fetched_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (source_security_id)
+);
+
+-- Short, reviewed ticker/provider continuations used only to liquidate a
+-- position after its index-membership interval ends. They never make the
+-- security factor-eligible and cannot be used to backdate membership.
+CREATE TABLE IF NOT EXISTS security_ticker_extensions (
+    provenance_id   VARCHAR PRIMARY KEY,
+    universe_id     VARCHAR NOT NULL,
+    security_id     VARCHAR NOT NULL,
+    ticker          VARCHAR NOT NULL,
+    provider        VARCHAR NOT NULL,
+    provider_symbol VARCHAR NOT NULL,
+    data_start      DATE NOT NULL,
+    data_end        DATE NOT NULL,
+    verified_date   DATE NOT NULL,
+    identity_source VARCHAR NOT NULL,
+    provider_source VARCHAR NOT NULL,
+    payload_sha256  VARCHAR NOT NULL,
+    purpose         VARCHAR NOT NULL,
+    review_policy   VARCHAR NOT NULL,
+    fetched_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ======================================================================
+-- Reviewed factor-price warm-up history.
+--   These rows intentionally do not carry a market ticker. A provider may
+--   expose history from before our certified universe/ticker interval, and
+--   backdating that ticker would create false identity evidence. Instead, an
+--   immutable security_id is anchored to an already reviewed provider series
+--   by an overlap comparison whose hashes are retained here.
+-- ======================================================================
+CREATE TABLE IF NOT EXISTS factor_price_provenance (
+    provenance_id   VARCHAR PRIMARY KEY,
+    universe_id     VARCHAR NOT NULL,
+    security_id     VARCHAR NOT NULL,
+    provider        VARCHAR NOT NULL,
+    provider_symbol VARCHAR NOT NULL,
+    data_start      DATE NOT NULL,
+    data_end        DATE NOT NULL,       -- half-open; reviewed mapping anchor
+    overlap_start   DATE NOT NULL,
+    overlap_end     DATE NOT NULL,
+    verified_date   DATE NOT NULL,
+    source          VARCHAR NOT NULL,
+    payload_sha256  VARCHAR NOT NULL,
+    overlap_sha256  VARCHAR NOT NULL,
+    review_policy   VARCHAR NOT NULL,
+    fetched_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS factor_prices (
+    security_id     VARCHAR NOT NULL,
+    date            DATE NOT NULL,
+    provider        VARCHAR NOT NULL,
+    provider_symbol VARCHAR NOT NULL,
+    close           DOUBLE NOT NULL,
+    adj_close       DOUBLE,
+    dividends       DOUBLE NOT NULL DEFAULT 0,
+    split_ratio     DOUBLE NOT NULL DEFAULT 1,
+    actions_complete BOOLEAN NOT NULL,
+    close_split_adjusted BOOLEAN NOT NULL,
+    split_normalization_factor DOUBLE NOT NULL,
+    split_normalization_through DATE,
+    provenance_id   VARCHAR NOT NULL,
+    fetched_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (security_id, date)
+);
+
 -- ======================================================================
 -- Historical investable-universe membership.
 --   effective_* = when membership applies to the portfolio universe.
---   known_date  = when that membership interval became publicly knowable.
---   The two dates are intentionally separate to prevent membership look-ahead.
+--   known_date  = when the membership start became publicly knowable.
+--   end_known_date = when a finite membership end became publicly knowable.
+--   Effective and knowledge dates stay separate to prevent membership look-ahead.
 -- ======================================================================
 CREATE TABLE IF NOT EXISTS universe_membership (
     universe_id     VARCHAR NOT NULL,
@@ -246,6 +335,7 @@ CREATE TABLE IF NOT EXISTS universe_membership (
     effective_start DATE NOT NULL,
     effective_end   DATE,
     known_date      DATE NOT NULL,
+    end_known_date  DATE,
     source          VARCHAR NOT NULL,
     fetched_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (universe_id, ticker, effective_start)
@@ -266,5 +356,9 @@ EXPECTED_TABLES = (
     "issuer_cik_history",
     "security_issuer_assignments",
     "provider_symbol_history",
+    "security_conversions",
+    "security_ticker_extensions",
+    "factor_price_provenance",
+    "factor_prices",
     "universe_membership",
 )

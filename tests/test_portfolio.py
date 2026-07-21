@@ -176,6 +176,75 @@ def test_split_dividend_and_daily_equity_use_raw_accounting(tmp_path):
         store.close()
 
 
+def test_portfolio_refuses_action_unverified_price_path(tmp_path):
+    store = Store(tmp_path / "unverified-action-path.duckdb")
+    try:
+        store.upsert_prices(
+            [
+                {
+                    "ticker": "A",
+                    "date": observation_date,
+                    "close": price,
+                    "source": "stooq",
+                    "actions_complete": False,
+                }
+                for observation_date, price in (
+                    ("2024-03-28", 100.0),
+                    ("2024-04-01", 100.0),
+                    ("2024-06-28", 110.0),
+                )
+            ]
+        )
+
+        result = _book(store).advance_period(
+            ("A",),
+            date(2024, 3, 28),
+            date(2024, 4, 1),
+            date(2024, 6, 28),
+        )
+
+        assert result.period_return is None
+        assert any("unverified_corporate_actions" in item for item in result.missing)
+    finally:
+        store.close()
+
+
+def test_split_normalized_close_does_not_multiply_shares_again(tmp_path):
+    store = Store(tmp_path / "split-normalized-close.duckdb")
+    try:
+        store.upsert_prices(
+            [
+                {
+                    "ticker": "A",
+                    "date": observation_date,
+                    "close": price,
+                    "split_ratio": split,
+                    "actions_complete": True,
+                    "close_split_adjusted": True,
+                    "source": "yfinance",
+                }
+                for observation_date, price, split in (
+                    ("2024-03-28", 100.0, 1.0),
+                    ("2024-04-01", 100.0, 1.0),
+                    ("2024-05-01", 101.0, 10.0),
+                    ("2024-06-28", 110.0, 1.0),
+                )
+            ]
+        )
+
+        result = _book(store).advance_period(
+            ("A",),
+            date(2024, 3, 28),
+            date(2024, 4, 1),
+            date(2024, 6, 28),
+        )
+
+        assert result.ending_equity == pytest.approx(1_100.0)
+        assert result.open_tax_lots == 1
+    finally:
+        store.close()
+
+
 def test_stable_security_identity_prevents_false_ticker_change_sale(tmp_path):
     store = Store(tmp_path / "ticker-change-book.duckdb")
     security_id = "aios:security:renamed"
@@ -300,5 +369,260 @@ def test_mid_period_data_failure_rolls_back_entire_book(tmp_path):
         assert book.cash == before_cash
         assert next(iter(book.positions.values())).quantity == before_quantity
         assert book.last_date == date(2024, 6, 28)
+    finally:
+        store.close()
+
+
+def test_portfolio_state_round_trip_and_mark_only_advance(tmp_path):
+    store = Store(tmp_path / "paper-state-round-trip.duckdb")
+    try:
+        store.upsert_prices(
+            [
+                {
+                    "ticker": "A",
+                    "date": observation_date,
+                    "close": price,
+                    "adj_close": price,
+                    "actions_complete": True,
+                    "close_split_adjusted": False,
+                    "source": "test",
+                }
+                for observation_date, price in (
+                    ("2024-03-28", 100.0),
+                    ("2024-04-01", 100.0),
+                    ("2024-06-28", 110.0),
+                    ("2024-07-01", 115.0),
+                )
+            ]
+        )
+        book = _book(
+            store,
+            transaction_costs=TransactionCostPolicy(commission_bps=5),
+        )
+        book.advance_period(
+            ("A",),
+            date(2024, 3, 28),
+            date(2024, 4, 1),
+            date(2024, 6, 28),
+        )
+
+        restored = PortfolioBook.from_state(store, book.to_state())
+        new_points = restored.mark_through(date(2024, 7, 1))
+
+        assert restored.to_state()["positions"] == book.to_state()["positions"]
+        assert restored.current_weights()["A"] > 0.99
+        assert [point.date for point in new_points] == [date(2024, 7, 1)]
+        assert restored.last_date == date(2024, 7, 1)
+        assert restored.equity > book.equity
+    finally:
+        store.close()
+
+
+def test_portfolio_state_rejects_missing_mark_for_open_position(tmp_path):
+    store = Store(tmp_path / "invalid-paper-state.duckdb")
+    try:
+        state = _book(store).to_state()
+        state["positions"] = [
+            {
+                "key": "ticker:A",
+                "ticker": "A",
+                "security_id": None,
+                "lots": [
+                    {
+                        "ticker": "A",
+                        "quantity": 1.0,
+                        "cost_basis_per_share": 100.0,
+                        "acquired_date": "2024-01-01",
+                    }
+                ],
+            }
+        ]
+
+        with pytest.raises(ValueError, match="missing a position mark price"):
+            PortfolioBook.from_state(store, state)
+    finally:
+        store.close()
+
+
+def test_reviewed_stock_conversion_preserves_book_and_tax_lot(tmp_path):
+    store = Store(tmp_path / "stock-conversion.duckdb")
+    source_security_id = "aios:security:old"
+    target_security_id = "aios:security:new"
+    memberships = [
+        {
+            "universe_id": "demo",
+            "ticker": ticker,
+            "effective_start": "2024-01-01",
+            "effective_end": None,
+            "known_date": "2024-01-01",
+            "source": "https://example.com/membership",
+        }
+        for ticker in ("OLD", "NEW")
+    ]
+    try:
+        store.upsert_universe_membership(memberships)
+        store.upsert_security_identities(
+            [
+                {
+                    **membership,
+                    "security_id": (
+                        source_security_id
+                        if membership["ticker"] == "OLD"
+                        else target_security_id
+                    ),
+                    "identity_status": "bounded_ticker",
+                }
+                for membership in memberships
+            ]
+        )
+        store.upsert_security_conversions(
+            [
+                {
+                    "source_security_id": source_security_id,
+                    "target_security_id": target_security_id,
+                    "effective_date": "2024-05-01",
+                    "known_date": "2024-05-01",
+                    "share_ratio": 2.0,
+                    "basis_policy": "carryover",
+                    "review_status": "verified",
+                    "verified_date": "2024-06-01",
+                    "source": "https://www.sec.gov/Archives/example.htm",
+                    "basis_source": "https://www.sec.gov/Archives/basis.htm",
+                }
+            ]
+        )
+        store.upsert_prices(
+            [
+                {
+                    "ticker": ticker,
+                    "security_id": security_id,
+                    "date": observation_date,
+                    "close": price,
+                    "adj_close": price,
+                    "actions_complete": True,
+                    "close_split_adjusted": False,
+                    "source": "test",
+                }
+                for ticker, security_id, observation_date, price in (
+                    ("MKT", None, "2024-03-28", 100.0),
+                    ("MKT", None, "2024-04-01", 100.0),
+                    ("MKT", None, "2024-05-01", 100.0),
+                    ("MKT", None, "2024-06-28", 100.0),
+                    ("OLD", source_security_id, "2024-04-01", 100.0),
+                    ("OLD", source_security_id, "2024-04-30", 110.0),
+                    ("NEW", target_security_id, "2024-05-01", 60.0),
+                    ("NEW", target_security_id, "2024-06-28", 66.0),
+                )
+            ]
+        )
+
+        book = _book(store, calendar_ticker="MKT")
+        result = book.advance_period(
+            ("OLD",),
+            date(2024, 3, 28),
+            date(2024, 4, 1),
+            date(2024, 6, 28),
+        )
+
+        assert result.missing == ()
+        assert result.ending_equity == pytest.approx(1_320.0)
+        assert result.ending_holdings == ("NEW",)
+        assert len(result.conversions) == 1
+        assert result.conversions[0].source_quantity == pytest.approx(10.0)
+        assert result.conversions[0].target_quantity == pytest.approx(20.0)
+        position = next(iter(book.positions.values()))
+        assert position.lots[0].acquired_date == date(2024, 4, 1)
+        assert position.lots[0].cost_basis_per_share == pytest.approx(50.0)
+        assert book.to_state()["conversions"][0]["target_ticker"] == "NEW"
+    finally:
+        store.close()
+
+
+def test_paper_mark_through_applies_reviewed_stock_conversion(tmp_path):
+    store = Store(tmp_path / "paper-conversion.duckdb")
+    source_security_id = "aios:security:old"
+    target_security_id = "aios:security:new"
+    memberships = [
+        {
+            "universe_id": "demo",
+            "ticker": ticker,
+            "effective_start": "2024-01-01",
+            "effective_end": None,
+            "known_date": "2024-01-01",
+            "source": "https://example.com/membership",
+        }
+        for ticker in ("OLD", "NEW")
+    ]
+    try:
+        store.upsert_universe_membership(memberships)
+        store.upsert_security_identities(
+            [
+                {
+                    **membership,
+                    "security_id": (
+                        source_security_id
+                        if membership["ticker"] == "OLD"
+                        else target_security_id
+                    ),
+                    "identity_status": "bounded_ticker",
+                }
+                for membership in memberships
+            ]
+        )
+        store.upsert_security_conversions(
+            [
+                {
+                    "source_security_id": source_security_id,
+                    "target_security_id": target_security_id,
+                    "effective_date": "2024-05-01",
+                    "known_date": "2024-05-01",
+                    "share_ratio": 2.0,
+                    "basis_policy": "carryover",
+                    "review_status": "verified",
+                    "verified_date": "2024-06-01",
+                    "source": "https://www.sec.gov/Archives/example.htm",
+                    "basis_source": "https://www.sec.gov/Archives/basis.htm",
+                }
+            ]
+        )
+        store.upsert_prices(
+            [
+                {
+                    "ticker": ticker,
+                    "security_id": security_id,
+                    "date": observation_date,
+                    "close": price,
+                    "adj_close": price,
+                    "actions_complete": True,
+                    "close_split_adjusted": False,
+                    "source": "test",
+                }
+                for ticker, security_id, observation_date, price in (
+                    ("MKT", None, "2024-03-28", 100.0),
+                    ("MKT", None, "2024-04-01", 100.0),
+                    ("MKT", None, "2024-04-30", 100.0),
+                    ("MKT", None, "2024-05-01", 100.0),
+                    ("MKT", None, "2024-06-28", 100.0),
+                    ("OLD", source_security_id, "2024-04-01", 100.0),
+                    ("OLD", source_security_id, "2024-04-30", 110.0),
+                    ("NEW", target_security_id, "2024-05-01", 60.0),
+                    ("NEW", target_security_id, "2024-06-28", 66.0),
+                )
+            ]
+        )
+        book = _book(store, calendar_ticker="MKT")
+        invested = book.advance_period(
+            ("OLD",),
+            date(2024, 3, 28),
+            date(2024, 4, 1),
+            date(2024, 4, 30),
+        )
+        assert invested.missing == ()
+
+        points = book.mark_through(date(2024, 6, 28))
+
+        assert points[-1].equity == pytest.approx(1_320.0)
+        assert tuple(book.current_weights()) == ("NEW",)
+        assert len(book.conversions) == 1
     finally:
         store.close()

@@ -85,6 +85,123 @@ as the final fallback.
 
 ---
 
+## PRODUCT DIRECTION — INDIA-FIRST, US AS THE REFERENCE BUILD
+
+The completed product is intended primarily for Indian public equities. The
+current U.S. implementation is the first audited reference market: finish it,
+use it to prove the PIT, identity, factor, cost, risk, and monitoring contracts,
+then reuse those contracts for India. Do not mix partially reviewed NSE/BSE
+data into the U.S. universe merely to appear multi-market.
+
+U.S. completion is the active engineering scope. India schema/adapters remain
+deferred until the U.S. current-date readiness, monitored paper, holdout, and
+operator/deployment gates are complete.
+
+The factor, portfolio, risk, reporting, and validation cores must remain
+market-neutral. Market-specific behavior belongs in a configured market
+profile or provider adapter:
+
+| Concern | U.S. reference today | Portable contract required for India |
+|---|---|---|
+| Instruments | SEC/security/provider identities | market, exchange, currency, stable security ID, dated provider symbols |
+| Fundamentals | SEC EDGAR adapters | reviewed filing adapter with public availability dates |
+| Prices/actions | reviewed Yahoo/Tiingo/Stooq paths | reviewed EOD and corporate-action adapters |
+| Universe | bounded S&P 500 membership | independently sourced NSE/BSE/index membership with announcement and effective dates |
+| Calendar/benchmark | explicit SPY sessions and benchmark | configured exchange calendar and benchmark; never hard-coded in factor logic |
+| Macro | release-aware FRED series | India-specific release-aware series selected through a market profile |
+| Costs/taxes/broker | caller-supplied U.S. research scenarios | separate user-approved India account, tax, fee, and broker policy |
+
+The current schema and adapters are not yet India-ready: several source
+defaults are U.S.-specific and market/exchange/currency are not first-class on
+every required row. Before Indian data ingestion, add those dimensions and
+provider interfaces with migration and parity tests. Do not encode `.NS`/`.BO`
+symbol conventions, INR assumptions, exchange holidays, or tax rules directly
+inside factor calculations.
+
+### Deployment and operator contract
+
+The owner should not need to administer DuckDB or understand Streamlit. Those
+are replaceable implementation details behind supported commands and the
+`Store` boundary. The deployment milestone is not complete until it provides:
+
+- one documented setup, start, stop, upgrade, backup, restore, and health-check
+  workflow;
+- environment-based configuration and secrets, with a persistent mounted data
+  directory that survives upgrades;
+- startup schema migrations plus `aios doctor` and `aios validate` gates;
+- `aios dashboard` as the supported local launcher and future container
+  entrypoint, exposing one dashboard URL without direct Streamlit commands;
+- safe single-instance DuckDB operation for local/paper use, and a storage
+  migration path behind `aios.storage.store.Store` if multi-user concurrency is
+  later required; and
+- versioned market profiles so switching from the U.S. reference build to India
+  selects adapters/configuration rather than forks the factor or risk engine.
+
+The current checkout remains a local supervised research and paper-simulation
+beta. `aios dashboard` hides Streamlit and the CLI hides DuckDB for ordinary
+use. `aios health`, `aios backup`, `aios verify-backup`, and confirmed
+`aios restore` provide fail-visible health and recovery. `aios
+refresh-us-current` sequentially refreshes prices, SEC filings, SPY, and macro
+only for already reviewed identities; membership announcements remain a manual
+provenance gate. Confirmed systemd-user installation adds weekday current-data,
+weekly filing, and weekly verified-backup timers plus status/pause/resume/remove
+commands. Generated units pass `systemd-analyze verify` and are not installed
+implicitly. The owner explicitly installed them on 2026-07-21; real manual
+first runs of backup, prices/macro, and filings passed. Raw refresh may use the
+newest reviewed membership snapshot up to seven days old for collection while
+showing the exact snapshot date; readiness still refuses to treat it as a
+current membership decision. A reviewed issuer with no accepted Company Facts
+is retried and reported as pending; zero rows for an established issuer remain
+a hard failure. A dashboard must be closed during scheduled writes because
+DuckDB is single-process. Container/hosted packaging, authentication, HTTPS,
+external alerts, multi-user storage, and India market adapters remain future exit
+conditions—not capabilities to assume today.
+
+### Untouched forward-policy contract
+
+Forward evidence must distinguish changing public inputs from changing research
+rules. `forward-freeze` therefore fingerprints the QV and macro-regime logic,
+portfolio/risk/cost/tax rules, U.S. calendar, readiness gate, and paper workflow,
+and stores the reviewed target count and policy configuration in a
+checksum-protected local document. It registers each later proposal by payload
+checksum. `forward-status` fails on missing/changed policy files, changed
+cost/tax configuration, altered registered proposals, or unregistered new
+proposals; the CLI refuses simulated execution while that drift exists.
+
+DuckDB is intentionally outside the policy checksum. Prices, filings, macro
+vintages, and reviewed membership must continue to advance under their existing
+PIT/provenance contracts. A deliberate policy change starts a new trial rather
+than rewriting the old baseline.
+
+### U.S. operational readiness and generic risk contract
+
+Raw recency and certified readiness are separate states. `aios readiness`
+checks a requested date against database integrity, dated S&P 500 membership,
+stable security identities, PIT filing coverage, identity-safe prices,
+action/split evidence, SPY calendar/benchmark freshness, and release-aware
+macro evidence. `paper` also requires a recent decision date and returns a
+non-zero exit status if any blocking gate fails. `historical_research` may pass
+inside an older bounded window without claiming that it is current.
+
+As of 2026-07-21, the reviewed current decision close is 2026-07-20. It has 503
+dated members and stable identities, 500/503 PIT filing coverage, 503/503
+identity-safe/action-safe price coverage, SPY through the same close, and macro
+releases through 2026-07-20. Current supervised paper readiness passes with zero
+hard database failures and three visible historical-audit warnings.
+
+`aios.risk.policy` is a deterministic, jurisdiction-neutral pre-trade contract.
+It rejects malformed or duplicate targets, short/leverage exposure, too few or
+too many positions, single-name and sector concentration, excessive one-way
+turnover, missing/oversized liquidity evidence, and a breached portfolio
+drawdown. These conservative defaults are not personalized limits and do not
+authorize orders. The local `aios.paper` workflow calls both data readiness and
+portfolio risk before it persists a proposal, ties the proposal to hashed
+factor/account evidence, and requires a reviewed next-session close plus
+explicit `--confirm-simulated` before changing simulated holdings. It contains
+no broker credential or order path.
+
+---
+
 ## DATA ARCHITECTURE (how the pieces connect)
 
 ```
@@ -174,12 +291,14 @@ convention.
 ### Historical universe and membership PIT contract
 
 `universe_membership` is the backtest universe boundary. Each row stores a
-half-open effective interval `[effective_start, effective_end)`, the date that
-membership became publicly knowable (`known_date`), and source provenance.
-For a decision date `D`, `Store.universe_membership_on()` requires both
-`known_date <= D` and an active effective interval. It is not valid to replace
-`known_date` with `effective_start`: index changes are often announced before
-they take effect.
+half-open effective interval `[effective_start, effective_end)`, the date its
+start became public (`known_date`), the independently public date of a finite
+end (`end_known_date`), and source provenance. `Store.universe_membership_on()`
+uses one date for both knowledge and effect. The backtest instead calls
+`universe_membership_known_on(universe, decision, execution)`: starts and ends
+must be known at the decision close, while membership must be effective when
+the scheduled trade occurs. It is not valid to replace either knowledge date
+with an effective date.
 
 `aios import-universe path.csv` is the controlled input. The importer rejects
 missing known dates, invalid intervals, and unsupported columns; the storage
@@ -189,13 +308,15 @@ bounded baseline, replays announced additions/deletions as a state machine,
 supports re-entry, reconciles every event identity against an independent span
 source, and refuses missing or contradictory boundaries. Small official event
 manifests live under `examples/`; bulk source/output data stays gitignored.
+Finite intervals without `end_known_date` are a hard data-quality failure.
 
-The currently audited S&P 500 manifest covers 2023-08-01 through 2024-12-31.
-Issuer announcements identify same-security ticker transitions; S&P Global
-releases identify index decisions. Three one-to-two-day conflicts in the free
-reference spans are retained as explicit warnings and resolved to official
-release dates. See `SP500_DATA_PROVENANCE.md`. This bounded slice is suitable
-for software validation, not a full-history investable performance claim.
+The original audited S&P 500 manifest covers 2023-08-01 through 2024-12-31.
+Reviewed event/reference batches extend the current operating path through
+2026-07-21. Issuer announcements identify same-security ticker transitions;
+S&P Global releases identify index decisions. Three one-to-two-day conflicts in
+the free reference spans are retained as explicit warnings and resolved to
+official release dates. See `SP500_DATA_PROVENANCE.md`. Neither slice claims a
+complete 1996-present announcement archive or investable performance history.
 
 ### Stable security identity contract
 
@@ -244,6 +365,26 @@ security-owner intervals, with eight yfinance intervals. It safely joins
 ABC→COR and FLT→CPAY price history, permits Healthpeak `DOC` only from
 2024-03-04, and permits Smurfit Westrock `SW` only from 2024-07-08. DAY and
 retired WRK history remain explicitly unavailable from the reviewed provider.
+
+### Held-security conversion and liquidation contract
+
+Universe membership and portfolio ownership are separate. A security may leave
+an index while an already-held position still needs a priced exit. The engine
+must not solve this by extending membership or reintroducing factor eligibility.
+
+`security_conversions` records a reviewed identity-changing share event with
+source/target security IDs, effective and known dates, share ratio, basis
+policy, and separate event/basis evidence. The first event is HES→CVX on
+2025-07-18 at 1.025 CVX shares per HES share. The portfolio transfers quantity,
+acquisition date, and carry-over basis and records a conversion audit row.
+
+`security_ticker_extensions` is the narrow alternative for a removed security
+that remains listed. It can extend only from an exact prior identity/provider
+end anchor, for at most 45 calendar days, with complete scheduled sessions,
+reviewed actions/split basis, HTTPS sources, and a canonical payload hash. The
+extension is visible to held-position pricing only; membership and factor reads
+remain unchanged. `aios validate` recomputes the payload hash so a later price
+overwrite cannot silently change accepted backtest evidence.
 
 The second reviewed manifest adds 25 unchanged full-window securities. It was
 generated by `aios build-reference-batch`, accepted 25/25 candidates, and was
@@ -374,10 +515,73 @@ returning:
   become visible without manual cache invalidation.
 
 The 2023-09-29 503-member profile dropped from 42,235 DuckDB queries and 174.1
-seconds to 3,874 queries and 17.4 seconds. The optimized five-decision bounded
-run completed in about 92 seconds. Its full result and ticker-explanation JSON
-matched the pre-optimization schema-v2 certification exactly; performance is
-not allowed to change PIT eligibility, scores, selections, or accounting.
+seconds to 3,874 queries and 17.4 seconds. The first optimized five-decision
+bounded run completed in about 92 seconds and exactly matched its pre-cache
+payload. The later schema-v3 run completed in about 77 seconds, but its Value
+rankings were subsequently superseded by the split/share-basis correction
+described below. Performance changes are allowed only when an explicitly
+versioned data or accounting correction explains them.
+
+### Contemporaneous price basis and factor warm-up contract
+
+Yahoo retrospectively split-normalizes historical `Close`. SEC shares and
+per-share facts remain on the basis known at their filing date. Combining those
+inputs directly understates pre-split market capitalization and distorts Value.
+Each reviewed Yahoo row therefore stores `split_normalization_factor`, the
+cumulative split ratio after that row through `split_normalization_through`.
+Value restores `Close × split_normalization_factor`; return paths continue to
+use Yahoo's internally consistent normalized close and never apply the same
+split twice. Unknown factors fail validation.
+
+Momentum and Low Volatility also need observations before the bounded universe
+window. That history cannot justify backdating a market ticker. The separate
+`factor_price_provenance` and `factor_prices` tables therefore enforce:
+
+- warm-up rows carry immutable `security_id`, provider, and provider symbol,
+  but intentionally no ticker;
+- each snapshot ends exactly at the start of an existing verified provider
+  mapping and compares at least five fresh overlap sessions with stored reviewed
+  `Close`, dividends, splits, basis, and normalization factor;
+- Yahoo's daily split scan-through date is retained as provenance but is not an
+  identity equality field. Cache reuse rechecks the hashed economic overlap
+  against current stored rows, so a real basis change still fails closed;
+- retrospective `Adj Close` is retained in the snapshot hash but is not an
+  equality gate because later dividends legitimately revise it and QVML does
+  not consume it;
+- blocked/wrong-security predecessor intervals and insufficient listing history
+  remain explicit rejections;
+- accepted compressed snapshots and overlap evidence are hashed, resumable, and
+  imported atomically; and
+- factor reads may union this security-level history only when the decision date
+  itself has an active verified mapping for that security. Provider gaps still
+  fail closed.
+
+The v3 review completed on 2026-07-21: 520/528 identities passed and 122,466
+security-keyed rows were imported. AMTM, GEHC, GEV, KVUE, SOLV, and VLTO lacked
+210 pre-anchor sessions; SW and Healthpeak/DOC were blocked by reviewed
+wrong-security/unavailable predecessor intervals. No transient or economic-
+overlap rejection remained.
+
+### Market factors and QVML publication contract
+
+Momentum and Low Volatility are additive; QV remains the preserved backtest
+default:
+
+- Momentum is 12-minus-1 total return: 253 trading-session observations with
+  the most recent 21 sessions skipped;
+- Low Volatility is the annualized sample standard deviation of the latest 252
+  daily total returns, ranked so lower volatility scores higher;
+- both require a latest observation no more than seven calendar days before
+  the decision, complete corporate-action fields, and one consistent declared
+  split-adjustment basis across the window;
+- QVML preserves the regime-relative Q/V tilt inside a 60% core, then adds 25%
+  Momentum and 15% Low Volatility; and
+- QVML is published only when Q, V, M, and L all exist. Missing factors are
+  never reweighted away.
+
+Across the five certified execution universes, valid Momentum/Low-Volatility
+counts are 499, 498, 498, 496, and 497; complete QVML counts are 291, 293, 347,
+307, and 300. This is coverage evidence, not a QVML performance claim.
 
 ### Cost, tax, and benchmark contract
 
@@ -389,15 +593,17 @@ compatibility harness:
   across decision dates;
 - commission and slippage are charged only on traded rebalance deltas;
 - fixed fees are charged once per non-zero order and deducted from book cash;
-- raw `close`, dividends, and split ratios drive both daily valuation and tax
-  accounting, preventing adjusted-price/dividend double counting;
+- provider `close` and explicit dividends drive daily valuation and tax
+  accounting; each row declares whether close is already split-normalized, and
+  split ratios are applied only when it is not, preventing both omitted and
+  double-counted corporate actions;
 - buy costs enter lot basis and sell costs reduce proceeds; realized gains use
   FIFO holding periods, while gains/losses net within each short/long bucket
   over the run and dividends accrue tax at the supplied rate;
 - net and zero-friction shadow books use the same selection schedule instead of
   approximating gross return by adding costs back; and
 - benchmarks are explicit persistent zero-friction books on the same calendar,
-  execution dates, raw-price/action convention, and daily sessions.
+  execution dates, provider-basis/action convention, and daily sessions.
 
 Wash sales, cross-bucket offsets, carryforwards, filing timing, and other
 jurisdiction-specific rules remain out of scope and must not be implied by the
@@ -414,16 +620,20 @@ turnover, order evidence, open-lot counts, and daily equity observations.
 
 ### QV policy-validation backtest
 
-`aios backtest-qv` compares the regime-aware QV ranking with the same-date,
-fixed 60/40 ranking. Each quarter uses only factor, macro, and historical
+`aios backtest-qv` compares the regime-aware QV or opt-in QVML ranking with its
+same-date fixed baseline. Each quarter uses only factor, macro, and historical
 membership evidence known at the decision date, selects equal-weight top-N
 holdings, keeps prior positions invested through the next-session close, and
 then trades only the target-weight deltas. Quarter boundaries and every daily
-valuation session come from one explicit market-calendar ticker. Price paths
+valuation session come from one explicit market-calendar ticker. The target
+membership is known at the decision close but effective on that scheduled
+entry session; this prevented the September 2024 decision from buying BBWI
+after its announced October 1 removal. Price paths
 use immutable security IDs, so a reviewed ticker change does not become a false
 sale or missing delisting. Historical membership is required by default.
-`--allow-current-universe` is available only as an explicitly labeled
-survivorship-biased diagnostic. Each schema-v2 result records the member-list
+`--factor-model qvml` activates the four-sleeve eligibility and weights; QV
+remains the default. `--allow-current-universe` is available only as an
+explicitly labeled survivorship-biased diagnostic. Each schema-v4 result records the member-list
 hash, raw coverage, factor eligibility/exclusion reasons, macro snapshot,
 ranked selections, orders, ending holdings/lots, daily net/gross/benchmark
 curves, data-quality report, database hash, and Git state in optional JSON.
@@ -452,15 +662,42 @@ reasons. Five strategy periods and five SPY observations completed on identical
 dates. Regime-aware QV returned 74.24% net versus fixed 60/40 at 76.55% and SPY
 at 41.49%. It is retained as the forced-liquidation regression baseline.
 
-The schema-v2 stateful rerun on 2026-07-20 preserved every selection and
+The provider-basis schema-v3 rerun on 2026-07-20 preserved every selection and
 eligibility count while carrying positions/lots and producing 316 aligned daily
-observations. Regime-aware returned 70.25% net (71.13% gross), fixed 60/40
-returned 72.58% net (73.51% gross), and persistent SPY returned 37.16%. Daily
-max drawdowns were -9.94%, -8.32%, and -8.41%; strategy turnover fell from
-10.58x/10.59x to 5.17x/5.37x. This is better execution-pipeline evidence, not
-validated alpha or an investable claim: the sample remains short and in-sample,
-tax rates are zero, and jurisdiction-specific tax rules are unresolved. See
-`SP500_DATA_PROVENANCE.md` for exact assumptions and evidence.
+observations. Regime-aware returned 74.25% net (75.14% gross), fixed 60/40
+returned 76.73% net (77.68% gross), and persistent SPY returned 39.47%. Daily
+max drawdowns were -9.87%, -8.25%, and -8.41%; strategy turnover was
+5.16x/5.36x. The earlier schema-v2 result is superseded because its yfinance
+downloads omitted explicit actions; a subsequent impossible 764.69% diagnostic
+was rejected when it exposed double-applied splits on Yahoo's already
+split-normalized closes. It was later superseded: the return path was
+basis-correct, but Value still combined retrospectively normalized historical
+closes with contemporaneous SEC shares for securities that split later. The
+stored close-restoration factors now repair that input. No schema-v3 strategy
+return is current certification; the replacement schema-v4 QV and QVML audits
+below completed that engineering gate.
+See `SP500_DATA_PROVENANCE.md` for exact assumptions and evidence.
+
+The matched schema-v4 audits completed on 2026-07-21 after the warm-up and
+membership-end knowledge repairs. Both use the same DuckDB SHA-256, five paired
+periods, 316 daily observations, 5+5 bps per-side costs, zero taxes, SPY, and
+explicit PEAK/WRK/AMTM exclusions. Regime-aware/fixed QV returned 51.12%/50.98%
+net with -8.35%/-8.01% max drawdown; regime-aware/fixed QVML returned
+24.97%/34.96% with -11.08%/-7.95% drawdown; SPY returned 39.47% with -8.41%
+drawdown. This is short in-sample engineering evidence. It does not certify
+alpha and it is not a basis for optimizing QVML weights.
+
+The newer 2025-01-01 through 2026-07-20 stateful QV engineering audit completed
+all six periods on 2026-07-21 after the reviewed MTCH/PAYC liquidation-only
+extensions were imported. It contains 327 exactly aligned regime-aware, fixed,
+and SPY observations, no stale strategy points, exact state continuity, the
+2025-07-18 HES→CVX conversion, and 2026-04-01 MTCH/PAYC exits. With 5 bps
+commission plus 5 bps slippage per side and zero taxes, regime-aware QV returned
+31.13% net, fixed QV returned 27.73%, and SPY returned 34.12%; maximum drawdowns
+were -14.69%, -14.69%, and -12.05%. This proves the stateful PIT, held-security,
+cost, and benchmark paths for the reviewed window. It is short in-sample
+engineering evidence, not alpha evidence, an after-tax result, or a basis for
+real-money use.
 
 ### Open-source design review
 
@@ -485,7 +722,8 @@ The implementation borrows contracts and ideas, not copied code:
 ## WHAT WE DELIBERATELY DO NOT BUILD (yet)
 
 - No real-time/intraday. Daily EOD only.
-- No broker API integration (no live trading). Manual entry of holdings for now.
+- No broker API integration or live trading. The local paper account changes
+  only through an explicitly confirmed simulated next-session close.
 - No multi-agent committee. Numeric models only; LLM synthesizes.
 - The current UI is a local Streamlit ranking dashboard; it is read-only and
   does not place trades. A richer web product remains out of scope.

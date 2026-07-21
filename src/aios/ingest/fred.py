@@ -20,7 +20,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from aios.config import settings
 from aios.ingest.http_client import get_http
-from aios.storage.store import get_store
+from aios.storage.store import Store, get_store
 
 log = get_logger(__name__)
 
@@ -264,9 +264,13 @@ def _chunks(values: list[date], size: int) -> list[list[date]]:
     return [values[offset : offset + size] for offset in range(0, len(values), size)]
 
 
-def ingest_macro(series_ids: list[str] | None = None) -> int:
+def ingest_macro(
+    series_ids: list[str] | None = None,
+    *,
+    store: Store | None = None,
+) -> int:
     """Fetch + store macro series. Defaults to all MACRO_SERIES + Treasury fallback."""
-    store = get_store()
+    store = store or get_store()
     started_at = datetime.now()
     run_id = str(uuid4())
     total = 0

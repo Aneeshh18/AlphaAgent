@@ -1,0 +1,2 @@
+source_security_id,target_security_id,effective_date,known_date,share_ratio,basis_policy,review_status,verified_date,source,basis_source
+aios:bounded:sp500:hes,aios:bounded:sp500:cvx,2025-07-18,2025-07-18,1.025,carryover,verified,2026-07-21,https://www.chevron.com/newsroom/2025/q3/chevron-completes-acquisition-of-hess-corporation,https://www.sec.gov/Archives/edgar/data/93410/000119312524046223/d576159ds4.htm

@@ -1,0 +1,2 @@
+provider,provider_symbol,security_id,data_start,data_end,mapping_status,verified_date,source
+yfinance,XOM,aios:bounded:sp500:xom,2025-01-01,2026-07-22,verified,2026-07-21,https://query1.finance.yahoo.com/v8/finance/chart/XOM

@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import date, datetime
+from math import isfinite
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -23,6 +24,10 @@ import duckdb
 from structlog import get_logger
 
 from aios.config import settings
+from aios.price_provenance import (
+    canonical_price_payload_hash,
+    normalize_extension_price_row,
+)
 from aios.storage.schema import MACRO_TABLE_SQL, SCHEMA_SQL
 
 if TYPE_CHECKING:
@@ -47,6 +52,7 @@ class Store:
         self._migrate_macro_schema()
         self._migrate_security_identity_schema()
         self._migrate_reference_identity_columns()
+        self._migrate_price_action_schema()
         log.info("schema.initialized", db=str(self.db_path))
 
     def _migrate_security_identity_schema(self) -> None:
@@ -54,6 +60,8 @@ class Store:
         columns = {row["column_name"] for row in self.query("DESCRIBE universe_membership")}
         if "security_id" not in columns:
             self.execute("ALTER TABLE universe_membership ADD COLUMN security_id VARCHAR")
+        if "end_known_date" not in columns:
+            self.execute("ALTER TABLE universe_membership ADD COLUMN end_known_date DATE")
 
     def _migrate_reference_identity_columns(self) -> None:
         """Add nullable issuer/provider links without rewriting legacy rows."""
@@ -72,6 +80,43 @@ class Store:
             for column, data_type in expected.items():
                 if column not in columns:
                     self.execute(f"ALTER TABLE {table} ADD COLUMN {column} {data_type}")
+
+    def _migrate_price_action_schema(self) -> None:
+        """Track whether a provider response actually included action fields.
+
+        Older yfinance downloads used its ``actions=False`` default, so their
+        zero dividends and unit split ratios are unknown rather than verified
+        zeroes. Tiingo has always returned explicit action fields in this
+        project and can be safely marked complete during the additive upgrade.
+        """
+        columns = {row["column_name"] for row in self.query("DESCRIBE prices")}
+        if "actions_complete" not in columns:
+            self.execute("ALTER TABLE prices ADD COLUMN actions_complete BOOLEAN DEFAULT FALSE")
+            self.execute("UPDATE prices SET actions_complete = TRUE WHERE source = 'tiingo'")
+        if "close_split_adjusted" not in columns:
+            self.execute("ALTER TABLE prices ADD COLUMN close_split_adjusted BOOLEAN")
+            self.execute(
+                """
+                UPDATE prices
+                SET close_split_adjusted = CASE
+                    WHEN source = 'yfinance' THEN TRUE
+                    WHEN source IN ('tiingo', 'stooq', 'test') THEN FALSE
+                    ELSE NULL
+                END
+                """
+            )
+        columns = {row["column_name"] for row in self.query("DESCRIBE prices")}
+        if "split_normalization_factor" not in columns:
+            self.execute("ALTER TABLE prices ADD COLUMN split_normalization_factor DOUBLE")
+            self.execute(
+                """
+                UPDATE prices
+                SET split_normalization_factor = 1.0
+                WHERE close_split_adjusted IS FALSE
+                """
+            )
+        if "split_normalization_through" not in columns:
+            self.execute("ALTER TABLE prices ADD COLUMN split_normalization_through DATE")
 
     def _migrate_macro_schema(self) -> None:
         """Upgrade the pre-vintage macro table without silently losing data.
@@ -187,9 +232,9 @@ class Store:
         """Insert point-in-time universe intervals.
 
         Intervals are half-open: ``[effective_start, effective_end)``. The
-        membership's ``known_date`` must be on or before its effective start;
-        this lets a future announced change exist in storage without making it
-        visible before the event becomes effective.
+        ``known_date`` protects the start and ``end_known_date`` independently
+        protects a finite end. Legacy callers that omit ``end_known_date`` are
+        declaring that the whole supplied interval was known at ``known_date``.
         """
         if not rows:
             return 0
@@ -205,10 +250,24 @@ class Store:
             effective_start = _as_date(row["effective_start"])
             known_date = _as_date(row["known_date"])
             effective_end = _as_date(row["effective_end"]) if row.get("effective_end") else None
+            end_known_date = (
+                _as_date(row["end_known_date"])
+                if row.get("end_known_date")
+                else (known_date if effective_end is not None else None)
+            )
             if known_date > effective_start:
                 raise ValueError("universe membership known_date cannot follow effective_start")
             if effective_end is not None and effective_end <= effective_start:
                 raise ValueError("universe membership effective_end must follow its start")
+            if end_known_date is not None and effective_end is None:
+                raise ValueError("open universe membership cannot have end_known_date")
+            if end_known_date is not None and (
+                end_known_date < known_date or end_known_date > effective_end
+            ):
+                raise ValueError(
+                    "universe membership end_known_date must fall between its "
+                    "start known_date and effective_end"
+                )
             normalized.append(
                 {
                     "universe_id": universe_id,
@@ -219,6 +278,7 @@ class Store:
                     "effective_start": effective_start,
                     "effective_end": effective_end,
                     "known_date": known_date,
+                    "end_known_date": end_known_date,
                     "source": source,
                 }
             )
@@ -230,9 +290,10 @@ class Store:
                 """
                 INSERT INTO universe_membership
                 (universe_id, ticker, security_id, effective_start, effective_end,
-                 known_date, source, fetched_at)
+                 known_date, end_known_date, source, fetched_at)
                 SELECT universe_id, ticker, security_id, CAST(effective_start AS DATE),
-                       CAST(effective_end AS DATE), CAST(known_date AS DATE), source, now()
+                       CAST(effective_end AS DATE), CAST(known_date AS DATE),
+                       CAST(end_known_date AS DATE), source, now()
                 FROM _tmp_universe
                 ON CONFLICT (universe_id, ticker, effective_start) DO UPDATE
                 SET security_id = COALESCE(
@@ -240,6 +301,7 @@ class Store:
                     ),
                     effective_end = EXCLUDED.effective_end,
                     known_date = EXCLUDED.known_date,
+                    end_known_date = EXCLUDED.end_known_date,
                     source = EXCLUDED.source,
                     fetched_at = EXCLUDED.fetched_at
                 """
@@ -839,38 +901,502 @@ class Store:
             self._con.unregister("_tmp_owner")
             self._con.unregister("_tmp_provider")
 
+    def upsert_security_conversions(self, rows: list[dict]) -> int:
+        """Atomically import reviewed share-for-share security conversions.
+
+        A conversion is not a ticker alias. It terminates one immutable
+        security position and creates another at an explicitly sourced share
+        ratio. Only reviewed carry-over-basis events are supported here; cash
+        mergers require a separate, jurisdiction-aware accounting policy.
+        """
+        if not rows:
+            raise ValueError("security conversion import requires at least one row")
+
+        clean: list[dict] = []
+        seen_sources: set[str] = set()
+        for row in rows:
+            source_security_id = _required_text(
+                row, "source_security_id", "security conversion"
+            )
+            target_security_id = _required_text(
+                row, "target_security_id", "security conversion"
+            )
+            if source_security_id == target_security_id:
+                raise ValueError("security conversion cannot target the source security")
+            if source_security_id in seen_sources:
+                raise ValueError(
+                    f"duplicate security conversion for {source_security_id!r}"
+                )
+            seen_sources.add(source_security_id)
+            if not row.get("effective_date") or not row.get("known_date"):
+                raise ValueError(
+                    "security conversion requires effective_date and known_date"
+                )
+            effective_date = _as_date(row["effective_date"])
+            known_date = _as_date(row["known_date"])
+            if known_date > effective_date:
+                raise ValueError(
+                    "security conversion known_date cannot follow effective_date"
+                )
+            try:
+                share_ratio = float(row["share_ratio"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("security conversion requires a numeric share_ratio") from exc
+            if not isfinite(share_ratio) or share_ratio <= 0:
+                raise ValueError("security conversion share_ratio must be finite and positive")
+            basis_policy = _required_text(
+                row, "basis_policy", "security conversion"
+            )
+            if basis_policy != "carryover":
+                raise ValueError(
+                    f"unsupported security conversion basis_policy {basis_policy!r}"
+                )
+            review_status = _required_text(
+                row, "review_status", "security conversion"
+            )
+            if review_status != "verified":
+                raise ValueError(
+                    f"unsupported security conversion review_status {review_status!r}"
+                )
+            clean.append(
+                {
+                    "source_security_id": source_security_id,
+                    "target_security_id": target_security_id,
+                    "effective_date": effective_date,
+                    "known_date": known_date,
+                    "share_ratio": share_ratio,
+                    "basis_policy": basis_policy,
+                    "review_status": review_status,
+                    "verified_date": _verified_date(row, "security conversion"),
+                    "source": _required_text(row, "source", "security conversion"),
+                    "basis_source": _required_text(
+                        row, "basis_source", "security conversion"
+                    ),
+                }
+            )
+
+        self._con.register("_tmp_security_conversion", _rows_to_arrowable(clean))
+        self.execute("BEGIN TRANSACTION")
+        try:
+            orphan = self.query(
+                """
+                WITH referenced AS (
+                    SELECT source_security_id AS security_id
+                    FROM _tmp_security_conversion
+                    UNION
+                    SELECT target_security_id AS security_id
+                    FROM _tmp_security_conversion
+                )
+                SELECT referenced.security_id
+                FROM referenced
+                LEFT JOIN security_master AS security USING (security_id)
+                WHERE security.security_id IS NULL
+                LIMIT 1
+                """
+            )
+            if orphan:
+                raise ValueError(
+                    "security conversion uses unknown security_id "
+                    f"{orphan[0]['security_id']!r}"
+                )
+            conflict = self.query(
+                """
+                SELECT existing.source_security_id
+                FROM security_conversions AS existing
+                JOIN _tmp_security_conversion AS incoming
+                  ON incoming.source_security_id = existing.source_security_id
+                WHERE existing.target_security_id <> incoming.target_security_id
+                   OR existing.effective_date <> CAST(incoming.effective_date AS DATE)
+                   OR existing.known_date <> CAST(incoming.known_date AS DATE)
+                   OR existing.share_ratio <> incoming.share_ratio
+                   OR existing.basis_policy <> incoming.basis_policy
+                   OR existing.review_status <> incoming.review_status
+                   OR existing.source <> incoming.source
+                   OR existing.basis_source <> incoming.basis_source
+                LIMIT 1
+                """
+            )
+            if conflict:
+                raise ValueError("security conversion conflicts with existing provenance")
+
+            count = self.execute(
+                """
+                INSERT INTO security_conversions
+                (source_security_id, target_security_id, effective_date,
+                 known_date, share_ratio, basis_policy, review_status,
+                 verified_date, source, basis_source, fetched_at)
+                SELECT source_security_id, target_security_id,
+                       CAST(effective_date AS DATE), CAST(known_date AS DATE),
+                       share_ratio, basis_policy, review_status,
+                       CAST(verified_date AS DATE), source, basis_source, now()
+                FROM _tmp_security_conversion
+                ON CONFLICT (source_security_id) DO UPDATE
+                SET verified_date = EXCLUDED.verified_date,
+                    fetched_at = EXCLUDED.fetched_at
+                """
+            ).fetchone()[0]
+
+            edges = {
+                row["source_security_id"]: row["target_security_id"]
+                for row in self.query(
+                    """
+                    SELECT source_security_id, target_security_id
+                    FROM security_conversions
+                    """
+                )
+            }
+            for origin in edges:
+                visited: set[str] = set()
+                current = origin
+                while current in edges:
+                    if current in visited:
+                        raise ValueError("security conversion graph contains a cycle")
+                    visited.add(current)
+                    current = edges[current]
+
+            self.execute("COMMIT")
+            return int(count)
+        except Exception:
+            self.execute("ROLLBACK")
+            raise
+        finally:
+            self._con.unregister("_tmp_security_conversion")
+
+    def upsert_liquidation_price_extensions(
+        self,
+        rows: list[dict],
+        price_rows: list[dict],
+    ) -> dict[str, int]:
+        """Atomically add short post-membership ticker paths and their prices."""
+        if not rows or not price_rows:
+            raise ValueError("liquidation extensions require provenance and price rows")
+        normalized_extensions: list[dict] = []
+        seen_provenance: set[str] = set()
+        for row in rows:
+            provenance_id = _required_text(
+                row, "provenance_id", "liquidation extension"
+            )
+            if provenance_id in seen_provenance:
+                raise ValueError(f"duplicate liquidation provenance {provenance_id!r}")
+            seen_provenance.add(provenance_id)
+            start, end = _half_open_dates(
+                row,
+                "data_start",
+                "data_end",
+                "liquidation extension",
+            )
+            if end is None:
+                raise ValueError("liquidation extension requires a finite data_end")
+            if (end - start).days > 45:
+                raise ValueError("liquidation extension cannot exceed 45 calendar days")
+            purpose = _required_text(row, "purpose", "liquidation extension")
+            if purpose != "portfolio_liquidation":
+                raise ValueError(f"unsupported liquidation purpose {purpose!r}")
+            review_policy = _required_text(
+                row, "review_policy", "liquidation extension"
+            )
+            if review_policy != "adjacent_identity_provider_v1":
+                raise ValueError(
+                    f"unsupported liquidation review policy {review_policy!r}"
+                )
+            payload_sha256 = _required_text(
+                row, "payload_sha256", "liquidation extension"
+            )
+            if len(payload_sha256) != 64 or any(
+                character not in "0123456789abcdef" for character in payload_sha256
+            ):
+                raise ValueError("liquidation extension has an invalid payload hash")
+            normalized_extensions.append(
+                {
+                    "provenance_id": provenance_id,
+                    "universe_id": _required_text(
+                        row, "universe_id", "liquidation extension"
+                    ),
+                    "security_id": _required_text(
+                        row, "security_id", "liquidation extension"
+                    ),
+                    "ticker": _required_text(
+                        row, "ticker", "liquidation extension"
+                    ).upper(),
+                    "provider": _required_text(
+                        row, "provider", "liquidation extension"
+                    ).lower(),
+                    "provider_symbol": _required_text(
+                        row, "provider_symbol", "liquidation extension"
+                    ).upper(),
+                    "data_start": start,
+                    "data_end": end,
+                    "verified_date": _verified_date(row, "liquidation extension"),
+                    "identity_source": _required_text(
+                        row, "identity_source", "liquidation extension"
+                    ),
+                    "provider_source": _required_text(
+                        row, "provider_source", "liquidation extension"
+                    ),
+                    "payload_sha256": payload_sha256,
+                    "purpose": purpose,
+                    "review_policy": review_policy,
+                }
+            )
+
+        normalized_prices = [normalize_extension_price_row(row) for row in price_rows]
+        extensions_by_id = {
+            row["provenance_id"]: row for row in normalized_extensions
+        }
+        prices_by_id: dict[str, list[dict]] = {}
+        seen_prices: set[tuple[str, str]] = set()
+        for row in normalized_prices:
+            provenance_id = row["provenance_id"]
+            extension = extensions_by_id.get(provenance_id)
+            if extension is None:
+                raise ValueError("liquidation price references unknown provenance")
+            key = (provenance_id, row["date"])
+            if key in seen_prices:
+                raise ValueError(f"duplicate liquidation price {provenance_id}@{row['date']}")
+            seen_prices.add(key)
+            row_date = _as_date(row["date"])
+            if not extension["data_start"] <= row_date < extension["data_end"]:
+                raise ValueError("liquidation price falls outside its reviewed window")
+            for field in ("security_id", "ticker", "provider_symbol"):
+                if row[field] != extension[field]:
+                    raise ValueError(
+                        f"liquidation price {field} disagrees with provenance"
+                    )
+            if row["source"] != extension["provider"]:
+                raise ValueError("liquidation price provider disagrees with provenance")
+            prices_by_id.setdefault(provenance_id, []).append(row)
+        for provenance_id, extension in extensions_by_id.items():
+            payload = prices_by_id.get(provenance_id, [])
+            if not payload:
+                raise ValueError(f"liquidation provenance {provenance_id!r} has no prices")
+            if canonical_price_payload_hash(payload) != extension["payload_sha256"]:
+                raise ValueError("liquidation price payload hash mismatch")
+
+        self._con.register(
+            "_tmp_liquidation_extension",
+            _rows_to_arrowable(normalized_extensions),
+        )
+        self._con.register("_tmp_liquidation_prices", _rows_to_arrowable(normalized_prices))
+        self.execute("BEGIN TRANSACTION")
+        try:
+            invalid_anchor = self.query(
+                """
+                SELECT extension.provenance_id
+                FROM _tmp_liquidation_extension AS extension
+                LEFT JOIN security_master AS security
+                  ON security.security_id = extension.security_id
+                WHERE security.security_id IS NULL
+                   OR NOT EXISTS (
+                       SELECT 1
+                       FROM security_identity_assignments AS identity
+                       WHERE identity.universe_id = extension.universe_id
+                         AND identity.security_id = extension.security_id
+                         AND identity.ticker = extension.ticker
+                         AND identity.effective_end = CAST(extension.data_start AS DATE)
+                   )
+                   OR NOT EXISTS (
+                       SELECT 1
+                       FROM provider_symbol_history AS mapping
+                       WHERE mapping.security_id = extension.security_id
+                         AND mapping.provider = extension.provider
+                         AND mapping.provider_symbol = extension.provider_symbol
+                         AND mapping.mapping_status = 'verified'
+                         AND mapping.data_end = CAST(extension.data_start AS DATE)
+                   )
+                LIMIT 1
+                """
+            )
+            if invalid_anchor:
+                raise ValueError(
+                    "liquidation extension lacks an exact identity/provider end anchor"
+                )
+            conflict = self.query(
+                """
+                SELECT extension.provenance_id
+                FROM _tmp_liquidation_extension AS extension
+                WHERE EXISTS (
+                    SELECT 1 FROM security_ticker_extensions AS existing
+                    WHERE existing.provenance_id = extension.provenance_id
+                      AND (
+                          existing.security_id <> extension.security_id
+                          OR existing.ticker <> extension.ticker
+                          OR existing.provider <> extension.provider
+                          OR existing.provider_symbol <> extension.provider_symbol
+                          OR existing.data_start <> CAST(extension.data_start AS DATE)
+                          OR existing.data_end <> CAST(extension.data_end AS DATE)
+                          OR existing.payload_sha256 <> extension.payload_sha256
+                      )
+                ) OR EXISTS (
+                    SELECT 1 FROM provider_symbol_history AS mapping
+                    WHERE mapping.security_id = extension.security_id
+                      AND mapping.provider = extension.provider
+                      AND mapping.data_start < CAST(extension.data_end AS DATE)
+                      AND COALESCE(mapping.data_end, DATE '9999-12-31')
+                          > CAST(extension.data_start AS DATE)
+                      AND NOT (
+                          mapping.data_start = CAST(extension.data_start AS DATE)
+                          AND mapping.data_end = CAST(extension.data_end AS DATE)
+                          AND mapping.provider_symbol = extension.provider_symbol
+                          AND mapping.mapping_status = 'verified'
+                      )
+                )
+                LIMIT 1
+                """
+            )
+            if conflict:
+                raise ValueError("liquidation extension conflicts with existing provenance")
+            price_conflict = self.query(
+                """
+                SELECT incoming.ticker, incoming.date
+                FROM _tmp_liquidation_prices AS incoming
+                JOIN prices AS existing
+                  ON existing.ticker = incoming.ticker
+                 AND existing.date = CAST(incoming.date AS DATE)
+                WHERE existing.security_id IS NOT NULL
+                  AND existing.security_id <> incoming.security_id
+                LIMIT 1
+                """
+            )
+            if price_conflict:
+                raise ValueError("liquidation price conflicts with another security")
+
+            extension_count = self.execute(
+                """
+                INSERT INTO security_ticker_extensions
+                (provenance_id, universe_id, security_id, ticker, provider,
+                 provider_symbol, data_start, data_end, verified_date,
+                 identity_source, provider_source, payload_sha256, purpose,
+                 review_policy, fetched_at)
+                SELECT provenance_id, universe_id, security_id, ticker, provider,
+                       provider_symbol, CAST(data_start AS DATE), CAST(data_end AS DATE),
+                       CAST(verified_date AS DATE), identity_source, provider_source,
+                       payload_sha256, purpose, review_policy, now()
+                FROM _tmp_liquidation_extension
+                ON CONFLICT (provenance_id) DO UPDATE
+                SET verified_date = EXCLUDED.verified_date,
+                    fetched_at = EXCLUDED.fetched_at
+                """
+            ).fetchone()[0]
+            provider_count = self.execute(
+                """
+                INSERT INTO provider_symbol_history
+                (provider, provider_symbol, security_id, data_start, data_end,
+                 mapping_status, verified_date, source, fetched_at)
+                SELECT provider, provider_symbol, security_id,
+                       CAST(data_start AS DATE), CAST(data_end AS DATE), 'verified',
+                       CAST(verified_date AS DATE), provider_source, now()
+                FROM _tmp_liquidation_extension
+                ON CONFLICT (provider, security_id, data_start) DO UPDATE
+                SET data_end = EXCLUDED.data_end,
+                    verified_date = EXCLUDED.verified_date,
+                    source = EXCLUDED.source,
+                    fetched_at = EXCLUDED.fetched_at
+                """
+            ).fetchone()[0]
+            price_count = self.execute(
+                """
+                INSERT INTO prices
+                (ticker, security_id, provider_symbol, date, open, high, low, close,
+                 adj_close, volume, dividends, split_ratio, actions_complete,
+                 close_split_adjusted, split_normalization_factor,
+                 split_normalization_through, source, fetched_at)
+                SELECT ticker, security_id, provider_symbol, CAST(date AS DATE),
+                       open, high, low, close, adj_close, volume, dividends,
+                       split_ratio, actions_complete, close_split_adjusted,
+                       split_normalization_factor,
+                       CAST(split_normalization_through AS DATE), source, now()
+                FROM _tmp_liquidation_prices
+                ON CONFLICT (ticker, date) DO UPDATE
+                SET security_id = EXCLUDED.security_id,
+                    provider_symbol = EXCLUDED.provider_symbol,
+                    open = EXCLUDED.open,
+                    high = EXCLUDED.high,
+                    low = EXCLUDED.low,
+                    close = EXCLUDED.close,
+                    adj_close = EXCLUDED.adj_close,
+                    volume = EXCLUDED.volume,
+                    dividends = EXCLUDED.dividends,
+                    split_ratio = EXCLUDED.split_ratio,
+                    actions_complete = EXCLUDED.actions_complete,
+                    close_split_adjusted = EXCLUDED.close_split_adjusted,
+                    split_normalization_factor = EXCLUDED.split_normalization_factor,
+                    split_normalization_through = EXCLUDED.split_normalization_through,
+                    source = EXCLUDED.source,
+                    fetched_at = EXCLUDED.fetched_at
+                """
+            ).fetchone()[0]
+            self.execute("COMMIT")
+            return {
+                "extensions": int(extension_count),
+                "provider_symbols": int(provider_count),
+                "prices": int(price_count),
+            }
+        except Exception:
+            self.execute("ROLLBACK")
+            raise
+        finally:
+            self._con.unregister("_tmp_liquidation_extension")
+            self._con.unregister("_tmp_liquidation_prices")
+
     def upsert_prices(self, rows: list[dict]) -> int:
         """Upsert daily prices. Idempotent on (ticker, date)."""
         if not rows:
             return 0
-        normalized = [
-            {
-                "ticker": str(r.get("ticker") or "").strip().upper(),
-                "security_id": r.get("security_id"),
-                "provider_symbol": r.get("provider_symbol"),
-                "date": r.get("date"),
-                "open": r.get("open"),
-                "high": r.get("high"),
-                "low": r.get("low"),
-                "close": r.get("close"),
-                "adj_close": r.get("adj_close"),
-                "volume": r.get("volume"),
-                "dividends": r.get("dividends", 0),
-                "split_ratio": r.get("split_ratio", 1),
-                "source": r.get("source", "yfinance"),
-            }
-            for r in rows
-        ]
+        normalized: list[dict] = []
+        for row in rows:
+            source = str(row.get("source") or "yfinance").strip().lower()
+            close_split_adjusted = row.get("close_split_adjusted")
+            if close_split_adjusted is None and source in {
+                "yfinance",
+                "tiingo",
+                "stooq",
+                "test",
+            }:
+                close_split_adjusted = source == "yfinance"
+            split_normalization_factor = row.get("split_normalization_factor")
+            if split_normalization_factor is None and close_split_adjusted is False:
+                split_normalization_factor = 1.0
+            if split_normalization_factor is not None:
+                split_normalization_factor = float(split_normalization_factor)
+                if not isfinite(split_normalization_factor) or split_normalization_factor <= 0:
+                    raise ValueError("split_normalization_factor must be positive and finite")
+            normalized.append(
+                {
+                    "ticker": str(row.get("ticker") or "").strip().upper(),
+                    "security_id": row.get("security_id"),
+                    "provider_symbol": row.get("provider_symbol"),
+                    "date": row.get("date"),
+                    "open": row.get("open"),
+                    "high": row.get("high"),
+                    "low": row.get("low"),
+                    "close": row.get("close"),
+                    "adj_close": row.get("adj_close"),
+                    "volume": row.get("volume"),
+                    "dividends": row.get("dividends", 0),
+                    "split_ratio": row.get("split_ratio", 1),
+                    "actions_complete": bool(row.get("actions_complete", source == "test")),
+                    "close_split_adjusted": close_split_adjusted,
+                    "split_normalization_factor": split_normalization_factor,
+                    "split_normalization_through": row.get("split_normalization_through"),
+                    "source": source,
+                }
+            )
         self._con.register("_tmp_px", _rows_to_arrowable(normalized))
         n = self._con.execute(
             """
             INSERT INTO prices
             (ticker, security_id, provider_symbol, date, open, high, low, close,
-             adj_close, volume, dividends, split_ratio, source, fetched_at)
+             adj_close, volume, dividends, split_ratio, actions_complete,
+             close_split_adjusted, split_normalization_factor,
+             split_normalization_through, source, fetched_at)
             SELECT
                 ticker, security_id, provider_symbol, CAST(date AS DATE),
                 open, high, low, close, adj_close, volume,
                 COALESCE(dividends, 0), COALESCE(split_ratio, 1),
+                COALESCE(actions_complete, FALSE),
+                close_split_adjusted,
+                split_normalization_factor,
+                CAST(split_normalization_through AS DATE),
                 COALESCE(source, 'yfinance'), now()
             FROM _tmp_px
             ON CONFLICT (ticker, date) DO UPDATE
@@ -886,12 +1412,299 @@ class Store:
                 volume = EXCLUDED.volume,
                 dividends = EXCLUDED.dividends,
                 split_ratio = EXCLUDED.split_ratio,
+                actions_complete = EXCLUDED.actions_complete,
+                close_split_adjusted = EXCLUDED.close_split_adjusted,
+                split_normalization_factor = EXCLUDED.split_normalization_factor,
+                split_normalization_through = EXCLUDED.split_normalization_through,
                 source = EXCLUDED.source,
                 fetched_at = EXCLUDED.fetched_at
             """.strip()
         ).fetchone()[0]
         self._con.unregister("_tmp_px")
         return int(n)
+
+    def upsert_factor_price_warmup(
+        self,
+        provenance_rows: list[dict],
+        price_rows: list[dict],
+    ) -> dict[str, int]:
+        """Atomically import identity-safe, overlap-reviewed factor history.
+
+        Warm-up observations deliberately have no ticker. Their security identity
+        is authorized only by a provenance row anchored exactly at the start of
+        an existing verified provider mapping. Re-importing a reviewed interval
+        replaces that interval's observations so a smaller corrected snapshot
+        cannot leave stale dates behind.
+        """
+        if not provenance_rows:
+            if price_rows:
+                raise ValueError("factor-price rows require provenance")
+            return {"provenance": 0, "factor_prices": 0}
+        if not price_rows:
+            raise ValueError("factor-price provenance has no payload rows")
+
+        normalized_provenance: list[dict] = []
+        seen_provenance: set[str] = set()
+        for row in provenance_rows:
+            provenance_id = _required_text(
+                row, "provenance_id", "factor-price provenance"
+            )
+            if provenance_id in seen_provenance:
+                raise ValueError(f"duplicate factor-price provenance {provenance_id!r}")
+            seen_provenance.add(provenance_id)
+            normalized_provenance.append(
+                {
+                    "provenance_id": provenance_id,
+                    "universe_id": _required_text(
+                        row, "universe_id", "factor-price provenance"
+                    ),
+                    "security_id": _required_text(
+                        row, "security_id", "factor-price provenance"
+                    ),
+                    "provider": _required_text(
+                        row, "provider", "factor-price provenance"
+                    ).lower(),
+                    "provider_symbol": _required_text(
+                        row, "provider_symbol", "factor-price provenance"
+                    ).upper(),
+                    "data_start": row.get("data_start"),
+                    "data_end": row.get("data_end"),
+                    "overlap_start": row.get("overlap_start"),
+                    "overlap_end": row.get("overlap_end"),
+                    "verified_date": row.get("verified_date"),
+                    "source": _required_text(row, "source", "factor-price provenance"),
+                    "payload_sha256": _required_text(
+                        row, "payload_sha256", "factor-price provenance"
+                    ),
+                    "overlap_sha256": _required_text(
+                        row, "overlap_sha256", "factor-price provenance"
+                    ),
+                    "review_policy": _required_text(
+                        row, "review_policy", "factor-price provenance"
+                    ),
+                }
+            )
+
+        normalized_prices: list[dict] = []
+        seen_prices: set[tuple[str, str]] = set()
+        for row in price_rows:
+            security_id = _required_text(row, "security_id", "factor price")
+            row_date = _required_text(row, "date", "factor price")
+            key = (security_id, row_date)
+            if key in seen_prices:
+                raise ValueError(f"duplicate factor price {security_id}@{row_date}")
+            seen_prices.add(key)
+            close = float(row.get("close"))
+            dividends = float(row.get("dividends", 0))
+            split_ratio = float(row.get("split_ratio", 1))
+            factor = float(row.get("split_normalization_factor"))
+            if not isfinite(close) or close <= 0:
+                raise ValueError("factor-price close must be positive and finite")
+            if not isfinite(dividends) or dividends < 0:
+                raise ValueError("factor-price dividends must be non-negative and finite")
+            if not isfinite(split_ratio) or split_ratio <= 0:
+                raise ValueError("factor-price split_ratio must be positive and finite")
+            if not isfinite(factor) or factor <= 0:
+                raise ValueError(
+                    "factor-price split_normalization_factor must be positive and finite"
+                )
+            if row.get("actions_complete") is not True:
+                raise ValueError("factor-price corporate actions must be reviewed")
+            if row.get("close_split_adjusted") not in {True, False}:
+                raise ValueError("factor-price split adjustment basis must be explicit")
+            normalized_prices.append(
+                {
+                    "security_id": security_id,
+                    "date": row_date,
+                    "provider": _required_text(row, "provider", "factor price").lower(),
+                    "provider_symbol": _required_text(
+                        row, "provider_symbol", "factor price"
+                    ).upper(),
+                    "close": close,
+                    "adj_close": row.get("adj_close"),
+                    "dividends": dividends,
+                    "split_ratio": split_ratio,
+                    "actions_complete": True,
+                    "close_split_adjusted": row["close_split_adjusted"],
+                    "split_normalization_factor": factor,
+                    "split_normalization_through": row.get(
+                        "split_normalization_through"
+                    ),
+                    "provenance_id": _required_text(
+                        row, "provenance_id", "factor price"
+                    ),
+                }
+            )
+
+        self._con.register("_tmp_factor_provenance", _rows_to_arrowable(normalized_provenance))
+        self._con.register("_tmp_factor_prices", _rows_to_arrowable(normalized_prices))
+        self.execute("BEGIN TRANSACTION")
+        try:
+            invalid_interval = self.query(
+                """
+                SELECT provenance_id
+                FROM _tmp_factor_provenance
+                WHERE CAST(data_end AS DATE) <= CAST(data_start AS DATE)
+                   OR CAST(overlap_start AS DATE) <> CAST(data_end AS DATE)
+                   OR CAST(overlap_end AS DATE) <= CAST(overlap_start AS DATE)
+                   OR CAST(verified_date AS DATE) > CURRENT_DATE
+                LIMIT 1
+                """
+            )
+            if invalid_interval:
+                raise ValueError("invalid factor-price provenance interval")
+
+            unknown_security = self.query(
+                """
+                SELECT incoming.security_id
+                FROM _tmp_factor_provenance AS incoming
+                LEFT JOIN security_master AS security USING (security_id)
+                WHERE security.security_id IS NULL
+                LIMIT 1
+                """
+            )
+            if unknown_security:
+                raise ValueError(
+                    "factor-price provenance uses unknown security_id "
+                    f"{unknown_security[0]['security_id']!r}"
+                )
+
+            unanchored = self.query(
+                """
+                SELECT incoming.provenance_id
+                FROM _tmp_factor_provenance AS incoming
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM provider_symbol_history AS mapping
+                    WHERE mapping.security_id = incoming.security_id
+                      AND mapping.provider = incoming.provider
+                      AND mapping.provider_symbol = incoming.provider_symbol
+                      AND mapping.mapping_status = 'verified'
+                      AND mapping.data_start = CAST(incoming.data_end AS DATE)
+                )
+                LIMIT 1
+                """
+            )
+            if unanchored:
+                raise ValueError("factor-price provenance lacks an exact verified mapping anchor")
+
+            conflicting_provenance = self.query(
+                """
+                SELECT incoming.provenance_id
+                FROM _tmp_factor_provenance AS incoming
+                JOIN factor_price_provenance AS existing USING (provenance_id)
+                WHERE existing.universe_id IS DISTINCT FROM incoming.universe_id
+                   OR existing.security_id IS DISTINCT FROM incoming.security_id
+                   OR existing.provider IS DISTINCT FROM incoming.provider
+                   OR existing.provider_symbol IS DISTINCT FROM incoming.provider_symbol
+                   OR existing.data_start IS DISTINCT FROM CAST(incoming.data_start AS DATE)
+                   OR existing.data_end IS DISTINCT FROM CAST(incoming.data_end AS DATE)
+                   OR existing.payload_sha256 IS DISTINCT FROM incoming.payload_sha256
+                   OR existing.overlap_sha256 IS DISTINCT FROM incoming.overlap_sha256
+                   OR existing.review_policy IS DISTINCT FROM incoming.review_policy
+                LIMIT 1
+                """
+            )
+            if conflicting_provenance:
+                raise ValueError("factor-price provenance ID conflicts with stored evidence")
+
+            invalid_price = self.query(
+                """
+                SELECT price.security_id
+                FROM _tmp_factor_prices AS price
+                LEFT JOIN _tmp_factor_provenance AS provenance
+                  ON provenance.provenance_id = price.provenance_id
+                WHERE provenance.provenance_id IS NULL
+                   OR price.security_id <> provenance.security_id
+                   OR price.provider <> provenance.provider
+                   OR price.provider_symbol <> provenance.provider_symbol
+                   OR CAST(price.date AS DATE) < CAST(provenance.data_start AS DATE)
+                   OR CAST(price.date AS DATE) >= CAST(provenance.data_end AS DATE)
+                LIMIT 1
+                """
+            )
+            if invalid_price:
+                raise ValueError("factor-price row falls outside its reviewed provenance")
+
+            missing_payload = self.query(
+                """
+                SELECT provenance.provenance_id
+                FROM _tmp_factor_provenance AS provenance
+                LEFT JOIN _tmp_factor_prices AS price USING (provenance_id)
+                GROUP BY provenance.provenance_id
+                HAVING COUNT(price.provenance_id) = 0
+                LIMIT 1
+                """
+            )
+            if missing_payload:
+                raise ValueError("factor-price provenance has no payload rows")
+
+            provenance_count = self.execute(
+                """
+                INSERT INTO factor_price_provenance
+                (provenance_id, universe_id, security_id, provider, provider_symbol,
+                 data_start, data_end, overlap_start, overlap_end, verified_date,
+                 source, payload_sha256, overlap_sha256, review_policy, fetched_at)
+                SELECT provenance_id, universe_id, security_id, provider,
+                       provider_symbol, CAST(data_start AS DATE), CAST(data_end AS DATE),
+                       CAST(overlap_start AS DATE), CAST(overlap_end AS DATE),
+                       CAST(verified_date AS DATE), source, payload_sha256,
+                       overlap_sha256, review_policy, now()
+                FROM _tmp_factor_provenance
+                ON CONFLICT (provenance_id) DO UPDATE
+                SET verified_date = EXCLUDED.verified_date,
+                    source = EXCLUDED.source,
+                    fetched_at = EXCLUDED.fetched_at
+                """
+            ).fetchone()[0]
+
+            self.execute(
+                """
+                DELETE FROM factor_prices AS existing
+                USING _tmp_factor_provenance AS incoming
+                WHERE existing.security_id = incoming.security_id
+                  AND existing.date >= CAST(incoming.data_start AS DATE)
+                  AND existing.date < CAST(incoming.data_end AS DATE)
+                """
+            )
+            price_count = self.execute(
+                """
+                INSERT INTO factor_prices
+                (security_id, date, provider, provider_symbol, close, adj_close,
+                 dividends, split_ratio, actions_complete, close_split_adjusted,
+                 split_normalization_factor, split_normalization_through,
+                 provenance_id, fetched_at)
+                SELECT security_id, CAST(date AS DATE), provider, provider_symbol,
+                       close, adj_close, dividends, split_ratio, actions_complete,
+                       close_split_adjusted, split_normalization_factor,
+                       CAST(split_normalization_through AS DATE), provenance_id, now()
+                FROM _tmp_factor_prices
+                ON CONFLICT (security_id, date) DO UPDATE
+                SET provider = EXCLUDED.provider,
+                    provider_symbol = EXCLUDED.provider_symbol,
+                    close = EXCLUDED.close,
+                    adj_close = EXCLUDED.adj_close,
+                    dividends = EXCLUDED.dividends,
+                    split_ratio = EXCLUDED.split_ratio,
+                    actions_complete = EXCLUDED.actions_complete,
+                    close_split_adjusted = EXCLUDED.close_split_adjusted,
+                    split_normalization_factor = EXCLUDED.split_normalization_factor,
+                    split_normalization_through = EXCLUDED.split_normalization_through,
+                    provenance_id = EXCLUDED.provenance_id,
+                    fetched_at = EXCLUDED.fetched_at
+                """
+            ).fetchone()[0]
+            self.execute("COMMIT")
+            return {
+                "provenance": int(provenance_count),
+                "factor_prices": int(price_count),
+            }
+        except Exception:
+            self.execute("ROLLBACK")
+            raise
+        finally:
+            self._con.unregister("_tmp_factor_provenance")
+            self._con.unregister("_tmp_factor_prices")
 
     def upsert_fundamentals(self, rows: list[dict]) -> int:
         """Upsert fundamentals. CRITICAL: as_of_date must be set per row.
@@ -1182,6 +1995,144 @@ class Store:
             "A price row without close cannot support valuation or returns.",
         )
         add(
+            "prices_unverified_corporate_actions",
+            self.query("SELECT COUNT(*) AS n FROM prices WHERE actions_complete IS NOT TRUE")[0][
+                "n"
+            ],
+            "warn",
+            "Refresh these rows before action-aware factors or after-tax backtests.",
+        )
+        add(
+            "prices_unknown_split_adjustment_basis",
+            self.query("SELECT COUNT(*) AS n FROM prices WHERE close_split_adjusted IS NULL")[0][
+                "n"
+            ],
+            "fail",
+            "Every close must declare whether its provider already normalized splits.",
+        )
+        add(
+            "tagged_prices_unknown_split_normalization_factor",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM prices
+                WHERE security_id IS NOT NULL
+                  AND close_split_adjusted IS TRUE
+                  AND split_normalization_factor IS NULL
+                """
+            )[0]["n"],
+            "fail",
+            "Reviewed split-normalized closes need a factor restoring their contemporaneous basis.",
+        )
+        add(
+            "prices_invalid_split_normalization_factor",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM prices
+                WHERE split_normalization_factor IS NOT NULL
+                  AND split_normalization_factor <= 0
+                """
+            )[0]["n"],
+            "fail",
+            "Split-normalization factors must be positive.",
+        )
+        add(
+            "factor_price_provenance_invalid_intervals",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM factor_price_provenance
+                WHERE data_end <= data_start
+                   OR overlap_start <> data_end
+                   OR overlap_end <= overlap_start
+                   OR NOT regexp_matches(payload_sha256, '^[0-9a-f]{64}$')
+                   OR NOT regexp_matches(overlap_sha256, '^[0-9a-f]{64}$')
+                """
+            )[0]["n"],
+            "fail",
+            "Warm-up provenance needs valid half-open windows and canonical payload hashes.",
+        )
+        add(
+            "factor_price_provenance_future_verification_dates",
+            self.query(
+                """
+                SELECT COUNT(*) AS n FROM factor_price_provenance
+                WHERE verified_date > CURRENT_DATE
+                """
+            )[0]["n"],
+            "fail",
+            "Warm-up evidence cannot be marked reviewed in the future.",
+        )
+        add(
+            "factor_price_provenance_orphans",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM factor_price_provenance AS provenance
+                LEFT JOIN security_master AS security USING (security_id)
+                WHERE security.security_id IS NULL
+                """
+            )[0]["n"],
+            "fail",
+            "Every warm-up snapshot must reference a reviewed security identity.",
+        )
+        add(
+            "factor_price_provenance_unanchored",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM factor_price_provenance AS provenance
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM provider_symbol_history AS mapping
+                    WHERE mapping.security_id = provenance.security_id
+                      AND mapping.provider = provenance.provider
+                      AND mapping.provider_symbol = provenance.provider_symbol
+                      AND mapping.mapping_status = 'verified'
+                      AND mapping.data_start = provenance.data_end
+                )
+                """
+            )[0]["n"],
+            "fail",
+            "Warm-up history must meet an exact reviewed provider-series anchor.",
+        )
+        add(
+            "factor_prices_outside_provenance",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM factor_prices AS price
+                LEFT JOIN factor_price_provenance AS provenance USING (provenance_id)
+                WHERE provenance.provenance_id IS NULL
+                   OR price.security_id <> provenance.security_id
+                   OR price.provider <> provenance.provider
+                   OR price.provider_symbol <> provenance.provider_symbol
+                   OR price.date < provenance.data_start
+                   OR price.date >= provenance.data_end
+                """
+            )[0]["n"],
+            "fail",
+            "Every factor-price row must remain inside its hashed review window.",
+        )
+        add(
+            "factor_prices_invalid_rows",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM factor_prices
+                WHERE close <= 0
+                   OR dividends < 0
+                   OR split_ratio <= 0
+                   OR actions_complete IS NOT TRUE
+                   OR close_split_adjusted IS NULL
+                   OR split_normalization_factor <= 0
+                """
+            )[0]["n"],
+            "fail",
+            "Warm-up factor prices require valid closes, actions, and split basis.",
+        )
+        add(
             "macro_missing_value",
             self.query("SELECT COUNT(*) AS n FROM macro WHERE value IS NULL")[0]["n"],
             "warn",
@@ -1212,9 +2163,42 @@ class Store:
             "Historical universe intervals must have a positive duration.",
         )
         add(
+            "universe_missing_end_known_dates",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM universe_membership
+                WHERE effective_end IS NOT NULL AND end_known_date IS NULL
+                """
+            )[0]["n"],
+            "fail",
+            "Every finite universe interval needs independently dated end knowledge.",
+        )
+        add(
+            "universe_invalid_end_known_dates",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM universe_membership
+                WHERE end_known_date IS NOT NULL
+                  AND (
+                      effective_end IS NULL
+                      OR end_known_date < known_date
+                      OR end_known_date > effective_end
+                  )
+                """
+            )[0]["n"],
+            "fail",
+            "Membership end knowledge must be after start knowledge and no later than its end.",
+        )
+        add(
             "universe_future_known_dates",
             self.query(
-                "SELECT COUNT(*) AS n FROM universe_membership WHERE known_date > CURRENT_DATE"
+                """
+                SELECT COUNT(*) AS n
+                FROM universe_membership
+                WHERE known_date > CURRENT_DATE OR end_known_date > CURRENT_DATE
+                """
             )[0]["n"],
             "fail",
             "Future membership knowledge dates cannot be used in a backtest.",
@@ -1352,6 +2336,128 @@ class Store:
             "Identity evidence cannot be marked verified in the future.",
         )
         add(
+            "security_conversion_invalid_rows",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM security_conversions
+                WHERE source_security_id = target_security_id
+                   OR known_date > effective_date
+                   OR share_ratio <= 0
+                   OR NOT isfinite(share_ratio)
+                   OR basis_policy <> 'carryover'
+                   OR review_status <> 'verified'
+                   OR verified_date > CURRENT_DATE
+                   OR NOT starts_with(source, 'https://')
+                   OR NOT starts_with(basis_source, 'https://')
+                """
+            )[0]["n"],
+            "fail",
+            "Security conversions require reviewed dates, ratios, carry-over "
+            "basis, and HTTPS evidence.",
+        )
+        add(
+            "security_conversion_orphans",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM security_conversions AS conversion
+                LEFT JOIN security_master AS source_security
+                  ON source_security.security_id = conversion.source_security_id
+                LEFT JOIN security_master AS target_security
+                  ON target_security.security_id = conversion.target_security_id
+                WHERE source_security.security_id IS NULL
+                   OR target_security.security_id IS NULL
+                """
+            )[0]["n"],
+            "fail",
+            "Every reviewed conversion endpoint must exist in the security master.",
+        )
+        add(
+            "security_conversion_missing_dated_tickers",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM security_conversions AS conversion
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM security_identity_assignments AS identity
+                    WHERE identity.security_id = conversion.source_security_id
+                      AND identity.effective_start <= conversion.effective_date
+                      AND (
+                          identity.effective_end IS NULL
+                          OR identity.effective_end > conversion.effective_date
+                      )
+                ) OR NOT EXISTS (
+                    SELECT 1
+                    FROM security_identity_assignments AS identity
+                    WHERE identity.security_id = conversion.target_security_id
+                      AND identity.known_date <= conversion.effective_date
+                      AND identity.effective_start <= conversion.effective_date
+                      AND (
+                          identity.effective_end IS NULL
+                          OR identity.effective_end > conversion.effective_date
+                      )
+                )
+                """
+            )[0]["n"],
+            "fail",
+            "Each conversion needs reviewed source and target market labels on its effective date.",
+        )
+        add(
+            "security_ticker_extension_invalid_rows",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM security_ticker_extensions
+                WHERE data_end <= data_start
+                   OR data_end > data_start + INTERVAL 45 DAY
+                   OR verified_date > CURRENT_DATE
+                   OR purpose <> 'portfolio_liquidation'
+                   OR review_policy <> 'adjacent_identity_provider_v1'
+                   OR NOT regexp_matches(payload_sha256, '^[0-9a-f]{64}$')
+                   OR NOT starts_with(identity_source, 'https://')
+                   OR NOT starts_with(provider_source, 'https://')
+                """
+            )[0]["n"],
+            "fail",
+            "Liquidation ticker extensions must be short, reviewed, hashed, and source-backed.",
+        )
+        add(
+            "security_ticker_extension_broken_anchors",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM security_ticker_extensions AS extension
+                LEFT JOIN security_master AS security USING (security_id)
+                WHERE security.security_id IS NULL
+                   OR NOT EXISTS (
+                       SELECT 1 FROM security_identity_assignments AS identity
+                       WHERE identity.universe_id = extension.universe_id
+                         AND identity.security_id = extension.security_id
+                         AND identity.ticker = extension.ticker
+                         AND identity.effective_end = extension.data_start
+                   )
+                   OR NOT EXISTS (
+                       SELECT 1 FROM provider_symbol_history AS mapping
+                       WHERE mapping.security_id = extension.security_id
+                         AND mapping.provider = extension.provider
+                         AND mapping.provider_symbol = extension.provider_symbol
+                         AND mapping.mapping_status = 'verified'
+                         AND mapping.data_end = extension.data_start
+                   )
+                """
+            )[0]["n"],
+            "fail",
+            "Each liquidation path must touch exact prior identity and provider anchors.",
+        )
+        add(
+            "security_ticker_extension_payload_mismatch",
+            self._liquidation_payload_mismatch_count(),
+            "fail",
+            "Every liquidation extension must exactly retain its hashed reviewed price payload.",
+        )
+        add(
             "reference_identity_orphans",
             self.query(
                 """
@@ -1480,6 +2586,15 @@ class Store:
                             OR identity.effective_end > price.date
                         )
                   )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM security_ticker_extensions AS extension
+                      WHERE extension.security_id = price.security_id
+                        AND extension.ticker = price.ticker
+                        AND extension.provider = price.source
+                        AND extension.provider_symbol = price.provider_symbol
+                        AND extension.data_start <= price.date
+                        AND extension.data_end > price.date
+                  )
                 """
             )[0]["n"],
             "fail",
@@ -1534,6 +2649,56 @@ class Store:
             "A fundamentals source returned no rows; inspect the run and issuer mapping.",
         )
         return checks
+
+    def _liquidation_payload_mismatch_count(self) -> int:
+        """Count reviewed liquidation paths whose stored prices changed or vanished."""
+        mismatches = 0
+        extensions = self.query(
+            """
+            SELECT provenance_id, security_id, ticker, provider, provider_symbol,
+                   data_start, data_end, payload_sha256
+            FROM security_ticker_extensions
+            ORDER BY provenance_id
+            """
+        )
+        for extension in extensions:
+            prices = self.query(
+                """
+                SELECT ticker, security_id, provider_symbol, date, open, high, low,
+                       close, adj_close, volume, dividends, split_ratio,
+                       actions_complete, close_split_adjusted,
+                       split_normalization_factor, split_normalization_through,
+                       source
+                FROM prices
+                WHERE security_id = ?
+                  AND ticker = ?
+                  AND source = ?
+                  AND provider_symbol = ?
+                  AND date >= CAST(? AS DATE)
+                  AND date < CAST(? AS DATE)
+                ORDER BY date
+                """,
+                (
+                    extension["security_id"],
+                    extension["ticker"],
+                    extension["provider"],
+                    extension["provider_symbol"],
+                    str(extension["data_start"]),
+                    str(extension["data_end"]),
+                ),
+            )
+            payload = [
+                {**price, "provenance_id": extension["provenance_id"]}
+                for price in prices
+            ]
+            try:
+                actual_hash = canonical_price_payload_hash(payload)
+            except (TypeError, ValueError):
+                mismatches += 1
+                continue
+            if actual_hash != extension["payload_sha256"]:
+                mismatches += 1
+        return mismatches
 
     def purge_legacy_ebitda(self, ticker: str | None = None) -> int:
         """Delete the known-invalid pre-D&A EBITDA metric rows.
@@ -1709,6 +2874,25 @@ class Store:
             return None
         return self.issuer_id_for_security(security_id, as_of)
 
+    def issuer_has_fundamentals(self, issuer_id: str) -> bool:
+        """Return whether an issuer has ever produced accepted Company Facts.
+
+        Current reviewed issuers can exist before their first XBRL facts are
+        published. Refresh orchestration uses this distinction to keep a
+        pre-filing issuer visible as pending without treating an established
+        issuer's unexpectedly empty response as harmless.
+        """
+        rows = self.query(
+            """
+            SELECT 1
+            FROM fundamentals
+            WHERE issuer_id = ?
+            LIMIT 1
+            """,
+            (issuer_id,),
+        )
+        return bool(rows)
+
     def _fundamental_identity_filter(
         self,
         ticker: str,
@@ -1802,7 +2986,14 @@ class Store:
         """Return dated market labels used to relabel provider history."""
         sql = """
             SELECT DISTINCT ticker, effective_start, effective_end
-            FROM security_identity_assignments
+            FROM (
+                SELECT ticker, security_id, effective_start, effective_end
+                FROM security_identity_assignments
+                UNION ALL
+                SELECT ticker, security_id, data_start AS effective_start,
+                       data_end AS effective_end
+                FROM security_ticker_extensions
+            ) AS ticker_history
             WHERE security_id = ?
         """
         params: list[Any] = [security_id]
@@ -1814,6 +3005,68 @@ class Store:
             params.append(str(end))
         sql += " ORDER BY effective_start, ticker"
         return self.query(sql, tuple(params))
+
+    def ticker_for_security_id(
+        self,
+        security_id: str,
+        as_of: date | str,
+    ) -> str | None:
+        """Resolve the reviewed dated market label for an immutable security."""
+        rows = self.query(
+            """
+            SELECT DISTINCT ticker
+            FROM (
+                SELECT ticker, security_id, effective_start, effective_end,
+                       known_date
+                FROM security_identity_assignments
+                UNION ALL
+                SELECT ticker, security_id, data_start AS effective_start,
+                       data_end AS effective_end, data_start AS known_date
+                FROM security_ticker_extensions
+            ) AS ticker_history
+            WHERE security_id = ?
+              AND known_date <= CAST(? AS DATE)
+              AND effective_start <= CAST(? AS DATE)
+              AND (effective_end IS NULL OR effective_end > CAST(? AS DATE))
+            """,
+            (security_id, str(as_of), str(as_of), str(as_of)),
+        )
+        if len(rows) > 1:
+            raise ValueError(f"ambiguous ticker for {security_id}@{as_of}")
+        return rows[0]["ticker"] if rows else None
+
+    def security_conversions_between(
+        self,
+        source_security_ids: list[str] | tuple[str, ...] | set[str],
+        start: date | str,
+        end: date | str,
+    ) -> list[dict]:
+        """Return reviewed identity-changing share events in ``(start, end]``."""
+        normalized = sorted(
+            {
+                str(value).strip()
+                for value in source_security_ids
+                if str(value).strip()
+            }
+        )
+        if not normalized:
+            return []
+        placeholders = ",".join("?" for _ in normalized)
+        return self.query(
+            f"""
+            SELECT source_security_id, target_security_id, effective_date,
+                   known_date, share_ratio, basis_policy, review_status,
+                   verified_date, source, basis_source
+            FROM security_conversions
+            WHERE source_security_id IN ({placeholders})
+              AND effective_date > CAST(? AS DATE)
+              AND effective_date <= CAST(? AS DATE)
+              AND known_date <= effective_date
+              AND review_status = 'verified'
+            ORDER BY effective_date, source_security_id
+            """,
+            (*normalized, str(start), str(end)),
+        )
 
     def pit_fundamentals(
         self,
@@ -2103,23 +3356,268 @@ class Store:
         sql += " ORDER BY date"
         return self.query(sql, tuple(params))
 
-    def universe_membership_on(self, universe_id: str, as_of: date | str) -> list[dict]:
-        """Return members active and publicly known on the decision date."""
+    def pit_factor_price_history(
+        self,
+        ticker: str,
+        as_of: date | str,
+        *,
+        observations: int,
+    ) -> list[dict]:
+        """Return an identity-safe raw-price/action window for market factors.
+
+        The provider policy matches :meth:`latest_price`: once a security has
+        reviewed provider history, a date without an active verified mapping
+        fails closed. Active reviewed securities read by stable ``security_id``
+        so a ticker change cannot break Momentum or Low Volatility. Legacy
+        unreviewed securities retain the ticker path. Rows are returned oldest
+        first and duplicate security/date observations are collapsed to the
+        newest stored copy.
+        """
+        if observations < 2:
+            raise ValueError("factor price history requires at least two observations")
+        normalized_ticker = ticker.upper()
+        security_id = self.security_id_for_ticker(normalized_ticker, as_of)
+        has_reviewed_mapping = False
+        has_active_mapping = False
+        if security_id is not None:
+            mapping_state = self.query(
+                """
+                SELECT COUNT(*) AS reviewed_count,
+                       COUNT(*) FILTER (
+                           WHERE mapping_status = 'verified'
+                             AND data_start <= CAST(? AS DATE)
+                             AND (data_end IS NULL OR data_end > CAST(? AS DATE))
+                       ) AS active_count
+                FROM provider_symbol_history
+                WHERE security_id = ?
+                """,
+                (str(as_of), str(as_of), security_id),
+            )[0]
+            has_reviewed_mapping = mapping_state["reviewed_count"] > 0
+            has_active_mapping = mapping_state["active_count"] > 0
+        if has_reviewed_mapping and not has_active_mapping:
+            return []
+
+        if has_active_mapping:
+            rows = self.query(
+                """
+                WITH combined AS (
+                    SELECT ticker, security_id, date, close, dividends, split_ratio,
+                           actions_complete, close_split_adjusted,
+                           split_normalization_factor, split_normalization_through,
+                           source, fetched_at, 2 AS source_priority
+                    FROM prices
+                    WHERE security_id = ?
+                      AND date <= CAST(? AS DATE)
+                    UNION ALL
+                    SELECT CAST(? AS VARCHAR) AS ticker, security_id, date, close,
+                           dividends, split_ratio, actions_complete,
+                           close_split_adjusted, split_normalization_factor,
+                           split_normalization_through, provider AS source,
+                           fetched_at, 1 AS source_priority
+                    FROM factor_prices
+                    WHERE security_id = ?
+                      AND date <= CAST(? AS DATE)
+                ), deduped AS (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY date
+                        ORDER BY source_priority DESC, fetched_at DESC
+                    ) AS date_rn
+                    FROM combined
+                ), recent AS (
+                    SELECT ticker, security_id, date, close, dividends, split_ratio,
+                           actions_complete, close_split_adjusted,
+                           split_normalization_factor, split_normalization_through, source
+                    FROM deduped
+                    WHERE date_rn = 1
+                    ORDER BY date DESC
+                    LIMIT ?
+                )
+                SELECT ticker, security_id, date, close, dividends, split_ratio,
+                       actions_complete, close_split_adjusted,
+                       split_normalization_factor, split_normalization_through, source
+                FROM recent
+                ORDER BY date
+                """,
+                (
+                    security_id,
+                    str(as_of),
+                    normalized_ticker,
+                    security_id,
+                    str(as_of),
+                    observations,
+                ),
+            )
+        else:
+            rows = self.query(
+                """
+                WITH deduped AS (
+                    SELECT ticker, security_id, date, close, dividends, split_ratio,
+                           actions_complete, close_split_adjusted,
+                           split_normalization_factor, split_normalization_through, source,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY date
+                               ORDER BY fetched_at DESC, ticker DESC
+                           ) AS date_rn
+                    FROM prices
+                    WHERE ticker = ?
+                      AND date <= CAST(? AS DATE)
+                ), recent AS (
+                    SELECT ticker, security_id, date, close, dividends, split_ratio,
+                           actions_complete, close_split_adjusted,
+                           split_normalization_factor, split_normalization_through, source
+                    FROM deduped
+                    WHERE date_rn = 1
+                    ORDER BY date DESC
+                    LIMIT ?
+                )
+                SELECT ticker, security_id, date, close, dividends, split_ratio,
+                       actions_complete, close_split_adjusted,
+                       split_normalization_factor, split_normalization_through, source
+                FROM recent
+                ORDER BY date
+                """,
+                (normalized_ticker, str(as_of), observations),
+            )
+        return rows
+
+    def price_action_refresh_candidates(
+        self,
+        provider: str,
+        start: date | str,
+        end: date | str,
+    ) -> list[str]:
+        """Return reviewed securities with unverified actions in a date window."""
+        rows = self.query(
+            """
+            SELECT DISTINCT price.security_id
+            FROM prices AS price
+            WHERE price.security_id IS NOT NULL
+              AND price.source = ?
+              AND price.date >= CAST(? AS DATE)
+              AND price.date < CAST(? AS DATE)
+              AND (
+                    price.actions_complete IS NOT TRUE
+                    OR (
+                        price.close_split_adjusted IS TRUE
+                        AND price.split_normalization_factor IS NULL
+                    )
+              )
+              AND EXISTS (
+                  SELECT 1
+                  FROM provider_symbol_history AS mapping
+                  WHERE mapping.security_id = price.security_id
+                    AND mapping.provider = price.source
+                    AND mapping.provider_symbol = price.provider_symbol
+                    AND mapping.mapping_status = 'verified'
+                    AND mapping.data_start <= price.date
+                    AND (mapping.data_end IS NULL OR mapping.data_end > price.date)
+              )
+            ORDER BY price.security_id
+            """,
+            (provider.lower(), str(start), str(end)),
+        )
+        return [str(row["security_id"]) for row in rows]
+
+    def unverified_price_action_count(
+        self,
+        security_id: str,
+        provider: str,
+        start: date | str,
+        end: date | str,
+    ) -> int:
+        """Count unresolved action-provenance rows after a corrective fetch."""
+        return int(
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM prices
+                WHERE security_id = ?
+                  AND source = ?
+                  AND date >= CAST(? AS DATE)
+                  AND date < CAST(? AS DATE)
+                  AND (
+                        actions_complete IS NOT TRUE
+                        OR (
+                            close_split_adjusted IS TRUE
+                            AND split_normalization_factor IS NULL
+                        )
+                  )
+                """,
+                (security_id, provider.lower(), str(start), str(end)),
+            )[0]["n"]
+        )
+
+    def unverified_ticker_action_count(
+        self,
+        ticker: str,
+        provider: str,
+        start: date | str,
+        end: date | str,
+    ) -> int:
+        """Count unresolved action rows for an explicit benchmark/calendar ticker."""
+        return int(
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM prices
+                WHERE ticker = ?
+                  AND source = ?
+                  AND date >= CAST(? AS DATE)
+                  AND date < CAST(? AS DATE)
+                  AND (
+                        actions_complete IS NOT TRUE
+                        OR (
+                            close_split_adjusted IS TRUE
+                            AND split_normalization_factor IS NULL
+                        )
+                  )
+                """,
+                (ticker.upper(), provider.lower(), str(start), str(end)),
+            )[0]["n"]
+        )
+
+    def universe_membership_known_on(
+        self,
+        universe_id: str,
+        known_as_of: date | str,
+        effective_on: date | str,
+    ) -> list[dict]:
+        """Return membership known on one date and effective on another."""
         return self.query(
             """
             SELECT universe_id, ticker, effective_start, effective_end,
-                   security_id, known_date, source
+                   security_id, known_date, end_known_date, source
             FROM universe_membership
             WHERE universe_id = ?
               AND known_date <= CAST(? AS DATE)
               AND effective_start <= CAST(? AS DATE)
-              AND (effective_end IS NULL OR effective_end > CAST(? AS DATE))
+              AND (
+                  effective_end IS NULL
+                  OR effective_end > CAST(? AS DATE)
+                  OR end_known_date > CAST(? AS DATE)
+              )
             ORDER BY ticker
             """,
-            (universe_id, str(as_of), str(as_of), str(as_of)),
+            (
+                universe_id,
+                str(known_as_of),
+                str(effective_on),
+                str(effective_on),
+                str(known_as_of),
+            ),
         )
 
-    def universe_data_coverage(self, universe_id: str, as_of: date | str) -> list[dict]:
+    def universe_membership_on(self, universe_id: str, as_of: date | str) -> list[dict]:
+        """Return members active and publicly known on the same date."""
+        return self.universe_membership_known_on(universe_id, as_of, as_of)
+
+    def universe_data_coverage(
+        self,
+        universe_id: str,
+        as_of: date | str,
+        effective_on: date | str | None = None,
+    ) -> list[dict]:
         """Report PIT fundamentals and price availability for each active member.
 
         Reviewed identities use issuer-tagged fundamentals and security-tagged
@@ -2130,7 +3628,7 @@ class Store:
         return self.query(
             """
             WITH decision AS (
-                SELECT CAST(? AS DATE) AS as_of
+                SELECT CAST(? AS DATE) AS as_of, CAST(? AS DATE) AS effective_on
             ), members AS (
                 SELECT membership.universe_id, membership.ticker,
                        membership.security_id, decision.as_of
@@ -2138,10 +3636,11 @@ class Store:
                 CROSS JOIN decision
                 WHERE membership.universe_id = ?
                   AND membership.known_date <= decision.as_of
-                  AND membership.effective_start <= decision.as_of
+                  AND membership.effective_start <= decision.effective_on
                   AND (
                       membership.effective_end IS NULL
-                      OR membership.effective_end > decision.as_of
+                      OR membership.effective_end > decision.effective_on
+                      OR membership.end_known_date > decision.as_of
                   )
             ), identified AS (
                 SELECT members.*,
@@ -2233,7 +3732,7 @@ class Store:
               ON security.security_id = identified.security_id
             ORDER BY identified.ticker
             """,
-            (str(as_of), universe_id),
+            (str(as_of), str(effective_on or as_of), universe_id),
         )
 
     # ------------------------------------------------------------------
@@ -2249,6 +3748,10 @@ class Store:
             "issuer_cik_history",
             "security_issuer_assignments",
             "provider_symbol_history",
+            "security_conversions",
+            "security_ticker_extensions",
+            "factor_price_provenance",
+            "factor_prices",
             "prices",
             "fundamentals",
             "fundamentals_quarantine",

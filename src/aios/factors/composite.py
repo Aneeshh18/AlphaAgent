@@ -22,10 +22,13 @@ from time import perf_counter
 from structlog import get_logger
 
 from aios.factors import common as fc
+from aios.factors.market_factors import compute_market_factors_ranked
 from aios.factors.policy import (
     BASELINE_FACTOR_WEIGHTS,
     MIN_QUALITY_COMPONENTS,
     FactorWeights,
+    QVMLFactorWeights,
+    qvml_weights_for_regime,
     weights_for_regime,
 )
 from aios.factors.quality import compute_quality
@@ -48,10 +51,15 @@ class CompositeRow:
     quality_score: float | None = None
     # Value (0-100)
     value_score: float | None = None
+    momentum_score: float | None = None
+    low_volatility_score: float | None = None
     # Composite QV (0-100)
     qv_score: float | None = None
+    # Experimental four-factor composite. QV remains the certified default.
+    qvml_score: float | None = None
     # Letter grade
     grade: str = "N/A"
+    qvml_grade: str = "N/A"
     # Sub-metrics for display
     quality_components_available: int = 0
     value_multiples_available: int = 0
@@ -66,15 +74,23 @@ class CompositeRow:
     p_b: float | None = None
     market_cap: float | None = None
     price: float | None = None
+    momentum_12_1: float | None = None
+    annualized_volatility: float | None = None
+    market_price_observations: int = 0
     # Macro overlay evidence and the actual weights used for QV.
     macro_regime: str = "unknown"
     quality_weight: float = QUALITY_WEIGHT
     value_weight: float = VALUE_WEIGHT
+    qvml_quality_weight: float = 0.36
+    qvml_value_weight: float = 0.24
+    qvml_momentum_weight: float = 0.25
+    qvml_low_volatility_weight: float = 0.15
     regime_pit_ready: bool = False
     # Rank within universe
     quality_rank: int | None = None
     value_rank: int | None = None
     qv_rank: int | None = None
+    qvml_rank: int | None = None
     missing: list[str] = field(default_factory=list)
 
 
@@ -97,6 +113,8 @@ def compute_composite(
     as_of: str | date,
     store: Store | None = None,
     regime_snapshot: MacroRegimeSnapshot | None = None,
+    *,
+    include_market_factors: bool = False,
 ) -> list[CompositeRow]:
     """Full QV composite ranking for a universe as-of a date.
 
@@ -118,6 +136,7 @@ def compute_composite(
         weights_for_regime(snapshot.regime) if regime_pit_ready else BASELINE_FACTOR_WEIGHTS
     )
     macro_regime = snapshot.regime if regime_pit_ready else "unknown"
+    qvml_weights: QVMLFactorWeights = qvml_weights_for_regime(macro_regime)
 
     # Quality and Value intentionally share one immutable decision-scoped
     # fundamental snapshot. The scope is discarded before this function
@@ -125,10 +144,16 @@ def compute_composite(
     # rows. Public factor function signatures remain unchanged.
     factor_started = perf_counter()
     with fc.factor_cache_scope(store, tickers) as factor_cache:
-        # 1. Value (universe-relative percentile ranks)
+        # 1. Optional price-only factors. Computing these first allows Value to
+        # reuse the latest close from the same identity-safe history window.
+        market_snaps = (
+            compute_market_factors_ranked(tickers, as_of, store) if include_market_factors else {}
+        )
+
+        # 2. Value (universe-relative percentile ranks)
         value_snaps = compute_value_ranked(tickers, as_of, store)
 
-        # 2. Quality per ticker + universe-relative rank
+        # 3. Quality per ticker + universe-relative rank
         q_snaps = {}
         for t in tickers:
             try:
@@ -136,7 +161,7 @@ def compute_composite(
             except Exception as e:
                 log.error("composite.quality_failed", ticker=t, error=str(e))
 
-    # 3. Quality composite score (0-100). Industrial companies use ROIC, FCF
+    # 4. Quality composite score (0-100). Industrial companies use ROIC, FCF
     #    margin, and gross margin. SIC-routed financials use ROE, equity ratio,
     #    and net margin because industrial capital and margin formulas are not
     #    meaningful for deposit-funded businesses. Piotroski is normalized by
@@ -194,20 +219,25 @@ def compute_composite(
             (sum(pcts) / len(pcts) * 100) if len(pcts) >= MIN_QUALITY_COMPONENTS else None
         )
 
-    # 4. Assemble rows
+    # 5. Assemble rows
     rows: list[CompositeRow] = []
     for t in tickers:
         t = t.upper()
         qs = q_snaps.get(t)
         vs = value_snaps.get(t)
+        ms = market_snaps.get(t)
         qscore = quality_scores.get(t)
         vscore = vs.value_score if vs else None
+        momentum_score = ms.momentum_score if ms else None
+        low_volatility_score = ms.low_volatility_score if ms else None
 
         row = CompositeRow(
             ticker=t,
             as_of=as_of,
             quality_score=qscore,
             value_score=vscore,
+            momentum_score=momentum_score,
+            low_volatility_score=low_volatility_score,
             quality_components_available=quality_component_counts.get(t, 0),
             value_multiples_available=vs.multiples_available if vs else 0,
             roic=qs.roic if qs else None,
@@ -221,9 +251,16 @@ def compute_composite(
             p_b=vs.p_b if vs else None,
             market_cap=vs.market_cap if vs else None,
             price=vs.price if vs else None,
+            momentum_12_1=ms.momentum_12_1 if ms else None,
+            annualized_volatility=ms.annualized_volatility if ms else None,
+            market_price_observations=ms.price_observations if ms else 0,
             macro_regime=macro_regime,
             quality_weight=weights.quality,
             value_weight=weights.value,
+            qvml_quality_weight=qvml_weights.quality,
+            qvml_value_weight=qvml_weights.value,
+            qvml_momentum_weight=qvml_weights.momentum,
+            qvml_low_volatility_weight=qvml_weights.low_volatility,
             regime_pit_ready=regime_pit_ready,
         )
         # Composite QV is published only when both sub-factors clear their
@@ -231,18 +268,34 @@ def compute_composite(
         if qscore is not None and vscore is not None:
             row.qv_score = weights.quality * qscore + weights.value * vscore
             row.grade = _grade(row.qv_score)
+        if (
+            row.qv_score is not None
+            and momentum_score is not None
+            and low_volatility_score is not None
+        ):
+            row.qvml_score = (
+                qvml_weights.quality * qscore
+                + qvml_weights.value * vscore
+                + qvml_weights.momentum * momentum_score
+                + qvml_weights.low_volatility * low_volatility_score
+            )
+            row.qvml_grade = _grade(row.qvml_score)
         if row.quality_components_available < MIN_QUALITY_COMPONENTS:
             row.missing.append(f"minimum_quality_components:{MIN_QUALITY_COMPONENTS}")
         if qs and qs.missing:
             row.missing.extend([f"q:{m}" for m in qs.missing])
         if vs and vs.missing:
             row.missing.extend([f"v:{m}" for m in vs.missing])
+        if include_market_factors and ms and ms.missing:
+            row.missing.extend([f"market:{m}" for m in ms.missing])
+        if include_market_factors and ms is None:
+            row.missing.append("market:factor_snapshot_unavailable")
         if not regime_pit_ready:
             row.missing.append("macro_regime_pit_unavailable")
             row.missing.extend([f"macro:{m}" for m in snapshot.missing])
         rows.append(row)
 
-    # 5. Assign ranks within universe
+    # 6. Assign ranks within universe
     def _assign_ranks(field_name: str, rank_field: str) -> None:
         valid = [r for r in rows if getattr(r, field_name) is not None]
         valid.sort(key=lambda r: getattr(r, field_name), reverse=True)
@@ -252,6 +305,7 @@ def compute_composite(
     _assign_ranks("quality_score", "quality_rank")
     _assign_ranks("value_score", "value_rank")
     _assign_ranks("qv_score", "qv_rank")
+    _assign_ranks("qvml_score", "qvml_rank")
 
     rows.sort(key=lambda r: r.qv_score if r.qv_score is not None else -1, reverse=True)
     log.info(
@@ -260,6 +314,7 @@ def compute_composite(
         universe=len(rows),
         elapsed_seconds=round(perf_counter() - factor_started, 3),
         fundamental_snapshots=factor_cache.fundamental_snapshot_count,
+        market_factors=include_market_factors,
         macro_regime=macro_regime,
         quality_weight=weights.quality,
         value_weight=weights.value,

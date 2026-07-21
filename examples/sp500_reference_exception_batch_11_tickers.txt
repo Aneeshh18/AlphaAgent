@@ -1,0 +1,2 @@
+# Same-ticker 1-for-1 successor issuer; reviewed outside the unchanged-issuer path.
+XOM

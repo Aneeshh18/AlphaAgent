@@ -36,7 +36,13 @@ TIINGO_EOD_URL = "https://api.tiingo.com/tiingo/daily/{symbol}/prices"
 # yfinance (primary)
 # ----------------------------------------------------------------------
 def fetch_yfinance(ticker: str, start: str | None = None, end: str | None = None) -> list[dict]:
-    """Fetch EOD prices via yfinance. Returns row dicts."""
+    """Fetch EOD prices and enough later split actions to restore raw basis.
+
+    Yahoo retrospectively split-normalizes historical ``Close``. The bounded
+    rows returned to callers therefore carry the cumulative later-split factor
+    required to recover the price that was actually quoted on each date. The
+    extra rows fetched only for that normalization scan are never returned.
+    """
     try:
         import yfinance as yf
     except ImportError as e:  # pragma: no cover
@@ -44,11 +50,15 @@ def fetch_yfinance(ticker: str, start: str | None = None, end: str | None = None
 
     period_start = start or "1995-01-01"
     period_end = end or date.today().isoformat()
+    requested_start = date.fromisoformat(period_start)
+    requested_end = date.fromisoformat(period_end)
+    normalization_end = max(requested_end, date.today() + timedelta(days=1))
 
     df: pd.DataFrame = yf.download(
         ticker,
         start=period_start,
-        end=period_end,
+        end=normalization_end.isoformat(),
+        actions=True,
         auto_adjust=False,
         progress=False,
         threads=False,
@@ -64,10 +74,11 @@ def fetch_yfinance(ticker: str, start: str | None = None, end: str | None = None
 
     rows: list[dict] = []
     for ts, r in df.iterrows():
+        row_date = ts.date() if hasattr(ts, "date") else date.fromisoformat(str(ts)[:10])
         rows.append(
             {
                 "ticker": ticker.upper(),
-                "date": ts.date().isoformat() if hasattr(ts, "date") else str(ts)[:10],
+                "date": row_date.isoformat(),
                 "open": _f(r.get("Open")),
                 "high": _f(r.get("High")),
                 "low": _f(r.get("Low")),
@@ -76,11 +87,37 @@ def fetch_yfinance(ticker: str, start: str | None = None, end: str | None = None
                 "volume": int(r["Volume"]) if pd.notna(r.get("Volume")) else None,
                 "dividends": _f(r.get("Dividends")) or 0.0,
                 "split_ratio": _f(r.get("Stock Splits")) or 1.0,
+                "actions_complete": True,
+                "close_split_adjusted": True,
+                "split_normalization_factor": None,
+                "split_normalization_through": date.today().isoformat(),
                 "source": "yfinance",
             }
         )
-    log.info("prices.yfinance_fetched", ticker=ticker, rows=len(rows))
-    return rows
+    cumulative_later_splits = 1.0
+    for row in reversed(rows):
+        row["split_normalization_factor"] = cumulative_later_splits
+        split_ratio = float(row["split_ratio"])
+        if split_ratio <= 0:
+            raise ValueError(f"invalid yfinance split ratio for {ticker}: {split_ratio}")
+        cumulative_later_splits *= split_ratio
+
+    # Never certify the local calendar's current date as EOD. Depending on the
+    # server timezone and provider timing it may still be an open/partial U.S.
+    # session. It becomes eligible on the next local day.
+    completed_end = min(requested_end, date.today())
+    bounded = [
+        row
+        for row in rows
+        if requested_start <= date.fromisoformat(row["date"]) < completed_end
+    ]
+    log.info(
+        "prices.yfinance_fetched",
+        ticker=ticker,
+        rows=len(bounded),
+        split_scan_through=date.today().isoformat(),
+    )
+    return bounded
 
 
 # ----------------------------------------------------------------------
@@ -130,6 +167,10 @@ def fetch_stooq(
                 "volume": int(r["Volume"]) if pd.notna(r.get("Volume")) else None,
                 "dividends": 0.0,
                 "split_ratio": 1.0,
+                "actions_complete": False,
+                "close_split_adjusted": False,
+                "split_normalization_factor": 1.0,
+                "split_normalization_through": None,
                 "source": "stooq",
             }
         )
@@ -180,11 +221,13 @@ def fetch_tiingo(
                 "low": _f(raw.get("low")),
                 "close": _f(raw.get("close")),
                 "adj_close": _f(raw.get("adjClose")),
-                "volume": (
-                    int(raw["volume"]) if raw.get("volume") is not None else None
-                ),
+                "volume": (int(raw["volume"]) if raw.get("volume") is not None else None),
                 "dividends": _f(raw.get("divCash")) or 0.0,
                 "split_ratio": _f(raw.get("splitFactor")) or 1.0,
+                "actions_complete": True,
+                "close_split_adjusted": False,
+                "split_normalization_factor": 1.0,
+                "split_normalization_through": None,
                 "source": "tiingo",
             }
         )
@@ -265,9 +308,7 @@ def relabel_provider_price_rows(
             "ticker": str(assignment["ticker"]).upper(),
             "effective_start": _as_date(assignment["effective_start"]),
             "effective_end": (
-                _as_date(assignment["effective_end"])
-                if assignment.get("effective_end")
-                else None
+                _as_date(assignment["effective_end"]) if assignment.get("effective_end") else None
             ),
         }
         for assignment in ticker_assignments
@@ -281,10 +322,7 @@ def relabel_provider_price_rows(
             assignment["ticker"]
             for assignment in normalized_assignments
             if assignment["effective_start"] <= row_date
-            and (
-                assignment["effective_end"] is None
-                or assignment["effective_end"] > row_date
-            )
+            and (assignment["effective_end"] is None or assignment["effective_end"] > row_date)
         }
         if len(active_tickers) != 1:
             raise ValueError(
@@ -336,11 +374,7 @@ def ingest_security_prices(
         all_rows: list[dict] = []
         for mapping in mappings:
             mapping_start = _as_date(mapping["data_start"])
-            mapping_end = (
-                _as_date(mapping["data_end"])
-                if mapping.get("data_end")
-                else date.today()
-            )
+            mapping_end = _as_date(mapping["data_end"]) if mapping.get("data_end") else date.today()
             segment_start = max(
                 value
                 for value in (
@@ -371,9 +405,7 @@ def ingest_security_prices(
                 start=segment_start,
                 end=segment_end,
             )
-            all_rows.extend(
-                relabel_provider_price_rows(raw_rows, mapping, assignments)
-            )
+            all_rows.extend(relabel_provider_price_rows(raw_rows, mapping, assignments))
         inserted = db.upsert_prices(all_rows) if all_rows else 0
         db.record_ingest(
             run_id=run_id,
@@ -397,9 +429,15 @@ def ingest_security_prices(
         raise
 
 
-def ingest_prices(ticker: str, start: str | None = None, end: str | None = None) -> int:
+def ingest_prices(
+    ticker: str,
+    start: str | None = None,
+    end: str | None = None,
+    *,
+    store: Store | None = None,
+) -> int:
     """Fetch + store daily prices for one ticker. Returns rows stored."""
-    store = get_store()
+    store = store or get_store()
     started_at = datetime.now()
     run_id = str(uuid4())
     try:

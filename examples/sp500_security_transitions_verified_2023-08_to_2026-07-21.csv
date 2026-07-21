@@ -1,0 +1,9 @@
+universe_id,security_id,from_ticker,to_ticker,effective_date,known_date,transition_type,source
+sp500,aios:security:cencora-common,ABC,COR,2023-08-30,2023-08-02,ticker_change,https://investor.cencora.com/news/news-details/2023/AmerisourceBergen-Reports-Fiscal-2023-Third-Quarter-Results/default.aspx
+sp500,aios:security:dayforce-common,CDAY,DAY,2024-02-01,2024-01-22,ticker_change,https://investors.dayforce.com/news-and-events/press-releases/press-release-details/2024/Ceridian-to-change-ticker-symbol-to-DAY-on-NYSE-and-TSX-effective-February-1/default.aspx
+sp500,aios:security:healthpeak-common,PEAK,DOC,2024-03-04,2024-03-01,surviving_security_ticker_change,https://www.sec.gov/Archives/edgar/data/765880/000110465924029661/tm247564d1_ex99-1.htm
+sp500,aios:security:corpay-common,FLT,CPAY,2024-03-25,2024-03-07,ticker_change,https://investor.corpay.com/news-releases/news-release-details/fleetcor-announces-rebranding-corpay/
+sp500,aios:bounded:sp500:fi,FI,FISV,2025-11-11,2025-10-29,ticker_change,https://investors.fiserv.com/news-releases/news-release-details/fiserv-announces-transfer-stock-exchange-listing-nasdaq
+sp500,aios:bounded:sp500:mmc,MMC,MRSH,2026-01-14,2025-12-29,ticker_change,https://www.corporate.marsh.com/news-events/2025/december/marsh-mclennan-to-change-nyse-symbol-to-mrsh.html
+sp500,aios:bounded:sp500:bk,BK,BNY,2026-05-21,2026-05-11,ticker_change,https://www.bny.com/corporate/global/en/about-us/newsroom/press-release/bny-announces-planned-change-of-stock-ticker-symbol-to-bny-130465.html
+sp500,aios:security:echostar-common,SATS,ECHO,2026-06-24,2026-06-22,ticker_change,https://ir.echostar.com/news-releases/news-release-details/echostar-changing-stocker-ticker-sats-echo-marking-companys-next
