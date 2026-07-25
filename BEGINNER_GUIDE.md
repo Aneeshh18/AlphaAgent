@@ -29,7 +29,7 @@ taxes, benchmarks, and brokers remain market-specific and reviewed.
 
 You should not need to understand DuckDB or Streamlit for normal use. DuckDB is
 the internal data file and Streamlit draws the screen. Use `aios dashboard`,
-`aios health`, `aios refresh-us-current`, and the backup/restore commands. On a
+`aios health`, `aios refresh-us-daily`, and the backup/restore commands. On a
 Linux computer, optional AIOS-managed timers provide simple start, stop, status,
 refresh, and backup automation. Hosted or multi-user deployment is not ready.
 
@@ -754,10 +754,11 @@ new folder path. Verify that folder later with:
 .venv/bin/aios verify-backup backups/aios-YYYYMMDDTHHMMSSZ
 ```
 
-Close the dashboard before backup or restore because DuckDB permits one writing
-process. Restore first verifies every checksum, automatically backs up the
-current database and paper state, and then replaces the snapshot only after an
-explicit confirmation:
+The dashboard may remain open for normal backups because it now releases its
+short read-only database connection after each cached load. Close it before a
+restore because restore replaces the database file. Restore first verifies
+every checksum, automatically backs up the current database and paper state,
+and then replaces the snapshot only after an explicit confirmation:
 
 ```bash
 .venv/bin/aios restore backups/aios-YYYYMMDDTHHMMSSZ --confirm-restore
@@ -767,38 +768,69 @@ If restored data has any hard validation failure, the command returns an error
 and prints the automatic pre-restore backup path. Never replace DuckDB files by
 hand.
 
-Refresh current U.S. data only after closing the dashboard:
+Refresh current U.S. data with:
 
 ```bash
-.venv/bin/aios refresh-us-current
+.venv/bin/aios refresh-us-daily
 .venv/bin/aios health
 ```
 
-The refresh uses the issuer, security, and provider identities that were
-already reviewed. It updates prices, SPY, SEC filings, and macro releases, and
-returns an error if any source fails. It does **not** silently add a company
-from a news page or guess an S&P announcement date.
+The dashboard can remain open. Its reads are short-lived, and an interactive
+command waits briefly if one happens to overlap. Scheduled jobs wait up to five
+minutes. The daily command first updates SPY, then checks the official
+announcement archive and independent current component list, then extends an
+unchanged dated universe, updates all reviewed member prices and macro releases,
+and finally proves that every broad readiness gate reaches the same U.S. close.
+If any stage fails, the newer decision date stays blocked. Weekly SEC filing
+refreshes remain separate because they are much slower and do not need to run
+every day.
 
-On Linux, you can enable the same work automatically in your computer's local
-time. These timers run prices/macro on weekdays at 07:30, filings Saturday at
-09:00, and a verified backup Sunday at 09:00:
+The lower-level `review-universe-current` command handles the separate
+membership clock. It saves
+exact copies of the public S&P Global press archive and a free independent
+component list, compares every symbol and reviewed CIK lineage, and looks for
+an unreviewed constituent-change announcement. If there is no change, it moves
+membership, security, issuer/CIK, and provider-symbol dates together in one
+database transaction. If anything disagrees, it moves nothing and tells you
+that a human event review is needed.
+
+This separation prevents a confusing but important mistake: a newly downloaded
+price is allowed to update the value of an existing simulated portfolio, but it
+cannot become the date of a new stock-selection decision until the investable
+company list is certified for that date too.
+
+On Linux, you can enable the same work automatically. One complete daily
+workflow runs at 02:00 New York time after every U.S. weekday. In India that is
+Tuesday through Saturday—about 11:30 during U.S. summer time and 12:30 during
+U.S. winter time—so Friday's U.S. close is not missed. Filings run Saturday at
+09:00 local time and a verified backup runs Sunday at 09:00 local time:
 
 ```bash
-.venv/bin/aios scheduler-install --confirm-install
+.venv/bin/aios scheduler-install --confirm-install --keep-running-after-logout
 .venv/bin/aios scheduler-status
 
 # Use these when needed
 .venv/bin/aios scheduler-pause
 .venv/bin/aios scheduler-resume
 .venv/bin/aios scheduler-remove --confirm-remove
+
+# Test and inspect local failure history
+.venv/bin/aios alert-test
+.venv/bin/aios alerts --unresolved
 ```
 
-Installation is deliberately explicit. It was enabled for this checkout on
-2026-07-21, and the backup, prices/economic-data, and company-filings services
-all passed real manual first runs. Keep the dashboard closed during a scheduled
-run because the local DuckDB file permits only one AIOS process. A collision
-fails safely; the status command shows whether the last service passed and when
-it runs next.
+Installation is deliberately explicit and idempotent: rerunning
+the full `scheduler-install` command updates only AIOS-managed timer files.
+`--keep-running-after-logout` uses Linux's free built-in user-service setting:
+updates continue after the desktop logs out while the computer remains on. If
+the computer was off, or a process disappeared unexpectedly, a second
+idempotent check runs three minutes after the user scheduler starts. A durable
+job record lets the dashboard distinguish running, completed, failed, and
+interrupted workflows.
+The dashboard releases DuckDB between cached reads. If a short read overlaps a
+scheduled write, the scheduled service waits for up to five minutes instead of
+failing immediately. A genuine long-running conflict still fails safely; the
+status command shows whether the last service passed and when it runs next.
 
 The status check will not wait forever if Linux's desktop scheduler interface
 is temporarily unavailable. After five seconds it shows which managed timer
@@ -806,21 +838,56 @@ files are installed/enabled and labels the live state **not verified**. Run the
 same command again from your normal logged-in terminal; do not interpret
 “not verified” as either a passed or failed scheduled job.
 
-If today's index membership has not been reviewed yet, the refresh may collect
-data for the newest reviewed member list up to seven days old. It displays that
-older date clearly. This keeps data moving but does **not** claim that the older
-list is today's index or permit a new portfolio decision for today.
+Every scheduled service has a local failure recorder. If a refresh, strict
+health check, or backup exits unsuccessfully, AIOS records a structured incident
+outside DuckDB. A later successful run resolves the incident without deleting
+its history. To inspect one entry or mark it reviewed:
+
+```bash
+.venv/bin/aios alerts --unresolved
+.venv/bin/aios alert-show INCIDENT_REF
+.venv/bin/aios alert-ack INCIDENT_REF
+# Use only after the underlying problem is genuinely fixed:
+.venv/bin/aios alert-resolve INCIDENT_REF
+```
+
+`alert-test` opens and resolves a harmless test entry. It does not send email,
+Slack, or a mobile notification. External delivery is still a separate step.
+
+If today's index membership has not been certified yet, the refresh may collect
+data for the newest reviewed member list up to seven days old. The dashboard
+continues to show the newest safe decision date instead of producing five
+misleading follow-on warnings from one missing membership date. This keeps data
+moving but does **not** claim that the older list is today's index or permit a
+new portfolio decision for today.
+
+“Today” means the market's date. India is ahead of New York: the U.S. session
+dated July 24 normally closes after midnight on July 25 IST. Before that close,
+July 23 is the newest possible complete U.S. daily bar. The dashboard compares
+stored prices with the latest completed U.S. session and says either **Up to
+date** or **awaiting the next automatic refresh** instead of calling safe
+previous-session data stale. The price adapters enforce the same New York-close
+boundary, so even an early manual run cannot save a still-moving daily bar.
 
 A newly reviewed company can exist before its first SEC Company Facts file. It
 stays visible as “company filings pending” and is tried again each week. If a
 company that previously had valid filings suddenly returns nothing, the refresh
 still stops and asks for investigation.
 
-The dashboard now opens on the latest broadly covered reviewed market date,
-not blindly on yesterday. Choose **Quality + Value (baseline)** or the
-experimental **Quality + Value + Trend + Stability** method.
-Every page uses plain-language labels, explains missing information, and says
-clearly that a high rank is a research shortlist rather than a buy instruction.
+The dashboard opens on an **Investment Research Control Room**, anchored to the
+latest broadly covered reviewed market date rather than blindly using today.
+It shows operating readiness, universe and filing coverage, the current paper
+proposal, simulated account, source clocks, and every operating gate before you
+open deeper analysis. **Research Explorer** provides an opportunity map, full
+ranked universe, and a separate missing-evidence queue. **Company Lens** traces
+one symbol into its quality, value, trend, stability, financial, and valuation
+evidence. Choose **Quality + Value (baseline)** or the experimental **Quality +
+Value + Trend + Stability** method. Every view states clearly that a high rank
+is a research shortlist rather than a buy instruction. Reviewed company names
+are shown beside their market symbols. **System Control** shows the scheduler,
+recent ingests, source dates, reviewed coverage, latest checksum-verified backup,
+forward-policy state, durable local incident history, and next human review.
+External notifications remain a future transport milestone.
 The first four-factor load can take longer because it rebuilds dated evidence
 for about 500 companies. The decision cache is then discarded, so a later data
 refresh cannot leave an old filing or price window hidden in memory.
@@ -838,10 +905,10 @@ There is now a separate current-use check:
 .venv/bin/aios readiness --report-only
 ```
 
-On 2026-07-22 the latest reviewed decision close is 2026-07-20. The current
+On 2026-07-24 the latest reviewed decision close is 2026-07-23. The current
 snapshot has 503 S&P 500 members, stable identities for all 503, PIT filings for
 500, action-safe prices for all 503, and SPY through the same close. The latest
-required macro release is dated 2026-07-20. The readiness command passes this
+required macro release is dated 2026-07-23. The readiness command passes this
 supervised paper-use boundary while still showing warnings and source dates.
 
 The risk gate checks position and broad business-group concentration, leverage,
@@ -876,6 +943,10 @@ The untouched forward test has a separate policy lock:
 
 # Safe to run at any time
 .venv/bin/aios forward-status
+
+# Only after status reports real policy drift: create a current proposal,
+# archive the old trial unchanged, and atomically activate its replacement.
+.venv/bin/aios forward-restart --confirm-restart
 ```
 
 The lock remembers checksums for the stock-ranking rules, macro regime, risk
@@ -886,14 +957,18 @@ change is reviewed and a new trial is deliberately started. New prices,
 filings, macro releases, and reviewed membership are expected to keep updating
 and therefore are not frozen.
 
-The existing account is still simulated cash. Its 2026-07-20 proposal is not a
-holding and cannot be recorded before the reviewed 2026-07-21 close exists.
+The account is still simulated cash. Its 2026-07-20 proposal was never executed,
+and later correctness changes made that old forward lock drift. The guarded
+restart archived it unchanged under `data/paper/forward_trials/` and activated
+trial `us-qv-forward-8559d86b6a02` from the 2026-07-23 close. Its one registered
+proposal is not a holding and has not been executed.
 
-The historical U.S. technical gate is complete. The current refresh, scheduler,
-backup/recovery, local dashboard smoke, and untouched-policy gate are complete
-in code, and the full six-period rerun now passes. The reviewed baseline is now
-frozen; the remaining local technical-beta step is to observe 1–3 naturally
-triggered clean timer cycles.
+The historical U.S. technical gate is complete. The current refresh,
+evidence-backed no-change membership review, scheduler, backup/recovery, local
+dashboard smoke, and untouched-policy gate are complete in code, and the full
+six-period rerun now passes. The recoverable daily workflow and prospective
+replacement freeze are live-proven; the remaining local technical-beta step is
+observation of naturally triggered daily, filing, and backup cycles.
 A real-capital pilot is a different gate and needs at least 8–12 weeks of
 untouched forward observation plus broker/data reconciliation, alerts, and your
 tax/risk assumptions. That elapsed evidence period cannot be sped up.
@@ -942,7 +1017,7 @@ corrections; a first-time ticker download still requests its full history.
 The foundation, QV/QVML factors, release-aware macro layer, reviewed membership
 and identities, action-safe current prices, costs, persistent holdings, FIFO
 tax lots, daily account values, benchmark comparison, risk gates, paper monitor,
-and current U.S. readiness path are working through the 2026-07-20 close.
+and current U.S. readiness path are working through the 2026-07-23 close.
 
 The 2025-to-current stateful historical rerun is complete: six of six periods,
 327 date-aligned strategy and SPY observations, exact quarter-to-quarter state
@@ -953,9 +1028,9 @@ extensions that do not make them index members again. Regime-aware QV returned
 software checks over a short historical period, not forecasts or proof that the
 strategy will beat the market.
 
-What remains is elapsed operational evidence: observe naturally triggered
-refresh/health/filing/backup cycles during the frozen untouched forward test.
-Older
+What remains is elapsed operational evidence: observe the active prospective
+forward test and naturally triggered daily/health/filing/backup cycles without
+retuning it. Older
 announcement provenance before August 2023 remains a separate long-history
 expansion.
 
@@ -965,5 +1040,21 @@ India work starts after these U.S. technical gates.
 The deterministic engine needs no language model; a weaker model can handle
 optional summaries, but no model output is accepted as a numeric or provenance
 source.
+
+The ordered roadmap is in [`FUTURE_BUILD_PLAN.md`](./FUTURE_BUILD_PLAN.md). The
+local incident ledger and systemd failure capture are implemented. Immutable
+downloads are now live for reviewed SEC Company Facts and Submissions: the
+first controlled AAPL run retained and verified two exact payloads and linked
+both to its ingest record. Treasury capture is wired but not live-proven. FRED,
+yfinance, parsed replay evidence, and the remaining transports still need their
+honest adapter-specific capture paths. A retry-safe notification outbox and one
+external delivery channel come after that gate. Stress testing, anomaly review
+cases, experiment registration, and the India schema foundation follow in that
+dependency order.
+
+The India sequence is in [`INDIA_BUILD_PLAN.md`](./INDIA_BUILD_PLAN.md). It
+starts with a bounded Nifty 50 research beta and explains the official NSE,
+NSE Indices, SEBI, RBI, and MoSPI evidence gates before any Indian ranking is
+allowed.
 
 For the compact technical handoff, read [`agent.md`](./agent.md).

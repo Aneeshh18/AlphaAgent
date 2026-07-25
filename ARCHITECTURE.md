@@ -28,7 +28,7 @@ These are decided. We do not revisit them without a concrete, data-backed reason
 **Decision:** OS-level scheduling via systemd user timers (cron as fallback), driving a Python CLI entrypoint.
 **Why:**
 - A long-term investor needs **daily batch**, not real-time. Prices after close, fundamentals after filings, macro after releases. Real-time is 10× the cost (infra, rate limits, latency monitoring) for ~1% of the value.
-- systemd timers give us logging (journalctl), retries, calendar expressions, and dependency ordering for free, with no extra dependency.
+- systemd timers give us logging (journalctl), retries, calendar expressions, and dependency ordering for free, with no extra dependency. The installed U.S. workflow is one idempotent benchmark-first service with a durable independent run record, startup catch-up, and Linux linger so a desktop logout cannot silently strand a partial run.
 - We deliberately reject Airflow/Prefect/Dagster: they solve multi-team orchestration problems we don't have, add heavy services, and over-engineer a single-user daily pipeline.
 - Architecture: `timer → CLI command → job → DuckDB + Parquet`.
 **Cost:** $0.
@@ -97,6 +97,11 @@ U.S. completion is the active engineering scope. India schema/adapters remain
 deferred until the U.S. current-date readiness, monitored paper, holdout, and
 operator/deployment gates are complete.
 
+The gated implementation and official-source feasibility decisions are tracked
+in `INDIA_BUILD_PLAN.md`. India engineering may proceed while the untouched U.S.
+forward observation accrues, but no Indian row may enter research tables before
+the portable market-schema and source-review gates pass.
+
 The factor, portfolio, risk, reporting, and validation cores must remain
 market-neutral. Market-specific behavior belongs in a configured market
 profile or provider adapter:
@@ -140,22 +145,59 @@ are replaceable implementation details behind supported commands and the
 The current checkout remains a local supervised research and paper-simulation
 beta. `aios dashboard` hides Streamlit and the CLI hides DuckDB for ordinary
 use. `aios health`, `aios backup`, `aios verify-backup`, and confirmed
-`aios restore` provide fail-visible health and recovery. `aios
-refresh-us-current` sequentially refreshes prices, SEC filings, SPY, and macro
-only for already reviewed identities; membership announcements remain a manual
-provenance gate. Confirmed systemd-user installation adds weekday current-data,
-weekly filing, and weekly verified-backup timers plus status/pause/resume/remove
-commands. Generated units pass `systemd-analyze verify` and are not installed
-implicitly. The owner explicitly installed them on 2026-07-21; real manual
-first runs of backup, prices/macro, and filings passed. Raw refresh may use the
+`aios restore` provide fail-visible health and recovery. The normal
+`aios refresh-us-daily` path refreshes action-safe SPY first, certifies the
+unchanged investable universe through that completed session, refreshes member
+prices and release-aware macro data inside the newly extended identity windows,
+and requires broad exact-date readiness before declaring success. The
+lower-level `aios refresh-us-current` remains available for selective prices,
+SEC filings, SPY, and macro work through already reviewed identities.
+`aios review-universe-current` archives exact S&P Global press-archive bytes
+and an independent current-component CSV, checks unreviewed change headlines,
+exact ticker-set equality, and reviewed CIK lineage, then extends all bounded
+reference domains atomically only on a no-change result. Real constituent
+changes remain a manual provenance gate.
+
+Confirmed systemd-user installation adds one New-York-clocked recoverable daily
+timer after every U.S. weekday plus weekly filing and verified-backup timers.
+The daily service uses `Restart=on-failure`; its timer also runs an idempotent
+check three minutes after the user manager starts. Linux linger is explicitly
+enabled so the user manager remains active after desktop logout while the
+computer is on. Each job writes running/success/failed/interrupted lifecycle
+state to the permission-restricted SQLite operations ledger, not analytical
+DuckDB. A killed process therefore leaves durable evidence that the next startup
+can recover. Every managed service also has an `OnFailure=` handler plus a
+post-success recovery marker. Structured incidents and lifecycle events remain
+available even when DuckDB cannot be opened. The ledger
+stores bounded systemd result properties rather than raw journals or process
+environments. It is included as audit evidence in verified backups but is never
+rolled backward during an analytical restore, preserving failures observed
+after the older backup. Generated units pass `systemd-analyze verify` and are
+not installed implicitly. The owner explicitly installed them on 2026-07-21; real manual
+first runs of backup and filings passed. The replacement daily workflow passed
+a live 503-member July 23 catch-up, exact-date readiness, and an immediate
+no-download startup run. Raw refresh may use the
 newest reviewed membership snapshot up to seven days old for collection while
 showing the exact snapshot date; readiness still refuses to treat it as a
 current membership decision. A reviewed issuer with no accepted Company Facts
 is retried and reported as pending; zero rows for an established issuer remain
-a hard failure. A dashboard must be closed during scheduled writes because
-DuckDB is single-process. Container/hosted packaging, authentication, HTTPS,
-external alerts, multi-user storage, and India market adapters remain future exit
+a hard failure. The benchmark-first daily dependency chain ensures dated
+identity windows are available before the member-price refresh. Streamlit uses
+short-lived read-only Store scopes instead of a process-global writable
+connection, and managed writers have a bounded five-minute lock wait. This
+preserves DuckDB's single-writer constraint without requiring the dashboard to
+be closed for normal scheduled updates. Restore still requires the dashboard
+to be closed. EOD adapters cap accepted rows at the latest completed New York
+session rather than the host's local date, preventing an India-after-midnight
+catch-up from accepting a still-open U.S. daily bar. Container/hosted packaging,
+authentication, HTTPS,
+external alert delivery, multi-user storage, and India market adapters remain future exit
 conditions—not capabilities to assume today.
+
+`FUTURE_BUILD_PLAN.md` is the sequencing and acceptance companion to this
+architecture. It prioritizes immutable provider snapshots, external notification
+delivery on top of the implemented local incident ledger, and deterministic
+stress testing before India ingestion or any additional model complexity.
 
 ### Untouched forward-policy contract
 
@@ -167,6 +209,11 @@ checksum-protected local document. It registers each later proposal by payload
 checksum. `forward-status` fails on missing/changed policy files, changed
 cost/tax configuration, altered registered proposals, or unregistered new
 proposals; the CLI refuses simulated execution while that drift exists.
+`forward-restart` is the guarded lifecycle transition after genuine drift: it
+builds a later simulation-only baseline, moves the predecessor unchanged into
+the forward-trial archive, and atomically activates the replacement. It refuses
+to replace an unchanged trial and rolls the archive move back if activation
+fails.
 
 DuckDB is intentionally outside the policy checksum. Prices, filings, macro
 vintages, and reviewed membership must continue to advance under their existing
@@ -182,11 +229,15 @@ action/split evidence, SPY calendar/benchmark freshness, and release-aware
 macro evidence. `paper` also requires a recent decision date and returns a
 non-zero exit status if any blocking gate fails. `historical_research` may pass
 inside an older bounded window without claiming that it is current.
+`latest_reviewed_market_close` is used for valuing existing simulated holdings;
+`latest_paper_decision_date` additionally requires a 450–550-member certified
+universe. This prevents one newer SPY row from turning one missing universe edge
+into several misleading downstream 0/0 failures.
 
-As of 2026-07-21, the reviewed current decision close is 2026-07-20. It has 503
+As of 2026-07-24, the reviewed current decision close is 2026-07-23. It has 503
 dated members and stable identities, 500/503 PIT filing coverage, 503/503
 identity-safe/action-safe price coverage, SPY through the same close, and macro
-releases through 2026-07-20. Current supervised paper readiness passes with zero
+releases through 2026-07-23. Current supervised paper readiness passes with zero
 hard database failures and three visible historical-audit warnings.
 
 `aios.risk.policy` is a deterministic, jurisdiction-neutral pre-trade contract.
@@ -312,11 +363,23 @@ Finite intervals without `end_known_date` are a hard data-quality failure.
 
 The original audited S&P 500 manifest covers 2023-08-01 through 2024-12-31.
 Reviewed event/reference batches extend the current operating path through
-2026-07-21. Issuer announcements identify same-security ticker transitions;
-S&P Global releases identify index decisions. Three one-to-two-day conflicts in
-the free reference spans are retained as explicit warnings and resolved to
-official release dates. See `SP500_DATA_PROVENANCE.md`. Neither slice claims a
-complete 1996-present announcement archive or investable performance history.
+2026-07-21. Immutable no-change attestations can roll that edge forward one
+reviewed close at a time; two accepted attestations currently extend it through
+2026-07-23. Each attestation links exact raw responses and records source/set
+hashes, candidate headlines, CIK-lineage checks, and per-table update counts.
+The transaction covers `universe_membership`,
+`security_identity_assignments`, `security_issuer_assignments`,
+`issuer_cik_history`, and `provider_symbol_history`, so a partial reference
+extension is impossible. XOM demonstrates why CIK lineage—not naive current-CIK
+equality—is required: the stable security has an officially reviewed
+predecessor/successor issuer transition, while the secondary component file
+still names the predecessor CIK.
+
+Issuer announcements identify same-security ticker transitions; S&P Global
+releases identify index decisions. Three one-to-two-day conflicts in the free
+reference spans are retained as explicit warnings and resolved to official
+release dates. See `SP500_DATA_PROVENANCE.md`. Neither slice claims a complete
+1996-present announcement archive or investable performance history.
 
 ### Stable security identity contract
 
@@ -471,7 +534,13 @@ The provider fingerprint is a review-time drift detector, not a claim that a
 free provider is immutable or that adjusted-price vintages are archived. A
 later ingest may observe provider corrections; exact price-payload versioning
 remains separate future work and is required for fully reproducible vendor-data
-reconstruction.
+reconstruction. The immutable snapshot layer now retains exact SEC Company
+Facts/Submissions bytes with request/response timestamps, secret-free request
+fingerprints, content hashes, adapter/parser versions, and ingest-run links;
+the Treasury fallback uses the same opt-in HTTP boundary. Parsed-row replay,
+FRED-library capture, yfinance normalized exports, and remaining transports are
+still incomplete. A normalized provider export must always be labeled as such
+and must never be presented as the original vendor response.
 
 Large reviewed batches may optionally read fundamentals from a local official
 SEC `companyfacts.zip` via `ingest-reference-batch --companyfacts-zip`. The ZIP
@@ -725,8 +794,10 @@ The implementation borrows contracts and ideas, not copied code:
 - No broker API integration or live trading. The local paper account changes
   only through an explicitly confirmed simulated next-session close.
 - No multi-agent committee. Numeric models only; LLM synthesizes.
-- The current UI is a local Streamlit ranking dashboard; it is read-only and
-  does not place trades. A richer web product remains out of scope.
+- The current UI is a local Streamlit research control room: readiness and
+  governed paper workflow first, followed by factor-universe, company, and
+  methodology drill-downs. It is read-only and does not place trades. A richer
+  multi-user web product remains out of scope.
 - No paid data feeds in the active build. Norgate Platinum/Diamond is the first
   reviewed upgrade candidate for delisted prices and effective membership, but
   adoption requires explicit user authorization, a Windows pilot, and parity

@@ -146,6 +146,80 @@ CREATE TABLE IF NOT EXISTS ingest_log (
     error           TEXT
 );
 
+-- Immutable provider evidence is split into content-addressed payloads and
+-- fetch observations. Identical bytes share one file, while every request
+-- retains its own timestamps, adapter/parser versions, and ingest link.
+CREATE TABLE IF NOT EXISTS raw_payloads (
+    payload_sha256  VARCHAR PRIMARY KEY,
+    relative_path  VARCHAR NOT NULL UNIQUE,
+    original_bytes BIGINT NOT NULL,
+    stored_bytes   BIGINT NOT NULL,
+    compression    VARCHAR NOT NULL,
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS raw_snapshots (
+    snapshot_id        VARCHAR PRIMARY KEY,
+    provider           VARCHAR NOT NULL,
+    dataset            VARCHAR NOT NULL,
+    artifact_kind      VARCHAR NOT NULL,
+    requested_at       TIMESTAMP NOT NULL,
+    received_at        TIMESTAMP NOT NULL,
+    http_status        INTEGER,
+    content_type       VARCHAR,
+    request_fingerprint VARCHAR NOT NULL,
+    payload_sha256     VARCHAR NOT NULL,
+    adapter_name       VARCHAR NOT NULL,
+    adapter_version    VARCHAR NOT NULL,
+    parser_version     VARCHAR NOT NULL,
+    parsed_row_count   BIGINT,
+    parsed_rows_sha256 VARCHAR,
+    created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS ingest_raw_snapshots (
+    run_id          VARCHAR NOT NULL,
+    snapshot_id     VARCHAR NOT NULL,
+    role            VARCHAR NOT NULL,
+    linked_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (run_id, snapshot_id, role)
+);
+
+-- A no-change universe roll-forward is an explicit, immutable certification,
+-- never an inferred extension. Exact provider responses remain in raw_snapshots;
+-- this row records what was compared and whether any reference windows moved.
+CREATE TABLE IF NOT EXISTS universe_coverage_attestations (
+    attestation_id             VARCHAR PRIMARY KEY,
+    run_id                     VARCHAR NOT NULL UNIQUE,
+    universe_id                VARCHAR NOT NULL,
+    prior_coverage_through     DATE NOT NULL,
+    requested_coverage_through DATE NOT NULL,
+    checked_at                 TIMESTAMP NOT NULL,
+    completed_new_york_date    DATE NOT NULL,
+    status                     VARCHAR NOT NULL CHECK (
+        status IN ('accepted_no_change', 'blocked_review_required')
+    ),
+    official_source_url        VARCHAR NOT NULL,
+    component_source_url       VARCHAR NOT NULL,
+    official_release_count     BIGINT NOT NULL,
+    relevant_release_count     BIGINT NOT NULL,
+    reviewed_member_count      BIGINT NOT NULL,
+    component_count            BIGINT NOT NULL,
+    reviewed_member_set_sha256 VARCHAR NOT NULL,
+    component_set_sha256       VARCHAR NOT NULL,
+    identity_match_count       BIGINT NOT NULL,
+    identity_mismatch_count    BIGINT NOT NULL,
+    candidate_releases_json    TEXT NOT NULL,
+    mismatch_detail_json       TEXT NOT NULL,
+    membership_rows_extended   BIGINT NOT NULL,
+    security_rows_extended     BIGINT NOT NULL,
+    owner_rows_extended        BIGINT NOT NULL,
+    cik_rows_extended          BIGINT NOT NULL,
+    provider_rows_extended     BIGINT NOT NULL,
+    detail                     TEXT NOT NULL,
+    created_at                 TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Durable markers distinguish an interrupted migration from an intentional
 -- post-backfill cleanup. Without this, reopening DuckDB could restore rows
 -- that were deliberately removed from the active table.
@@ -349,6 +423,10 @@ EXPECTED_TABLES = (
     "fundamentals",
     "macro",
     "ingest_log",
+    "raw_payloads",
+    "raw_snapshots",
+    "ingest_raw_snapshots",
+    "universe_coverage_attestations",
     "schema_migrations",
     "security_master",
     "security_identity_assignments",

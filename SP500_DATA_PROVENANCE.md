@@ -1,6 +1,6 @@
 # S&P 500 point-in-time universe provenance
 
-## Current operating extension — reviewed through 2026-07-21
+## Current operating extension — reviewed through 2026-07-23
 
 The original bounded 2023–2024 certification described below is still the
 reproducible base. The active database now also carries a reviewed current path:
@@ -15,10 +15,10 @@ reproducible base. The active database now also carries a reviewed current path:
 - reviewed reference batches 21–42 plus the consolidated current manifests
   extend issuer, SEC CIK, security-owner, and provider-symbol evidence for the
   2025-current additions/removals.
-- on the 2026-07-20 decision close, 503/503 members have stable security IDs,
+- on the 2026-07-23 decision close, 503/503 members have stable security IDs,
   500/503 have PIT filings, and 503/503 have current action-safe prices. SPY is
   reviewed through the same close and required macro releases through
-  2026-07-20. `aios readiness` passes with zero hard integrity failures.
+  2026-07-23. `aios readiness` passes with zero hard integrity failures.
 
 This current path does **not** turn the repository into a complete
 1996-present S&P announcement archive. Pre-August-2023 provenance and broader
@@ -1080,3 +1080,35 @@ nor justify tuning QVML weights to improve this sample.
 - [Palantir / Dell / Erie](https://press.spglobal.com/2024-09-06-Palantir-Technologies%2C-Dell-Technologies%2C-and-Erie-Indemnity-Set-to-Join-S-P-500-Others-to-Join-S-P-MidCap-400-and-S-P-SmallCap-600)
 - [Apollo / Workday](https://press.spglobal.com/2024-12-06-Apollo-Global-Management-and-Workday-Set-to-Join-S-P-500-Others-to-Join-S-P-MidCap-400-and-S-P-SmallCap-600)
 - [Lennox / Catalent](https://press.spglobal.com/2024-12-18-Lennox-International-Set-to-Join-S-P-500-and-BILL-Holdings-to-Join-S-P-MidCap-400)
+
+## Current no-change attestations — 2026-07-24
+
+`aios review-universe-current` now handles no-change days without guessing an
+announcement date. It uses the public
+[S&P Global press archive](https://press.spglobal.com/index.php?s=2429&l=100)
+as the official change-candidate source and the free
+[fja05680 current-component CSV](https://raw.githubusercontent.com/fja05680/sp500/master/sp500.csv)
+as an independent ticker/CIK cross-check. Exact response bytes are stored under
+`data/raw/` and linked to the ingest run before parsing.
+
+The first accepted attestation,
+`uca-4db48592af734a2bba5db012fd458047`, checked 99 official release records and
+503 components and extended the reviewed edge from 2026-07-21 through
+2026-07-22. The next recoverable daily cycle archived a newer official response
+and accepted `uca-34e691c1401d4113b9acb18ef49aff99`, which checked 100 official
+release records and the same 503 components before extending the edge through
+2026-07-23. The reviewed and independent ticker sets had the same SHA-256
+`a0f5af90629e0c80a7db4cee385d189f33b54e6d2d6efa078d1adc56504511f2`.
+There were no unreviewed S&P 500 change headlines and no unresolved identity
+mismatches. The component source still carries XOM predecessor CIK 34088; this
+was accepted only because the same stable security has an already reviewed
+official successor lineage to CIK 2115436.
+
+Each accepted transaction extended 503 membership rows, 503 security
+assignments, 503 security-to-issuer assignments, 500 active issuer CIK rows,
+and 503 verified provider-symbol rows through its requested close. The latest
+reviewed edge is therefore 2026-07-23. A preceding deliberately blocked
+attestation proves the control: naive CIK equality stopped with zero date
+changes until the reviewed XOM lineage rule was applied. A real index
+announcement, missing archive coverage, parser drift, ticker-set difference,
+or unreviewed CIK lineage still stops for manual review.

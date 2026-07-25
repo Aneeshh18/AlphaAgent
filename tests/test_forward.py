@@ -9,7 +9,9 @@ import pytest
 from aios.forward import (
     assess_forward_trial,
     create_forward_trial,
+    read_forward_trial,
     register_forward_proposal,
+    replace_drifted_forward_trial,
     require_registered_forward_proposal,
 )
 from aios.paper import (
@@ -234,3 +236,90 @@ def test_forward_trial_records_a_readiness_block_without_false_drift(tmp_path) -
     )
     assert status.ready is True
     assert status.registered_proposals == 2
+
+
+def test_drifted_forward_trial_is_archived_before_replacement(tmp_path) -> None:
+    policy, account, proposal, trial = _baseline(tmp_path)
+    previous = create_forward_trial(
+        tmp_path,
+        trial,
+        account,
+        proposal,
+        confirm=True,
+        now=datetime(2026, 7, 21, tzinfo=UTC),
+        policy_files=("policy.py",),
+    )
+    previous_bytes = trial.read_bytes()
+    policy.write_text("WEIGHT = 2\n", encoding="utf-8")
+    replacement_proposal = tmp_path / "data/paper/proposals/us-qv-2026-07-23.json"
+    _write_document(
+        replacement_proposal,
+        PROPOSAL_DOCUMENT_KIND,
+        _proposal_payload(
+            canonical_payload_sha256(_account_payload()),
+            proposal_id="replacement",
+            decision_date="2026-07-23",
+            generated_at="2026-07-24T16:00:00Z",
+        ),
+    )
+
+    replacement = replace_drifted_forward_trial(
+        tmp_path,
+        trial,
+        account,
+        replacement_proposal,
+        confirm=True,
+        now=datetime(2026, 7, 24, 16, 5, tzinfo=UTC),
+        policy_files=("policy.py",),
+    )
+
+    assert replacement.archived_previous.read_bytes() == previous_bytes
+    assert replacement.archived_previous.name == f"{previous.payload['trial_id']}.json"
+    assert replacement.active.path == trial
+    assert replacement.active.payload["trial_id"] != previous.payload["trial_id"]
+    assert replacement.active.payload["observation_start_decision_date"] == "2026-07-23"
+    status = assess_forward_trial(
+        tmp_path,
+        trial,
+        account,
+        policy_files=("policy.py",),
+    )
+    assert status.ready is True
+    assert status.registered_proposals == 1
+
+
+def test_unchanged_forward_trial_cannot_be_replaced(tmp_path) -> None:
+    _policy, account, proposal, trial = _baseline(tmp_path)
+    previous = create_forward_trial(
+        tmp_path,
+        trial,
+        account,
+        proposal,
+        confirm=True,
+        now=datetime(2026, 7, 21, tzinfo=UTC),
+        policy_files=("policy.py",),
+    )
+    replacement_proposal = tmp_path / "data/paper/proposals/us-qv-2026-07-23.json"
+    _write_document(
+        replacement_proposal,
+        PROPOSAL_DOCUMENT_KIND,
+        _proposal_payload(
+            canonical_payload_sha256(_account_payload()),
+            proposal_id="replacement",
+            decision_date="2026-07-23",
+            generated_at="2026-07-24T16:00:00Z",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="unchanged"):
+        replace_drifted_forward_trial(
+            tmp_path,
+            trial,
+            account,
+            replacement_proposal,
+            confirm=True,
+            policy_files=("policy.py",),
+        )
+
+    assert read_forward_trial(trial).payload["trial_id"] == previous.payload["trial_id"]
+    assert not (trial.parent / "forward_trials").exists()

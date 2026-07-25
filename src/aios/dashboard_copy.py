@@ -7,23 +7,36 @@ in storage and audit artifacts; this module only translates their display.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
+from datetime import date, datetime, timedelta
 
-VIEW_STOCK_RANKINGS = "📈 Stock Rankings"
-VIEW_COMPANY_DETAILS = "🔎 Company Details"
-VIEW_PAPER_MONITOR = "🧪 Paper Monitor"
-VIEW_HOW_IT_WORKS = "📖 How It Works"
+from aios.market_calendar import (
+    latest_completed_us_equity_session,
+    us_equity_sessions,
+)
+
+VIEW_OVERVIEW = "Overview"
+VIEW_STOCK_RANKINGS = "Research Explorer"
+VIEW_COMPANY_DETAILS = "Company Lens"
+VIEW_PAPER_MONITOR = "Portfolio Monitor"
+VIEW_SYSTEM_CONTROL = "System Control"
+VIEW_HOW_IT_WORKS = "Methodology & Data"
 VIEW_OPTIONS = (
+    VIEW_OVERVIEW,
     VIEW_STOCK_RANKINGS,
     VIEW_COMPANY_DETAILS,
     VIEW_PAPER_MONITOR,
+    VIEW_SYSTEM_CONTROL,
     VIEW_HOW_IT_WORKS,
 )
 
 # Short aliases keep the Streamlit page conditions readable.
+VIEW_HOME = VIEW_OVERVIEW
 VIEW_RANKINGS = VIEW_STOCK_RANKINGS
 VIEW_DETAILS = VIEW_COMPANY_DETAILS
 VIEW_PAPER = VIEW_PAPER_MONITOR
+VIEW_SYSTEM = VIEW_SYSTEM_CONTROL
 VIEW_METHOD = VIEW_HOW_IT_WORKS
 
 MODEL_QV_LABEL = "Quality + Value (baseline)"
@@ -34,6 +47,94 @@ RESEARCH_ONLY_NOTICE = (
     "Research only — not a buy or sell recommendation. A high score means a stock "
     "compares well on the selected historical measures; it does not predict its next return."
 )
+
+
+def display_date(value: object) -> str:
+    """Format an ISO date for people while preserving unknown values."""
+    if value in {None, ""}:
+        return "Not available"
+    try:
+        parsed = date.fromisoformat(str(value))
+    except ValueError:
+        return str(value)
+    return parsed.strftime("%b %d, %Y").replace(" 0", " ")
+
+
+def us_eod_freshness_message(
+    raw_prices_through: object,
+    *,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    """Explain EOD freshness using the U.S. session clock, not local midnight."""
+    try:
+        stored_date = date.fromisoformat(str(raw_prices_through))
+    except ValueError:
+        return False, "The latest completed U.S. market date is not available."
+    expected_date = latest_completed_us_equity_session(now)
+    expected_label = display_date(expected_date)
+    if stored_date >= expected_date:
+        return True, f"Up to date for the latest completed U.S. session ({expected_label})."
+    return (
+        False,
+        f"The {expected_label} U.S. session is complete and awaits the next automatic refresh.",
+    )
+
+
+def us_certification_freshness_message(
+    certified_through: object,
+    *,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    """Explain whether new decisions reach the latest completed U.S. session."""
+    expected_date = latest_completed_us_equity_session(now)
+    expected_label = display_date(expected_date)
+    try:
+        certified_date = date.fromisoformat(str(certified_through))
+    except ValueError:
+        return (
+            False,
+            f"The latest completed U.S. session is {expected_label}, but no fully "
+            "certified decision date is available.",
+        )
+    if certified_date >= expected_date:
+        return (
+            True,
+            f"New supervised research is current through the latest completed U.S. "
+            f"session ({expected_label}).",
+        )
+    lag = len(
+        us_equity_sessions(
+            certified_date + timedelta(days=1),
+            expected_date + timedelta(days=1),
+        )
+    )
+    session_word = "session" if lag == 1 else "sessions"
+    return (
+        False,
+        f"The latest completed U.S. session is {expected_label}. Safe decision data "
+        f"currently ends on {display_date(certified_date)} ({lag} market {session_word} "
+        "behind), so new paper decisions remain paused until catch-up completes.",
+    )
+
+
+def company_symbol_label(company_name: object, ticker: object) -> str:
+    """Return one human-readable security label without inventing a company name."""
+    symbol = str(ticker or "").strip().upper()
+    company = str(company_name or "").strip()
+    if not company or company.upper() == symbol:
+        return symbol or "Unknown security"
+    return f"{company} ({symbol})" if symbol else company
+
+
+def coverage_value(observed: object) -> tuple[int, int, float] | None:
+    """Parse a readiness observation such as ``500/503 (99.4%)``."""
+    match = re.search(r"(?<!\d)(\d+)\s*/\s*(\d+)(?!\d)", str(observed or ""))
+    if not match:
+        return None
+    covered, total = (int(value) for value in match.groups())
+    if total <= 0 or covered > total:
+        return None
+    return covered, total, covered / total * 100
 
 _MODEL_KEYS = {
     MODEL_QV_LABEL: "qv",

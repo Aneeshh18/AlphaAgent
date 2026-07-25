@@ -30,7 +30,7 @@ from aios.backtest.costs import TaxPolicy, TransactionCostPolicy
 from aios.backtest.portfolio import PortfolioBook
 from aios.factors.composite import compute_composite
 from aios.market_calendar import us_equity_sessions
-from aios.readiness import assess_us_readiness
+from aios.readiness import USReadinessPolicy, assess_us_readiness
 from aios.risk import PortfolioRiskPolicy, TargetPosition, assess_portfolio_risk
 from aios.storage.store import Store
 
@@ -155,8 +155,8 @@ def default_proposal_path(project_root: Path, as_of: date) -> Path:
     return Path(project_root) / DEFAULT_PROPOSAL_DIRECTORY / f"us-qv-{as_of.isoformat()}.json"
 
 
-def latest_paper_decision_date(store: Store, *, today: date | None = None) -> date:
-    """Return the latest reviewed SPY close no later than the supplied day."""
+def latest_reviewed_market_close(store: Store, *, today: date | None = None) -> date:
+    """Return the newest action-safe SPY close available for valuation."""
     upper_bound = today or date.today()
     rows = store.query(
         """
@@ -172,7 +172,71 @@ def latest_paper_decision_date(store: Store, *, today: date | None = None) -> da
     )
     latest = rows[0]["latest"] if rows else None
     if not isinstance(latest, date):
-        raise ValueError("no reviewed SPY market close is available for a paper decision")
+        raise ValueError("no reviewed SPY market close is available")
+    return latest
+
+
+def latest_paper_decision_date(
+    store: Store,
+    *,
+    today: date | None = None,
+    policy: USReadinessPolicy | None = None,
+) -> date:
+    """Return the newest reviewed close covered by a dated investable universe.
+
+    Market prices may arrive before the constituent universe has been independently
+    certified through the same date. Valuation may use those newer prices, but a new
+    portfolio decision must remain on the newest date where both clocks overlap.
+    The full readiness assessor still validates identities, filings, prices, macro,
+    and data integrity for the selected date.
+    """
+    upper_bound = today or date.today()
+    rules = policy or USReadinessPolicy()
+    rows = store.query(
+        """
+        WITH candidate_dates AS (
+            SELECT DISTINCT price.date
+            FROM prices AS price
+            WHERE price.ticker = ?
+              AND price.date <= CAST(? AS DATE)
+              AND price.actions_complete IS TRUE
+              AND price.close_split_adjusted IS NOT NULL
+              AND price.split_normalization_factor IS NOT NULL
+              AND price.close IS NOT NULL
+              AND price.close > 0
+        ), member_counts AS (
+            SELECT candidate.date, COUNT(DISTINCT membership.ticker) AS members
+            FROM candidate_dates AS candidate
+            JOIN universe_membership AS membership
+              ON membership.universe_id = ?
+             AND membership.known_date <= candidate.date
+             AND membership.effective_start <= candidate.date
+             AND (
+                 membership.effective_end IS NULL
+                 OR membership.effective_end > candidate.date
+                 OR membership.end_known_date > candidate.date
+             )
+            GROUP BY candidate.date
+        )
+        SELECT date
+        FROM member_counts
+        WHERE members BETWEEN ? AND ?
+        ORDER BY date DESC
+        LIMIT 1
+        """,
+        (
+            rules.benchmark_ticker,
+            upper_bound.isoformat(),
+            rules.universe_id,
+            rules.minimum_universe_members,
+            rules.maximum_universe_members,
+        ),
+    )
+    latest = rows[0]["date"] if rows else None
+    if not isinstance(latest, date):
+        raise ValueError(
+            "no reviewed market close overlaps a certified investable-universe date"
+        )
     return latest
 
 

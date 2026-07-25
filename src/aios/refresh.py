@@ -64,6 +64,7 @@ def refresh_us_current(
     universe_id: str = "sp500",
     benchmark_ticker: str = "SPY",
     include_prices: bool = True,
+    include_benchmark: bool | None = None,
     include_fundamentals: bool = True,
     include_macro: bool = True,
     minimum_members: int = 450,
@@ -83,7 +84,8 @@ def refresh_us_current(
     store and the free providers require polite pacing. Re-running is safe:
     price adapters fetch a short overlap and all storage writes are idempotent.
     """
-    if not any((include_prices, include_fundamentals, include_macro)):
+    refresh_benchmark = include_prices if include_benchmark is None else include_benchmark
+    if not any((include_prices, refresh_benchmark, include_fundamentals, include_macro)):
         raise ValueError("at least one refresh area must be enabled")
     if minimum_members < 1 or maximum_members < minimum_members:
         raise ValueError("invalid universe member bounds")
@@ -247,6 +249,7 @@ def refresh_us_current(
             if index < len(price_candidates):
                 sleeper(settings.yfinance_sleep_sec)
 
+    if refresh_benchmark:
         _progress(progress, "benchmark", benchmark_ticker.upper(), 1, 1)
         try:
             benchmark_rows = _positive_rows(

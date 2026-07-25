@@ -1,6 +1,7 @@
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
-from aios.market_calendar import us_equity_sessions
+from aios.market_calendar import latest_completed_us_equity_session, us_equity_sessions
 
 
 def test_us_equity_calendar_matches_reviewed_2025_2026_windows() -> None:
@@ -31,3 +32,14 @@ def test_us_equity_calendar_excludes_official_closures_but_keeps_early_closes() 
         assert holiday not in sessions_2026
     assert date(2026, 11, 27) in sessions_2026
     assert date(2026, 12, 24) in sessions_2026
+
+
+def test_latest_completed_session_uses_new_york_close_not_india_midnight() -> None:
+    india = ZoneInfo("Asia/Kolkata")
+
+    assert latest_completed_us_equity_session(
+        datetime(2026, 7, 24, 1, 5, tzinfo=india)
+    ) == date(2026, 7, 22)
+    assert latest_completed_us_equity_session(
+        datetime(2026, 7, 24, 2, 0, tzinfo=india)
+    ) == date(2026, 7, 23)

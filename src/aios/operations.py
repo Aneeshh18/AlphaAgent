@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -40,11 +41,12 @@ def create_local_backup(
     project_root: Path,
     database_path: Path,
     *,
+    operations_database_path: Path | None = None,
     output: Path | None = None,
     application_version: str,
     now: datetime | None = None,
 ) -> BackupResult:
-    """Copy DuckDB and paper JSON into an atomic checksum-manifest directory."""
+    """Copy analytical, paper, and incident evidence into a verified snapshot."""
     root = Path(project_root).resolve()
     database = _resolve_under_root(root, database_path)
     if database.is_symlink() or not database.is_file():
@@ -59,7 +61,9 @@ def create_local_backup(
         raise ValueError(f"backup destination already exists: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
 
-    sources: list[tuple[Path, Path]] = [(database, Path("database") / database.name)]
+    sources: list[tuple[Path, Path, bool]] = [
+        (database, Path("database") / database.name, False)
+    ]
     paper_root = root / "data" / "paper"
     if paper_root.exists():
         if paper_root.is_symlink() or not paper_root.is_dir():
@@ -67,7 +71,30 @@ def create_local_backup(
         for source in sorted(paper_root.rglob("*.json")):
             if source.is_symlink() or not source.is_file():
                 raise ValueError(f"paper backup source must be a regular file: {source}")
-            sources.append((source, Path("paper") / source.relative_to(paper_root)))
+            sources.append((source, Path("paper") / source.relative_to(paper_root), False))
+    if operations_database_path is not None:
+        operations_database = _resolve_under_root(root, operations_database_path)
+        if operations_database.exists():
+            if operations_database.is_symlink() or not operations_database.is_file():
+                raise ValueError(
+                    f"operations backup source must be a regular file: {operations_database}"
+                )
+            sources.append(
+                (
+                    operations_database,
+                    Path("operations") / operations_database.name,
+                    True,
+                )
+            )
+    raw_root = root / "data" / "raw"
+    if raw_root.exists():
+        if raw_root.is_symlink() or not raw_root.is_dir():
+            raise ValueError(f"raw snapshot source must be a regular directory: {raw_root}")
+        for source in sorted(raw_root.rglob("*")):
+            if source.is_symlink():
+                raise ValueError(f"raw snapshot source cannot be a symlink: {source}")
+            if source.is_file():
+                sources.append((source, Path("raw") / source.relative_to(raw_root), False))
 
     temporary = Path(
         tempfile.mkdtemp(prefix=".aios-backup-", dir=str(destination.parent))
@@ -75,10 +102,13 @@ def create_local_backup(
     try:
         manifest_files: list[dict[str, Any]] = []
         total_bytes = 0
-        for source, relative in sources:
+        for source, relative, sqlite_snapshot in sources:
             target = temporary / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
+            if sqlite_snapshot:
+                _copy_sqlite_snapshot(source, target)
+            else:
+                shutil.copy2(source, target)
             size = target.stat().st_size
             total_bytes += size
             manifest_files.append(
@@ -95,7 +125,11 @@ def create_local_backup(
             "created_at": timestamp.isoformat().replace("+00:00", "Z"),
             "database_file": (Path("database") / database.name).as_posix(),
             "files": manifest_files,
-            "excludes": [".env", "logs", "backtest artifacts", "provider caches"],
+            "excludes": [".env", "logs", "backtest artifacts", "mutable provider caches"],
+            "restore_policy": {
+                "operations": "audit-only; never rolled backward during analytical restore",
+                "raw": "immutable merge; newer content-addressed payloads are retained",
+            },
         }
         encoded = _canonical_json(manifest)
         manifest_path = temporary / "manifest.json"
@@ -189,6 +223,7 @@ def restore_local_backup(
     project_root: Path,
     database_path: Path,
     *,
+    operations_database_path: Path | None = None,
     application_version: str,
     confirm: bool = False,
     now: datetime | None = None,
@@ -203,7 +238,11 @@ def restore_local_backup(
     allowed_files: list[Path] = []
     for item in manifest["files"]:
         relative = _safe_relative_path(item["path"])
-        if relative != database_relative and relative.parts[0] != "paper":
+        if relative != database_relative and relative.parts[0] not in {
+            "paper",
+            "operations",
+            "raw",
+        }:
             raise ValueError(f"backup contains an unsupported restore path: {relative}")
         allowed_files.append(relative)
 
@@ -218,6 +257,7 @@ def restore_local_backup(
     safety = create_local_backup(
         root,
         database_target,
+        operations_database_path=operations_database_path,
         output=safety_destination,
         application_version=application_version,
         now=timestamp,
@@ -240,6 +280,19 @@ def restore_local_backup(
             target = staged_paper / Path(*relative.parts[1:])
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source / relative, target)
+
+        raw_files = [relative for relative in allowed_files if relative.parts[0] == "raw"]
+        for relative in raw_files:
+            live_target = data_root / relative
+            live_target.parent.mkdir(parents=True, exist_ok=True)
+            source_file = source / relative
+            if live_target.exists():
+                if live_target.is_symlink() or not live_target.is_file():
+                    raise ValueError(f"live raw snapshot path is unsafe: {live_target}")
+                if _file_sha256(live_target) != _file_sha256(source_file):
+                    raise ValueError(f"immutable raw snapshot conflicts during restore: {relative}")
+            else:
+                shutil.copy2(source_file, live_target)
 
         if paper_target.exists():
             os.replace(paper_target, old_paper)
@@ -288,6 +341,16 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _copy_sqlite_snapshot(source: Path, target: Path) -> None:
+    """Use SQLite's online backup API so WAL-backed incident data is consistent."""
+    source_uri = f"file:{source.as_posix()}?mode=ro"
+    with (
+        sqlite3.connect(source_uri, uri=True, timeout=5.0) as source_connection,
+        sqlite3.connect(target, timeout=5.0) as target_connection,
+    ):
+        source_connection.backup(target_connection)
 
 
 def _canonical_json(value: dict[str, Any]) -> bytes:

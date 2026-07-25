@@ -7,7 +7,7 @@ from typer.testing import CliRunner
 
 import aios.refresh as refresh_module
 from aios import cli
-from aios.refresh import USRefreshResult, refresh_us_current
+from aios.refresh import RefreshFailure, USRefreshResult, refresh_us_current
 
 
 class FakeStore:
@@ -128,6 +128,29 @@ def test_current_us_refresh_retains_each_price_failure_and_continues() -> None:
     ]
 
 
+def test_current_us_refresh_can_skip_a_benchmark_already_bootstrapped_by_daily_cycle() -> None:
+    store = FakeStore([{"ticker": "AAA", "security_id": "sec-a"}])
+    benchmarks: list[str] = []
+
+    result = refresh_us_current(
+        "2026-07-21",
+        today=date(2026, 7, 21),
+        store=store,  # type: ignore[arg-type]
+        minimum_members=1,
+        maximum_members=10,
+        include_benchmark=False,
+        include_fundamentals=False,
+        include_macro=False,
+        security_price_ingester=lambda _security: 5,
+        benchmark_ingester=lambda ticker: benchmarks.append(ticker) or 5,
+    )
+
+    assert result.ok is True
+    assert result.price_rows == 5
+    assert result.benchmark_rows == 0
+    assert benchmarks == []
+
+
 def test_current_us_refresh_warns_for_reviewed_pre_filing_issuer() -> None:
     store = FakeStore([{"ticker": "AAA", "security_id": "sec-a"}])
 
@@ -213,6 +236,7 @@ def test_current_us_refresh_uses_latest_recent_reviewed_membership() -> None:
 
 def test_current_us_refresh_cli_keeps_membership_review_boundary(monkeypatch) -> None:
     captured: dict[str, object] = {}
+    recovered: list[str] = []
 
     def fake_refresh(as_of, **kwargs) -> USRefreshResult:
         captured.update(as_of=as_of, **kwargs)
@@ -230,6 +254,7 @@ def test_current_us_refresh_cli_keeps_membership_review_boundary(monkeypatch) ->
         )
 
     monkeypatch.setattr(refresh_module, "refresh_us_current", fake_refresh)
+    monkeypatch.setattr(cli, "_resolve_operational_alert", recovered.append)
     result = CliRunner().invoke(
         cli.app,
         ["refresh-us-current", "--as-of", "2026-07-21", "--no-fundamentals"],
@@ -240,3 +265,41 @@ def test_current_us_refresh_cli_keeps_membership_review_boundary(monkeypatch) ->
     assert captured["include_fundamentals"] is False
     assert "already reviewed identities" in result.output
     assert "Run `aios health`" in result.output
+    assert recovered == [
+        "refresh:prices-macro:failure",
+        "refresh:prices-macro:partial",
+    ]
+
+
+def test_current_us_refresh_cli_records_zero_exit_degradation(monkeypatch) -> None:
+    emitted = []
+    recovered: list[str] = []
+
+    def fake_refresh(_as_of, **_kwargs) -> USRefreshResult:
+        return USRefreshResult(
+            as_of="2026-07-21",
+            universe_id="sp500",
+            members=503,
+            issuers_attempted=0,
+            securities_attempted=503,
+            macro_rows=10,
+            fundamental_rows=0,
+            price_rows=1_000,
+            benchmark_rows=2,
+            failures=(),
+            warnings=(RefreshFailure("price", "ABC", "provider delay"),),
+        )
+
+    monkeypatch.setattr(refresh_module, "refresh_us_current", fake_refresh)
+    monkeypatch.setattr(cli, "_emit_operational_alert", emitted.append)
+    monkeypatch.setattr(cli, "_resolve_operational_alert", recovered.append)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["refresh-us-current", "--as-of", "2026-07-21", "--no-fundamentals"],
+    )
+
+    assert result.exit_code == 0
+    assert [alert.code for alert in emitted] == ["current_refresh_partial"]
+    assert emitted[0].payload["identities"] == ["ABC"]
+    assert recovered == ["refresh:prices-macro:failure"]

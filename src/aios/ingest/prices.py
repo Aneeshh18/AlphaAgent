@@ -14,7 +14,10 @@ adjustment reconciliation is a downstream concern, not an ingest one.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+import json
+import time
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
 from uuid import uuid4
@@ -24,18 +27,33 @@ from structlog import get_logger
 
 from aios.config import settings
 from aios.ingest.http_client import get_http
+from aios.market_calendar import latest_completed_us_equity_session
+from aios.raw_snapshots import (
+    canonical_request_fingerprint,
+    capture_raw_snapshot,
+)
 from aios.storage.store import Store, get_store
 
 log = get_logger(__name__)
 
 STOOQ_URL = "https://stooq.com/q/d/l/"
 TIINGO_EOD_URL = "https://api.tiingo.com/tiingo/daily/{symbol}/prices"
+YFINANCE_EXPORT_SCHEMA_VERSION = 1
+YFINANCE_PARSER_VERSION = "yfinance-normalized-v1"
 
 
 # ----------------------------------------------------------------------
 # yfinance (primary)
 # ----------------------------------------------------------------------
-def fetch_yfinance(ticker: str, start: str | None = None, end: str | None = None) -> list[dict]:
+def fetch_yfinance(
+    ticker: str,
+    start: str | None = None,
+    end: str | None = None,
+    *,
+    store: Store | None = None,
+    ingest_run_id: str | None = None,
+    project_root: Path | None = None,
+) -> list[dict]:
     """Fetch EOD prices and enough later split actions to restore raw basis.
 
     Yahoo retrospectively split-normalizes historical ``Close``. The bounded
@@ -49,22 +67,60 @@ def fetch_yfinance(ticker: str, start: str | None = None, end: str | None = None
         raise RuntimeError("yfinance not installed") from e
 
     period_start = start or "1995-01-01"
-    period_end = end or date.today().isoformat()
+    latest_completed = latest_completed_us_equity_session()
+    safe_exclusive_end = latest_completed + timedelta(days=1)
+    period_end = end or safe_exclusive_end.isoformat()
     requested_start = date.fromisoformat(period_start)
     requested_end = date.fromisoformat(period_end)
-    normalization_end = max(requested_end, date.today() + timedelta(days=1))
+    normalization_end = max(requested_end, safe_exclusive_end)
 
-    df: pd.DataFrame = yf.download(
-        ticker,
-        start=period_start,
-        end=normalization_end.isoformat(),
-        actions=True,
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-    )
+    requested_at = datetime.now(UTC)
+    df: pd.DataFrame | None = None
+    attempts = settings.yfinance_max_attempts
+    for attempt in range(1, attempts + 1):
+        try:
+            df = yf.download(
+                ticker,
+                start=period_start,
+                end=normalization_end.isoformat(),
+                actions=True,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+        except Exception as exc:
+            log.warning(
+                "prices.yfinance_attempt_failed",
+                ticker=ticker,
+                attempt=attempt,
+                attempts=attempts,
+                error=str(exc),
+            )
+            if attempt == attempts:
+                raise
+        else:
+            if df is not None and not df.empty:
+                break
+            log.warning(
+                "prices.yfinance_empty_attempt",
+                ticker=ticker,
+                attempt=attempt,
+                attempts=attempts,
+            )
+
+        if attempt == attempts:
+            break
+        delay = settings.yfinance_retry_base_sec * (2 ** (attempt - 1))
+        log.info(
+            "prices.yfinance_retrying",
+            ticker=ticker,
+            next_attempt=attempt + 1,
+            sleep_seconds=delay,
+        )
+        time.sleep(delay)
+
     if df is None or df.empty:
-        log.warning("prices.yfinance_empty", ticker=ticker)
+        log.warning("prices.yfinance_empty_exhausted", ticker=ticker, attempts=attempts)
         return []
 
     # yfinance may return MultiIndex columns when a single ticker is passed in
@@ -72,12 +128,13 @@ def fetch_yfinance(ticker: str, start: str | None = None, end: str | None = None
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    rows: list[dict] = []
+    export_rows: list[dict[str, Any]] = []
     for ts, r in df.iterrows():
         row_date = ts.date() if hasattr(ts, "date") else date.fromisoformat(str(ts)[:10])
-        rows.append(
+        if row_date >= safe_exclusive_end:
+            continue
+        export_rows.append(
             {
-                "ticker": ticker.upper(),
                 "date": row_date.isoformat(),
                 "open": _f(r.get("Open")),
                 "high": _f(r.get("High")),
@@ -85,15 +142,126 @@ def fetch_yfinance(ticker: str, start: str | None = None, end: str | None = None
                 "close": _f(r.get("Close")),
                 "adj_close": _f(r.get("Adj Close")),
                 "volume": int(r["Volume"]) if pd.notna(r.get("Volume")) else None,
-                "dividends": _f(r.get("Dividends")) or 0.0,
-                "split_ratio": _f(r.get("Stock Splits")) or 1.0,
+                "dividends": _f(r.get("Dividends")),
+                "stock_splits": _f(r.get("Stock Splits")),
+            }
+        )
+    export_rows.sort(key=lambda row: row["date"])
+    export = {
+        "export_schema_version": YFINANCE_EXPORT_SCHEMA_VERSION,
+        "provider": "yfinance",
+        "symbol": ticker.upper(),
+        "requested_start": requested_start.isoformat(),
+        "requested_end_exclusive": requested_end.isoformat(),
+        "normalization_through": latest_completed.isoformat(),
+        "provider_rows": export_rows,
+    }
+    payload = json.dumps(
+        export,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    bounded = parse_yfinance_normalized_export(payload)
+    if store is not None:
+        capture_raw_snapshot(
+            payload,
+            provider="yfinance",
+            dataset="daily-prices",
+            artifact_kind="normalized_provider_export",
+            requested_at=requested_at,
+            received_at=datetime.now(UTC),
+            request_fingerprint=canonical_request_fingerprint(
+                {
+                    "adapter": "yfinance.download",
+                    "symbol": ticker.upper(),
+                    "start": period_start,
+                    "end": normalization_end.isoformat(),
+                    "actions": True,
+                    "auto_adjust": False,
+                }
+            ),
+            adapter_name="aios-yfinance-library",
+            adapter_version="1",
+            parser_version=YFINANCE_PARSER_VERSION,
+            content_type="application/vnd.aios.yfinance-normalized+json",
+            parsed_rows=bounded,
+            ingest_run_id=ingest_run_id,
+            role=f"prices:{ticker.upper()}",
+            store=store,
+            project_root=project_root,
+        )
+    log.info(
+        "prices.yfinance_fetched",
+        ticker=ticker,
+        rows=len(bounded),
+        split_scan_through=latest_completed.isoformat(),
+    )
+    return bounded
+
+
+def parse_yfinance_normalized_export(payload: bytes) -> list[dict[str, Any]]:
+    """Replay one canonical yfinance library export into AIOS price rows."""
+    try:
+        export = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("yfinance normalized export is not valid JSON") from exc
+    if not isinstance(export, dict):
+        raise ValueError("yfinance normalized export must be an object")
+    if (
+        export.get("export_schema_version") != YFINANCE_EXPORT_SCHEMA_VERSION
+        or export.get("provider") != "yfinance"
+    ):
+        raise ValueError("unsupported yfinance normalized export")
+
+    ticker = str(export.get("symbol") or "").strip().upper()
+    if not ticker:
+        raise ValueError("yfinance normalized export has no symbol")
+    requested_start = date.fromisoformat(str(export["requested_start"]))
+    requested_end = date.fromisoformat(str(export["requested_end_exclusive"]))
+    normalization_through = date.fromisoformat(str(export["normalization_through"]))
+    if requested_start >= requested_end:
+        raise ValueError("yfinance normalized export has an invalid requested window")
+
+    provider_rows = export.get("provider_rows")
+    if not isinstance(provider_rows, list):
+        raise ValueError("yfinance normalized export has no provider row array")
+    rows: list[dict[str, Any]] = []
+    seen_dates: set[date] = set()
+    for provider_row in provider_rows:
+        if not isinstance(provider_row, dict):
+            raise ValueError("yfinance normalized export contains a non-object row")
+        row_date = date.fromisoformat(str(provider_row["date"]))
+        if row_date in seen_dates:
+            raise ValueError(f"duplicate yfinance export date: {row_date}")
+        if row_date > normalization_through:
+            raise ValueError(f"yfinance export contains an incomplete session: {row_date}")
+        seen_dates.add(row_date)
+        rows.append(
+            {
+                "ticker": ticker,
+                "date": row_date.isoformat(),
+                "open": _f(provider_row.get("open")),
+                "high": _f(provider_row.get("high")),
+                "low": _f(provider_row.get("low")),
+                "close": _f(provider_row.get("close")),
+                "adj_close": _f(provider_row.get("adj_close")),
+                "volume": (
+                    int(provider_row["volume"])
+                    if provider_row.get("volume") is not None
+                    else None
+                ),
+                "dividends": _f(provider_row.get("dividends")) or 0.0,
+                "split_ratio": _f(provider_row.get("stock_splits")) or 1.0,
                 "actions_complete": True,
                 "close_split_adjusted": True,
                 "split_normalization_factor": None,
-                "split_normalization_through": date.today().isoformat(),
+                "split_normalization_through": normalization_through.isoformat(),
                 "source": "yfinance",
             }
         )
+    rows.sort(key=lambda row: row["date"])
     cumulative_later_splits = 1.0
     for row in reversed(rows):
         row["split_normalization_factor"] = cumulative_later_splits
@@ -102,22 +270,15 @@ def fetch_yfinance(ticker: str, start: str | None = None, end: str | None = None
             raise ValueError(f"invalid yfinance split ratio for {ticker}: {split_ratio}")
         cumulative_later_splits *= split_ratio
 
-    # Never certify the local calendar's current date as EOD. Depending on the
-    # server timezone and provider timing it may still be an open/partial U.S.
-    # session. It becomes eligible on the next local day.
-    completed_end = min(requested_end, date.today())
-    bounded = [
+    completed_end = min(
+        requested_end,
+        normalization_through + timedelta(days=1),
+    )
+    return [
         row
         for row in rows
         if requested_start <= date.fromisoformat(row["date"]) < completed_end
     ]
-    log.info(
-        "prices.yfinance_fetched",
-        ticker=ticker,
-        rows=len(bounded),
-        split_scan_through=date.today().isoformat(),
-    )
-    return bounded
 
 
 # ----------------------------------------------------------------------
@@ -136,11 +297,13 @@ def fetch_stooq(
 ) -> list[dict]:
     """Fetch EOD prices via Stooq CSV download (no key). Returns row dicts."""
     sym = _stooq_symbol(ticker)
+    safe_exclusive_end = latest_completed_us_equity_session() + timedelta(days=1)
+    requested_end = date.fromisoformat(end) if end else safe_exclusive_end
+    completed_end = min(requested_end, safe_exclusive_end)
     params = {"s": sym, "i": "d"}
     if start:
         params["d1"] = start.replace("-", "")
-    if end:
-        params["d2"] = end.replace("-", "")
+    params["d2"] = completed_end.isoformat().replace("-", "")
     url = f"{STOOQ_URL}?{urlencode(params)}"
     csv_text = get_http().get_text(url)
     if not csv_text or "No data" in csv_text:
@@ -155,10 +318,13 @@ def fetch_stooq(
 
     rows: list[dict] = []
     for _, r in df.iterrows():
+        row_date = date.fromisoformat(str(r["Date"])[:10])
+        if row_date >= completed_end:
+            continue
         rows.append(
             {
                 "ticker": ticker.upper(),
-                "date": str(r["Date"]),
+                "date": row_date.isoformat(),
                 "open": _f(r.get("Open")),
                 "high": _f(r.get("High")),
                 "low": _f(r.get("Low")),
@@ -204,7 +370,9 @@ def fetch_tiingo(
     if not isinstance(payload, list):
         raise ValueError("Tiingo EOD response is not a row array")
 
-    end_date = date.fromisoformat(end) if end else None
+    safe_exclusive_end = latest_completed_us_equity_session() + timedelta(days=1)
+    requested_end = date.fromisoformat(end) if end else safe_exclusive_end
+    end_date = min(requested_end, safe_exclusive_end)
     rows: list[dict] = []
     for raw in payload:
         if not isinstance(raw, dict) or not raw.get("date"):
@@ -238,10 +406,23 @@ def fetch_tiingo(
 # ----------------------------------------------------------------------
 # Unified fetch + store
 # ----------------------------------------------------------------------
-def fetch_prices(ticker: str, start: str | None = None, end: str | None = None) -> list[dict]:
+def fetch_prices(
+    ticker: str,
+    start: str | None = None,
+    end: str | None = None,
+    *,
+    store: Store | None = None,
+    ingest_run_id: str | None = None,
+) -> list[dict]:
     """Try yfinance, configured Tiingo, then Stooq on empty/failure."""
     try:
-        rows = fetch_yfinance(ticker, start=start, end=end)
+        rows = fetch_yfinance(
+            ticker,
+            start=start,
+            end=end,
+            store=store,
+            ingest_run_id=ingest_run_id,
+        )
     except Exception as e:
         log.warning("prices.yfinance_failed", ticker=ticker, error=str(e))
         rows = []
@@ -269,11 +450,20 @@ def fetch_provider_prices(
     provider_symbol: str,
     start: str,
     end: str,
+    *,
+    store: Store | None = None,
+    ingest_run_id: str | None = None,
 ) -> list[dict]:
     """Fetch one explicitly reviewed provider mapping without cross-provider fallback."""
     provider = provider.lower()
     if provider == "yfinance":
-        return fetch_yfinance(provider_symbol, start=start, end=end)
+        return fetch_yfinance(
+            provider_symbol,
+            start=start,
+            end=end,
+            store=store,
+            ingest_run_id=ingest_run_id,
+        )
     if provider == "stooq":
         return fetch_stooq(provider_symbol, start=start, end=end)
     if provider == "tiingo":
@@ -399,6 +589,8 @@ def ingest_security_prices(
                 mapping["provider_symbol"],
                 segment_start.isoformat(),
                 segment_end.isoformat(),
+                store=db,
+                ingest_run_id=run_id,
             )
             assignments = db.security_ticker_assignments(
                 security_id,
@@ -448,7 +640,13 @@ def ingest_prices(
                 # Re-fetch a short overlap so recent corrections, dividends,
                 # and exchange-date revisions can replace existing rows.
                 fetch_start = (latest - timedelta(days=5)).isoformat()
-        rows = fetch_prices(ticker, start=fetch_start, end=end)
+        rows = fetch_prices(
+            ticker,
+            start=fetch_start,
+            end=end,
+            store=store,
+            ingest_run_id=run_id,
+        )
         n = store.upsert_prices(rows) if rows else 0
         store.record_ingest(
             run_id=run_id,

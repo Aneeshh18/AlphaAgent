@@ -10,19 +10,27 @@ Commands
   aios health        — one plain-language operating check
   aios backup        — checksum-verified local data/paper backup
   aios verify-backup — verify a backup without restoring it
+  aios verify-raw-snapshots — verify immutable provider payloads
+  aios review-universe-current — safely roll forward unchanged S&P 500 coverage
   aios restore       — confirmed recovery with automatic rollback backup
   aios scheduler-install — enable local refresh/health/backup timers
   aios scheduler-status — show whether local timers are enabled and waiting
   aios scheduler-pause/resume — safely stop/start local timers
   aios scheduler-remove — disable and remove only AIOS-managed timer files
+  aios alerts        — inspect durable local operating incidents
+  aios alert-test    — verify the local incident lifecycle
+  aios alert-ack     — acknowledge one unresolved incident
+  aios alert-resolve — explicitly resolve one incident
   aios dashboard     — open the local research dashboard
   aios paper-init    — create a local simulation-only portfolio
   aios forward-freeze — freeze policy/configuration for untouched monitoring
+  aios forward-restart — prospectively replace and archive a drifted trial
   aios forward-status — verify the active forward policy has not drifted
   aios paper-propose — build a reviewed QV simulation proposal
   aios paper-execute — explicitly simulate an approved proposal
   aios paper-mark    — update simulated holdings through a reviewed close
   aios paper-status  — show local simulation state in plain language
+  aios refresh-us-daily — recoverably certify the latest completed U.S. session
   aios refresh-us-current — refresh reviewed U.S. prices, filings, and macro
   aios ingest-macro  — pull FRED + Treasury macro series
   aios build-universe-membership — reconcile spans with public change events
@@ -65,7 +73,7 @@ import sys
 from contextlib import suppress
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import uuid4
 
 import duckdb
@@ -101,6 +109,26 @@ LIQUIDATION_EXTENSION_FILE_ARGUMENT = typer.Argument(
 def _project_path(path: Path) -> Path:
     """Resolve a CLI data path consistently when invoked outside the repo."""
     return path if path.is_absolute() else settings.project_root / path
+
+
+def _emit_operational_alert(alert: Any) -> None:
+    """Persist an application alert without changing the originating job result."""
+    try:
+        from aios.alerts import get_alert_store
+
+        get_alert_store().emit(alert)
+    except Exception as exc:
+        console.print(f"[yellow]Local incident recording failed:[/yellow] {exc}")
+
+
+def _resolve_operational_alert(fingerprint: str) -> None:
+    """Record recovery best-effort; notifier errors never fail the healthy job."""
+    try:
+        from aios.alerts import get_alert_store
+
+        get_alert_store().resolve_fingerprint(fingerprint)
+    except Exception as exc:
+        console.print(f"[yellow]Local incident recovery recording failed:[/yellow] {exc}")
 
 
 @app.command()
@@ -197,12 +225,38 @@ def health(
                 paper_ok = False
                 paper_detail = f"blocked; local paper state could not be verified ({exc})"
     except duckdb.IOException as exc:
+        from aios.alerts import Alert, AlertSeverity
+
+        _emit_operational_alert(
+            Alert(
+                code="health_check_failed",
+                severity=AlertSeverity.CRITICAL,
+                title="AIOS health check could not open the database",
+                body="The operating health check failed before readiness could be verified.",
+                dedup_key="health:execution",
+                source_job="aios health",
+                payload={"error_type": type(exc).__name__},
+            )
+        )
         console.print(
             "[red]Health check could not open the local database.[/red] Close the "
             "dashboard or another AIOS command, then retry."
         )
         raise typer.Exit(code=1) from exc
     except Exception as exc:
+        from aios.alerts import Alert, AlertSeverity
+
+        _emit_operational_alert(
+            Alert(
+                code="health_check_failed",
+                severity=AlertSeverity.CRITICAL,
+                title="AIOS health check failed",
+                body="The operating health check failed before a safe result was produced.",
+                dedup_key="health:execution",
+                source_job="aios health",
+                payload={"error_type": type(exc).__name__},
+            )
+        )
         console.print(f"[red]Health check failed safely:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
@@ -235,16 +289,41 @@ def health(
     )
     console.print(table)
     console.print(
-        f"Source dates — prices: {report.raw_prices_through}; filings: "
+        f"Certified decision date: {decision_date}. Source dates — prices: "
+        f"{report.raw_prices_through}; filings: "
         f"{report.fundamentals_through}; macro releases: "
         f"{report.macro_releases_through}."
     )
+    if report.raw_prices_through and report.raw_prices_through > decision_date.isoformat():
+        console.print(
+            "Newer reviewed prices may value existing simulated holdings, but they do not "
+            "advance new decisions until the dated universe is certified too."
+        )
     healthy = report.ready and integrity.status != "fail" and paper_ok
+    _resolve_operational_alert("health:execution")
     if healthy:
+        _resolve_operational_alert("readiness:paper")
         console.print(
             "[bold green]HEALTHY for supervised research and paper monitoring.[/bold green]"
         )
     else:
+        from aios.alerts import Alert, AlertSeverity
+
+        _emit_operational_alert(
+            Alert(
+                code="readiness_blocked",
+                severity=AlertSeverity.CRITICAL,
+                title="Paper research readiness became blocked",
+                body="One or more fail-closed operating gates require review.",
+                dedup_key="readiness:paper",
+                source_job="aios health",
+                payload={
+                    "decision_date": str(decision_date),
+                    "blockers": [check.check for check in report.blockers],
+                    "paper_state_verified": paper_ok,
+                },
+            )
+        )
         console.print("[bold red]BLOCKED — do not create or record a paper proposal.[/bold red]")
     if strict and not healthy:
         raise typer.Exit(code=1)
@@ -272,22 +351,50 @@ def backup(
         result = create_local_backup(
             settings.project_root,
             _project_path(settings.duckdb_path),
+            operations_database_path=_project_path(settings.operations_db_path),
             output=destination,
             application_version=__version__,
         )
     except duckdb.IOException as exc:
+        from aios.alerts import Alert, AlertSeverity
+
+        _emit_operational_alert(
+            Alert(
+                code="backup_failed",
+                severity=AlertSeverity.CRITICAL,
+                title="Verified local backup failed",
+                body="The backup could not acquire and checkpoint the analytical database.",
+                dedup_key="backup:local",
+                source_job="aios backup",
+                payload={"error_type": type(exc).__name__},
+            )
+        )
         console.print(
             "[red]Backup could not lock the local database.[/red] Close the dashboard "
             "and any other AIOS command, then retry."
         )
         raise typer.Exit(code=1) from exc
     except (OSError, RuntimeError, ValueError) as exc:
+        from aios.alerts import Alert, AlertSeverity
+
+        _emit_operational_alert(
+            Alert(
+                code="backup_failed",
+                severity=AlertSeverity.CRITICAL,
+                title="Verified local backup failed",
+                body="The local backup did not complete verification.",
+                dedup_key="backup:local",
+                source_job="aios backup",
+                payload={"error_type": type(exc).__name__},
+            )
+        )
         console.print(f"[red]Backup failed safely:[/red] {exc}")
         raise typer.Exit(code=1) from exc
     finally:
         if store is not None:
             with suppress(Exception):
                 store.close()
+    _resolve_operational_alert("backup:local")
     console.print(f"[bold green]Verified backup created:[/bold green] {result.path}")
     console.print(
         f"{result.files} file(s), {result.bytes:,} bytes; manifest SHA-256 "
@@ -312,6 +419,120 @@ def verify_backup(
         f"[bold green]Backup verified:[/bold green] {result.path} "
         f"({result.files} file(s), {result.bytes:,} bytes)."
     )
+
+
+@app.command("verify-raw-snapshots")
+def verify_raw_snapshot_command() -> None:
+    """Verify every registered immutable provider payload."""
+    from aios.raw_snapshots import verify_raw_snapshots
+
+    try:
+        result = verify_raw_snapshots()
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Raw snapshot verification failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        "[bold green]Raw snapshots verified:[/bold green] "
+        f"{result.payloads} payload(s), {result.original_bytes:,} original bytes, "
+        f"{result.stored_bytes:,} stored bytes, "
+        f"{result.replayed_snapshots} normalized replay(s)."
+    )
+
+
+@app.command("review-universe-current")
+def review_universe_current() -> None:
+    """Archive free source evidence and extend only an unchanged S&P 500 universe."""
+    from aios.alerts import Alert, AlertSeverity
+    from aios.universe_rollforward import roll_forward_sp500_coverage
+
+    try:
+        result = roll_forward_sp500_coverage()
+    except duckdb.IOException as exc:
+        _emit_operational_alert(
+            Alert(
+                code="universe_coverage_check_failed",
+                severity=AlertSeverity.CRITICAL,
+                title="Current universe review could not open the database",
+                body="The dated reference window was not changed.",
+                dedup_key="universe:coverage:execution",
+                source_job="aios review-universe-current",
+                payload={"error_type": type(exc).__name__},
+            )
+        )
+        console.print(
+            "[red]Universe review could not open DuckDB.[/red] Close the dashboard "
+            "or another AIOS command, then retry. No reference dates were changed."
+        )
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:
+        _emit_operational_alert(
+            Alert(
+                code="universe_coverage_check_failed",
+                severity=AlertSeverity.CRITICAL,
+                title="Current universe evidence check failed",
+                body=(
+                    "Free source evidence could not be certified; all dated references "
+                    "stayed closed."
+                ),
+                dedup_key="universe:coverage:execution",
+                source_job="aios review-universe-current",
+                payload={"error_type": type(exc).__name__},
+            )
+        )
+        console.print(f"[red]Universe review failed safely:[/red] {exc}")
+        console.print("No membership, identity, CIK, issuer, or provider date was extended.")
+        raise typer.Exit(code=1) from exc
+
+    table = Table(title="Current S&P 500 evidence review")
+    table.add_column("evidence")
+    table.add_column("result")
+    table.add_row("Previous certified date", result.prior_coverage_through)
+    table.add_row("Newest eligible market close", result.requested_coverage_through)
+    table.add_row("Reviewed member set", f"{result.member_count} stocks")
+    table.add_row("Official release records checked", str(result.official_release_count))
+    table.add_row("Unreviewed change announcements", str(result.relevant_release_count))
+    table.add_row("Identity/component mismatches", str(result.identity_mismatch_count))
+    console.print(table)
+    _resolve_operational_alert("universe:coverage:execution")
+
+    if result.review_required:
+        _emit_operational_alert(
+            Alert(
+                code="universe_change_review_required",
+                severity=AlertSeverity.WARNING,
+                title="S&P 500 change or reference drift needs review",
+                body="Automatic extension stopped before changing any dated reference.",
+                dedup_key="universe:coverage:review",
+                source_job="aios review-universe-current",
+                payload={
+                    "attestation_id": result.attestation_id,
+                    "target": result.requested_coverage_through,
+                    "announcement_candidates": result.relevant_release_count,
+                    "identity_mismatches": result.identity_mismatch_count,
+                },
+            )
+        )
+        console.print(f"[bold red]REVIEW REQUIRED:[/bold red] {result.detail}")
+        console.print(
+            "The previous certified decision date remains usable; newer decisions stay blocked."
+        )
+        raise typer.Exit(code=1)
+
+    _resolve_operational_alert("universe:coverage:review")
+    if result.status == "up_to_date":
+        console.print(
+            "[bold green]Universe coverage is already current for the newest eligible "
+            "close.[/bold green]"
+        )
+    else:
+        console.print(
+            "[bold green]Unchanged universe coverage extended safely through "
+            f"{result.requested_coverage_through}.[/bold green]"
+        )
+        console.print(
+            "Membership, security, issuer/CIK, and provider-symbol windows moved together "
+            "in one transaction."
+        )
 
 
 @app.command("restore")
@@ -340,6 +561,7 @@ def restore(
             _project_path(path),
             settings.project_root,
             database_path,
+            operations_database_path=_project_path(settings.operations_db_path),
             application_version=__version__,
             confirm=confirm_restore,
         )
@@ -383,14 +605,25 @@ def scheduler_install(
             help="Required acknowledgement before user-level timers are installed.",
         ),
     ] = False,
+    keep_running_after_logout: Annotated[
+        bool,
+        typer.Option(
+            "--keep-running-after-logout/--login-session-only",
+            help=(
+                "Keep the free local user scheduler alive when the desktop logs out. "
+                "Recommended for automatic updates."
+            ),
+        ),
+    ] = False,
 ) -> None:
-    """Install weekday refresh, weekly filings, and verified-backup user timers."""
+    """Install recoverable daily, filings, and backup user timers."""
     from aios.scheduler import install_user_scheduler
 
     try:
         result = install_user_scheduler(
             settings.project_root,
             confirm=confirm_install,
+            enable_linger=keep_running_after_logout,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         console.print(f"[red]Scheduler installation refused safely:[/red] {exc}")
@@ -400,19 +633,33 @@ def scheduler_install(
         f"timers in {result.unit_dir}."
     )
     console.print(
-        "Weekday prices/macro run at 07:30, weekly filings Saturday at 09:00, "
-        "and verified backups Sunday at 09:00 (computer local time)."
+        "After every U.S. weekday, one benchmark-first daily update runs at 02:00 "
+        "New York time. It also checks three minutes after the user scheduler starts, "
+        "so an interrupted or missed run catches up safely. "
+        "Weekly filings run Saturday at 09:00, and verified backups Sunday at 09:00 "
+        "(the weekly jobs use computer local time)."
     )
+    if result.linger_enabled:
+        console.print(
+            "[green]Keep-running-after-logout is enabled.[/green] The scheduler remains "
+            "active while this computer is on, even after the desktop logs out."
+        )
+    else:
+        console.print(
+            "[yellow]Login-session-only mode.[/yellow] Startup catch-up is enabled, but "
+            "a logged-out desktop cannot refresh until the next login. Reinstall with "
+            "`--keep-running-after-logout` for unattended local updates."
+        )
     console.print(
-        "[yellow]Close the dashboard before a scheduled run.[/yellow] DuckDB is a "
-        "single-process local store; a collision fails safely and is visible in status/logs."
+        "The dashboard uses short read-only database sessions, and scheduled jobs wait up "
+        "to five minutes for a brief overlap. Close it only for restore operations."
     )
 
 
 @app.command("scheduler-status")
 def scheduler_status() -> None:
     """Show whether each supported local timer is installed and waiting."""
-    from aios.scheduler import user_scheduler_status
+    from aios.scheduler import user_linger_status, user_scheduler_status
 
     try:
         status = user_scheduler_status()
@@ -459,12 +706,40 @@ def scheduler_status() -> None:
             state["next_trigger"],
         )
     console.print(table)
-    if any(not state.get("runtime_verified", True) for state in status.values()):
+    linger = user_linger_status()
+    if linger is True:
+        console.print("Keep running after desktop logout: [green]enabled[/green]")
+    elif linger is False:
+        console.print("Keep running after desktop logout: [yellow]disabled[/yellow]")
+    else:
+        console.print("Keep running after desktop logout: [yellow]not verified[/yellow]")
+    runtime_unverified = any(
+        not state.get("runtime_verified", True) for state in status.values()
+    )
+    if runtime_unverified:
+        from aios.alerts import Alert, AlertSeverity
+
+        _emit_operational_alert(
+            Alert(
+                code="scheduler_runtime_unverified",
+                severity=AlertSeverity.WARNING,
+                title="Local scheduler runtime could not be verified",
+                body=(
+                    "Installed timer files are visible, but the user service manager "
+                    "did not answer."
+                ),
+                dedup_key="scheduler:runtime-unverified",
+                source_job="aios scheduler-status",
+                payload={"timers": sorted(status)},
+            )
+        )
         console.print(
             "[yellow]The systemd user manager did not answer within 5 seconds.[/yellow] "
             "Installed/enabled files are shown, but live waiting and run times could not "
             "be verified. Try again from your normal logged-in terminal."
         )
+    else:
+        _resolve_operational_alert("scheduler:runtime-unverified")
 
 
 @app.command("scheduler-pause")
@@ -512,6 +787,175 @@ def scheduler_remove(
     console.print(
         f"[green]Local AIOS scheduler removed:[/green] {len(removed)} managed file(s)."
     )
+
+
+@app.command("alerts")
+def alerts_command(
+    unresolved: Annotated[
+        bool,
+        typer.Option(
+            "--unresolved/--all",
+            help="Show only open or acknowledged incidents, or include resolved history.",
+        ),
+    ] = False,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", min=1, max=1000, help="Maximum incidents to display."),
+    ] = 100,
+) -> None:
+    """Show durable local system failures and operating incidents."""
+    from aios.alerts import get_alert_store
+
+    try:
+        incidents = get_alert_store().list(unresolved_only=unresolved, limit=limit)
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Incident history is unavailable:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    table = Table(title="AIOS local incident history")
+    table.add_column("incident ref", min_width=12, no_wrap=True)
+    table.add_column("severity")
+    table.add_column("state")
+    table.add_column("last seen", no_wrap=True)
+    table.add_column("count", justify="right")
+    table.add_column("summary")
+    for incident in incidents:
+        table.add_row(
+            incident.incident_id[:12],
+            incident.severity,
+            incident.state,
+            incident.last_seen_at[:16].replace("T", " "),
+            str(incident.occurrence_count),
+            incident.title,
+        )
+    console.print(table)
+    if not incidents:
+        console.print("No matching incidents are recorded.")
+    console.print("Use `aios alert-show INCIDENT_REF` for structured failure evidence.")
+
+
+@app.command("alert-show")
+def alert_show(
+    incident_id: Annotated[str, typer.Argument(help="Incident reference shown by `aios alerts`.")],
+) -> None:
+    """Show one incident and its append-only lifecycle events."""
+    from aios.alerts import get_alert_store
+
+    try:
+        store = get_alert_store()
+        incident = store.get(incident_id)
+        events = store.events(incident_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Incident detail is unavailable:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.rule(f"[bold]{incident.title}[/bold]")
+    console.print(f"Incident: {incident.incident_id}")
+    console.print(f"Code: {incident.code}")
+    console.print(f"Severity/state: {incident.severity} / {incident.state}")
+    console.print(f"Source: {incident.source_job}")
+    console.print(f"First/last seen: {incident.first_seen_at} / {incident.last_seen_at}")
+    console.print(f"Occurrences: {incident.occurrence_count}")
+    console.print(f"Detail: {incident.body}")
+    console.print("Structured evidence:")
+    console.print_json(json.dumps(incident.payload, sort_keys=True))
+    event_table = Table(title="Lifecycle events")
+    event_table.add_column("time")
+    event_table.add_column("event")
+    for event in events:
+        event_table.add_row(event["created_at"], event["event_type"])
+    console.print(event_table)
+
+
+@app.command("alert-ack")
+def alert_ack(
+    incident_id: Annotated[
+        str, typer.Argument(help="Unresolved incident reference to acknowledge.")
+    ],
+) -> None:
+    """Record that an operator has reviewed an unresolved incident."""
+    from aios.alerts import get_alert_store
+
+    try:
+        incident = get_alert_store().acknowledge(incident_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Incident acknowledgement refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Incident acknowledged:[/green] {incident.incident_id}")
+
+
+@app.command("alert-resolve")
+def alert_resolve(
+    incident_id: Annotated[
+        str, typer.Argument(help="Incident reference to resolve explicitly.")
+    ],
+) -> None:
+    """Resolve one incident while retaining its history."""
+    from aios.alerts import get_alert_store
+
+    try:
+        incident = get_alert_store().resolve(incident_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Incident resolution refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Incident resolved:[/green] {incident.incident_id}")
+
+
+@app.command("alert-test")
+def alert_test() -> None:
+    """Verify local incident open and recovery recording without external delivery."""
+    from aios.alerts import Alert, AlertSeverity, get_alert_store
+
+    try:
+        store = get_alert_store()
+        incident = store.emit(
+            Alert(
+                code="local_alert_test",
+                severity=AlertSeverity.INFO,
+                title="Local alert path test",
+                body="The independent incident ledger accepted a test event.",
+                dedup_key="test:local-alert-path",
+                source_job="aios alert-test",
+                payload={"test": True},
+            )
+        )
+        store.resolve(incident.incident_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Local alert test failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[bold green]Local alert path passed:[/bold green] {incident.incident_id}")
+    console.print(
+        "The test incident was opened, logged, and resolved; no external message was sent."
+    )
+
+
+@app.command("alert-service-failure", hidden=True)
+def alert_service_failure(
+    unit: Annotated[str, typer.Option("--unit", help="Managed systemd service name.")],
+) -> None:
+    """Internal systemd OnFailure handler using only safe service result fields."""
+    from aios.alerts import record_systemd_failure
+
+    try:
+        incident = record_systemd_failure(unit)
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]System failure could not be recorded:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[red]System failure recorded:[/red] {incident.incident_id} ({unit})")
+
+
+@app.command("alert-service-recovered", hidden=True)
+def alert_service_recovered(
+    unit: Annotated[str, typer.Option("--unit", help="Managed systemd service name.")],
+) -> None:
+    """Internal post-success handler that closes a prior service incident."""
+    from aios.alerts import record_systemd_recovery
+
+    try:
+        incident = record_systemd_recovery(unit)
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[yellow]System recovery could not be recorded:[/yellow] {exc}")
+        raise typer.Exit(code=1) from exc
+    if incident is not None and incident.state == "resolved":
+        console.print(f"[green]Prior system failure resolved:[/green] {incident.incident_id}")
 
 
 @app.command("dashboard")
@@ -770,18 +1214,148 @@ def forward_status(
             _project_path(account),
         )
     except (OSError, ValueError) as exc:
+        from aios.alerts import Alert, AlertSeverity
+
+        _emit_operational_alert(
+            Alert(
+                code="forward_status_unavailable",
+                severity=AlertSeverity.CRITICAL,
+                title="Forward-policy status could not be verified",
+                body="The frozen forward-trial evidence could not be opened or validated.",
+                dedup_key="forward:status",
+                source_job="aios forward-status",
+                payload={"error_type": type(exc).__name__},
+            )
+        )
         console.print(f"[red]Forward status unavailable:[/red] {exc}")
         raise typer.Exit(code=1) from exc
     console.rule("[bold]U.S. untouched forward monitor[/bold]")
     console.print(f"Trial ID: {status.trial_id}")
     console.print(f"Registered proposals: {status.registered_proposals}")
+    _resolve_operational_alert("forward:status")
     if status.ready:
+        _resolve_operational_alert("forward:drift")
         console.print("[bold green]UNCHANGED — forward policy evidence is intact.[/bold green]")
         return
+    from aios.alerts import Alert, AlertSeverity
+
+    _emit_operational_alert(
+        Alert(
+            code="forward_policy_drift",
+            severity=AlertSeverity.CRITICAL,
+            title="Frozen forward policy drifted",
+            body="The active trial no longer matches its frozen policy evidence.",
+            dedup_key="forward:drift",
+            source_job="aios forward-status",
+            payload={"trial_id": status.trial_id, "issue_count": len(status.issues)},
+        )
+    )
     for issue in status.issues:
         console.print(f"[red]• {issue}[/red]")
     console.print("[bold red]DRIFTED — do not count newer observations in this trial.[/bold red]")
     raise typer.Exit(code=1)
+
+
+@app.command("forward-restart")
+def forward_restart(
+    as_of: Annotated[
+        str | None,
+        typer.Option(
+            "--as-of",
+            help="Reviewed decision close (YYYY-MM-DD); defaults to the latest safe close.",
+        ),
+    ] = None,
+    account: Annotated[
+        Path,
+        typer.Option("--account", help="Local paper-account JSON path."),
+    ] = Path("data/paper/us_qv_sandbox.json"),
+    trial: Annotated[
+        Path,
+        typer.Option("--trial", help="Active checksum-protected forward-trial path."),
+    ] = Path("data/paper/us_qv_forward_trial.json"),
+    proposal_output: Annotated[
+        Path | None,
+        typer.Option("--proposal-output", help="New dated baseline proposal path."),
+    ] = None,
+    top_n: Annotated[
+        int,
+        typer.Option("--top-n", min=10, max=20, help="Number of simulated holdings."),
+    ] = 10,
+    confirm_restart: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-restart/--no-confirm-restart",
+            help="Archive the drifted trial and activate a prospective replacement.",
+        ),
+    ] = False,
+) -> None:
+    """Create a new paper baseline and atomically replace a drifted trial."""
+    from aios.forward import assess_forward_trial, replace_drifted_forward_trial
+    from aios.paper import (
+        create_paper_proposal,
+        default_proposal_path,
+        latest_paper_decision_date,
+    )
+
+    if not confirm_restart:
+        console.print(
+            "[red]Forward restart refused:[/red] explicit --confirm-restart approval "
+            "is required"
+        )
+        raise typer.Exit(code=1)
+
+    store = get_store()
+    account_path = _project_path(account)
+    trial_path = _project_path(trial)
+    created_proposal: Path | None = None
+    try:
+        status = assess_forward_trial(
+            settings.project_root,
+            trial_path,
+            account_path,
+        )
+        if status.ready:
+            raise ValueError("active forward trial is unchanged; continue the existing trial")
+        decision_date = date.fromisoformat(as_of) if as_of else latest_paper_decision_date(store)
+        destination = (
+            _project_path(proposal_output)
+            if proposal_output is not None
+            else default_proposal_path(settings.project_root, decision_date)
+        )
+        if destination.exists():
+            raise ValueError(f"replacement proposal already exists: {destination}")
+        proposal = create_paper_proposal(
+            account_path,
+            destination,
+            decision_date,
+            store,
+            top_n=top_n,
+        )
+        created_proposal = proposal.path
+        replacement = replace_drifted_forward_trial(
+            settings.project_root,
+            trial_path,
+            account_path,
+            proposal.path,
+            confirm=True,
+        )
+    except Exception as exc:
+        if created_proposal is not None:
+            with suppress(OSError):
+                created_proposal.unlink()
+        console.print(f"[red]Forward restart refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    payload = replacement.active.payload
+    console.print("[bold green]New prospective U.S. forward trial is active.[/bold green]")
+    console.print(f"Trial ID: {payload['trial_id']}")
+    console.print(f"Decision close: {payload['observation_start_decision_date']}")
+    console.print(f"Baseline proposal: {created_proposal}")
+    console.print(f"Archived predecessor: {replacement.archived_previous}")
+    console.print(
+        "No trade was executed. The proposal remains simulation-only until its reviewed "
+        "next-session close and explicit confirmation."
+    )
 
 
 @app.command("paper-propose")
@@ -967,11 +1541,11 @@ def paper_mark(
     ] = Path("data/paper/us_qv_sandbox.json"),
 ) -> None:
     """Update simulated holdings and the daily equity curve without rebalancing."""
-    from aios.paper import latest_paper_decision_date, mark_paper_account
+    from aios.paper import latest_reviewed_market_close, mark_paper_account
 
     store = get_store()
     try:
-        mark_date = date.fromisoformat(through) if through else latest_paper_decision_date(store)
+        mark_date = date.fromisoformat(through) if through else latest_reviewed_market_close(store)
         result = mark_paper_account(_project_path(account), mark_date, store)
     except Exception as exc:
         console.print(f"[red]Paper mark refused:[/red] {exc}")
@@ -1099,6 +1673,19 @@ def refresh_us_current_command(
     """Refresh the current reviewed U.S. universe without approving new members."""
     from aios.refresh import refresh_us_current
 
+    enabled_areas = [
+        name
+        for name, enabled in (
+            ("prices", prices),
+            ("fundamentals", fundamentals),
+            ("macro", macro),
+        )
+        if enabled
+    ]
+    refresh_key = "-".join(enabled_areas) or "none"
+    failure_fingerprint = f"refresh:{refresh_key}:failure"
+    partial_fingerprint = f"refresh:{refresh_key}:partial"
+
     def show_progress(kind: str, identity: str, index: int, total: int) -> None:
         if index == 1 or index == total or index % 25 == 0:
             console.print(f"  {kind}: {index}/{total} ({identity})")
@@ -1119,12 +1706,38 @@ def refresh_us_current_command(
                 encoding="utf-8",
             )
     except duckdb.IOException as exc:
+        from aios.alerts import Alert, AlertSeverity
+
+        _emit_operational_alert(
+            Alert(
+                code="current_refresh_failed",
+                severity=AlertSeverity.CRITICAL,
+                title="Current U.S. refresh failed",
+                body="The refresh could not acquire the analytical database safely.",
+                dedup_key=failure_fingerprint,
+                source_job="aios refresh-us-current",
+                payload={"areas": enabled_areas, "error_type": type(exc).__name__},
+            )
+        )
         console.print(
             "[red]Current refresh could not lock DuckDB.[/red] Close the dashboard "
             "and every other AIOS command, then retry."
         )
         raise typer.Exit(code=1) from exc
     except (OSError, RuntimeError, ValueError) as exc:
+        from aios.alerts import Alert, AlertSeverity
+
+        _emit_operational_alert(
+            Alert(
+                code="current_refresh_failed",
+                severity=AlertSeverity.CRITICAL,
+                title="Current U.S. refresh failed",
+                body="The refresh stopped before it produced a safe completed result.",
+                dedup_key=failure_fingerprint,
+                source_job="aios refresh-us-current",
+                payload={"areas": enabled_areas, "error_type": type(exc).__name__},
+            )
+        )
         console.print(f"[red]Current U.S. refresh refused safely:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
@@ -1158,6 +1771,23 @@ def refresh_us_current_command(
             "the JSON summary and ingest audit.[/yellow]"
         )
     if result.failures:
+        from aios.alerts import Alert, AlertSeverity
+
+        _emit_operational_alert(
+            Alert(
+                code="current_refresh_failed",
+                severity=AlertSeverity.CRITICAL,
+                title="Current U.S. refresh completed with hard failures",
+                body="One or more reviewed refresh items failed and require inspection.",
+                dedup_key=failure_fingerprint,
+                source_job="aios refresh-us-current",
+                payload={
+                    "areas": enabled_areas,
+                    "failure_count": len(result.failures),
+                    "identities": [failure.identity for failure in result.failures[:25]],
+                },
+            )
+        )
         for failure in result.failures[:25]:
             console.print(
                 f"  [red]{failure.kind} {failure.identity}:[/red] {failure.error}"
@@ -1168,10 +1798,137 @@ def refresh_us_current_command(
                 "the JSON summary and ingest audit.[/red]"
             )
         raise typer.Exit(code=1)
+    _resolve_operational_alert(failure_fingerprint)
+    if result.warnings:
+        from aios.alerts import Alert, AlertSeverity
+
+        _emit_operational_alert(
+            Alert(
+                code="current_refresh_partial",
+                severity=AlertSeverity.WARNING,
+                title="Current U.S. refresh completed with warnings",
+                body="The main refresh completed, but some reviewed items need inspection.",
+                dedup_key=partial_fingerprint,
+                source_job="aios refresh-us-current",
+                payload={
+                    "areas": enabled_areas,
+                    "warning_count": len(result.warnings),
+                    "identities": [warning.identity for warning in result.warnings[:25]],
+                },
+            )
+        )
+    else:
+        _resolve_operational_alert(partial_fingerprint)
     console.print(
         "[bold green]Refresh completed.[/bold green] Run `aios health` before creating "
         "or recording a paper proposal."
     )
+
+
+@app.command("refresh-us-daily")
+def refresh_us_daily_command(
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force/--skip-if-current",
+            help="Re-run providers even when this completed session already passed.",
+        ),
+    ] = False,
+    json_output: Annotated[
+        Path | None,
+        typer.Option("--json-output", help="Optional machine-readable run summary."),
+    ] = None,
+) -> None:
+    """Run the recoverable benchmark-first U.S. daily workflow."""
+    from aios.alerts import Alert, AlertSeverity
+    from aios.daily import run_us_daily_cycle
+
+    def show_progress(stage: str, detail: str) -> None:
+        console.print(f"  [cyan]{stage.replace('_', ' ')}:[/cyan] {detail}")
+
+    try:
+        result = run_us_daily_cycle(force=force, progress=show_progress)
+        if json_output is not None:
+            destination = _project_path(json_output)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(
+                json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+    except Exception as exc:
+        _emit_operational_alert(
+            Alert(
+                code="daily_us_cycle_failed",
+                severity=AlertSeverity.CRITICAL,
+                title="Daily U.S. update did not complete",
+                body=(
+                    "The exact completed U.S. session was not certified. Older reviewed "
+                    "research remains available."
+                ),
+                dedup_key="daily:us-cycle:failure",
+                source_job="aios refresh-us-daily",
+                payload={"error_type": type(exc).__name__},
+            )
+        )
+        console.print(f"[red]Daily U.S. update stopped safely:[/red] {exc}")
+        console.print(
+            "No newer paper decision is approved. The next startup or scheduled run "
+            "will retry the same idempotent workflow."
+        )
+        raise typer.Exit(code=1) from exc
+
+    if result.interrupted_run_ids:
+        incident = Alert(
+            code="daily_us_cycle_interrupted",
+            severity=AlertSeverity.WARNING,
+            title="An earlier daily U.S. update was interrupted",
+            body="A later run recovered and certified the target session.",
+            dedup_key="daily:us-cycle:interrupted",
+            source_job="aios refresh-us-daily",
+            payload={"recovered_run_ids": list(result.interrupted_run_ids)},
+        )
+        _emit_operational_alert(incident)
+        _resolve_operational_alert(incident.dedup_key)
+
+    for fingerprint in (
+        "daily:us-cycle:failure",
+        "refresh:prices-macro:failure",
+        "universe:coverage:execution",
+        "readiness:paper",
+        "systemd:aios-us-current.service",
+        "systemd:aios-universe-review.service",
+    ):
+        _resolve_operational_alert(fingerprint)
+
+    table = Table(title=f"Daily U.S. update — {result.target_session}")
+    table.add_column("stage")
+    table.add_column("verified result")
+    table.add_row("Completed U.S. session", result.target_session)
+    table.add_row("SPY bootstrap", f"{result.benchmark_rows} reviewed row(s)")
+    table.add_row(
+        "Dated S&P 500 universe",
+        f"{result.universe_status} through {result.universe_coverage_through}",
+    )
+    table.add_row("Reviewed members", str(result.member_count))
+    table.add_row("Member price rows", str(result.member_price_rows))
+    table.add_row("Macro rows", str(result.macro_rows))
+    table.add_row(
+        "Certified research through",
+        result.certified_research_through or "not certified",
+    )
+    console.print(table)
+    if result.status == "already_current":
+        console.print(
+            "[green]Already current.[/green] No provider download was needed for this "
+            "completed U.S. session."
+        )
+    else:
+        console.print(
+            "[bold green]Daily update completed safely.[/bold green] The benchmark, "
+            "universe, member data, and exact-date readiness now agree."
+        )
+    if json_output is not None:
+        console.print(f"Run summary written to {_project_path(json_output)}.")
 
 
 @app.command("import-universe")

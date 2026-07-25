@@ -7,7 +7,11 @@ from weekends and exchange holidays.  Early closes remain trading sessions.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
+
+_NEW_YORK = ZoneInfo("America/New_York")
+_REGULAR_CLOSE = time(16, 0)
 
 # Full-market exceptional closures since the beginning of AIOS price history.
 # Scheduled holidays are generated below.  Keep this set source-reviewed when
@@ -40,6 +44,32 @@ def us_equity_sessions(start: date, end: date) -> list[date]:
             output.append(current)
         current += timedelta(days=1)
     return output
+
+
+def latest_completed_us_equity_session(now: datetime | None = None) -> date:
+    """Return the newest session whose regular New York close has elapsed.
+
+    Early-close sessions remain conservatively incomplete until 16:00 ET. This
+    avoids treating a partial provider bar as final and is safe for EOD research.
+    """
+    checked_at = now or datetime.now(UTC)
+    if checked_at.tzinfo is None or checked_at.utcoffset() is None:
+        raise ValueError("now must include a timezone")
+    checked_at = checked_at.astimezone(UTC)
+    new_york_date = checked_at.astimezone(_NEW_YORK).date()
+    candidates = us_equity_sessions(
+        new_york_date - timedelta(days=14),
+        new_york_date + timedelta(days=1),
+    )
+    completed = [
+        session
+        for session in candidates
+        if datetime.combine(session, _REGULAR_CLOSE, tzinfo=_NEW_YORK).astimezone(UTC)
+        <= checked_at
+    ]
+    if not completed:
+        raise ValueError("no completed U.S. equity session found in the calendar window")
+    return completed[-1]
 
 
 def _scheduled_holidays(year: int) -> set[date]:

@@ -42,6 +42,8 @@ cp .env.example .env
 .venv/bin/aios readiness --report-only
 .venv/bin/aios forward-status
 .venv/bin/aios health
+.venv/bin/aios refresh-us-daily
+.venv/bin/aios review-universe-current
 
 # Optional: open the local research dashboard
 .venv/bin/aios dashboard
@@ -50,14 +52,25 @@ cp .env.example .env
 .venv/bin/aios backup
 # Restore requires a verified backup and an explicit --confirm-restore flag
 
-# Optional Linux automation; close the dashboard before scheduled runs
-.venv/bin/aios scheduler-install --confirm-install
+# Optional Linux automation; remains active after desktop logout while the computer is on
+.venv/bin/aios scheduler-install --confirm-install --keep-running-after-logout
 .venv/bin/aios scheduler-status
+
+# Inspect or test the independent local incident ledger
+.venv/bin/aios alert-test
+.venv/bin/aios alerts --unresolved
 ```
 
 Scheduler status is bounded: if the Linux user scheduler does not answer in
 five seconds, installed/enabled unit-file evidence is shown with runtime state
 explicitly marked unverified.
+
+Managed services use systemd failure handlers. Crashes, non-zero refreshes,
+strict health failures, and backup failures are recorded in an independent
+SQLite incident ledger even when the analytical DuckDB cannot be opened. Use
+`aios alert-show INCIDENT_REF`, `aios alert-ack INCIDENT_REF`, and `aios
+alert-resolve INCIDENT_REF` to review its append-only lifecycle. External email
+or Slack delivery is not configured yet.
 
 If the `aios` executable points at an older checkout, reinstall the project or
 use the source-checkout form: `PYTHONPATH=src .venv/bin/python -m aios.cli status`.
@@ -65,16 +78,20 @@ use the source-checkout form: `PYTHONPATH=src .venv/bin/python -m aios.cli statu
 ## When can I use it?
 
 You can use it **now for supervised U.S. research and local paper simulation**.
-The supported dashboard explains rankings, missing evidence, current readiness,
-and a checksum-protected model portfolio in plain language. It does not connect
+The supported dashboard opens as an operating control room: readiness and
+reviewed dates first, then the governed proposal, paper account, source clocks,
+and operating gates. Research Explorer, Company Lens, Portfolio Monitor, and
+Methodology & Data provide progressively deeper evidence. It does not connect
 to a broker, issue personal buy/sell instructions, or move money.
 
-The current-date gate is real rather than implied. On 2026-07-22 the reviewed
-decision date is 2026-07-20: 503 S&P 500 members have stable security identities,
+The current-date gate is real rather than implied. On 2026-07-24 the reviewed
+decision date is 2026-07-23: 503 S&P 500 members have stable security identities,
 500 have PIT company filings, all 503 have current action-safe prices, SPY is
 current through the same close, and the latest required macro release is dated
-2026-07-20. The local paper proposal remains separate from holdings and cannot
-be simulated until the next reviewed market close and explicit confirmation.
+2026-07-23. The unexecuted 2026-07-20 proposal and its drifted trial remain
+preserved as invalidated history. A new prospective trial,
+`us-qv-forward-8559d86b6a02`, is active from the 2026-07-23 decision close with
+one registered simulation-only proposal and zero executions.
 
 The broader 2025-to-current stateful engineering backtest now completes all six
 periods. It applies the reviewed HES→CVX conversion, liquidates MTCH and PAYC
@@ -87,7 +104,7 @@ after-tax, or personal investment claim.
 |---|---|---|
 | Supervised U.S. research | available now | keep `aios readiness` and `aios validate` non-failing |
 | Local U.S. paper simulation | available now | reviewed next-session close plus explicit simulated confirmation; still no broker |
-| U.S. technical-beta completion | historical gate complete; timers installed and all three services manually passed | observe 1–3 naturally triggered refresh/health/backup cycles |
+| U.S. technical-beta completion | historical gate, recoverable daily workflow, and new forward freeze complete | observe the next natural daily/filing/backup cycles, then add one external delivery channel |
 | Controlled real-capital pilot | not approved; at least 8–12 weeks of untouched forward monitoring after freeze | broker reconciliation, alerts, price versioning, and user-approved tax/risk policy |
 | India market build | next major phase after the U.S. technical gate | NSE/BSE identity, membership, filings, actions, calendars, taxes, benchmarks, and parity tests |
 
@@ -100,6 +117,10 @@ required elapsed forward-test period cannot be compressed by adding compute.
 - [`BEGINNER_GUIDE.md`](./BEGINNER_GUIDE.md) explains the project without
   assuming investing or Python experience.
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md) records the larger design decisions.
+- [`FUTURE_BUILD_PLAN.md`](./FUTURE_BUILD_PLAN.md) orders future work and defines
+  the acceptance gate for each milestone.
+- [`INDIA_BUILD_PLAN.md`](./INDIA_BUILD_PLAN.md) defines the official-source,
+  Nifty-50-first path from the U.S. reference build to an India research beta.
 - [`SP500_DATA_PROVENANCE.md`](./SP500_DATA_PROVENANCE.md) records the audited
   bounded and current-universe sources, conflicts, and safe-use limits.
 - [`OPEN_SOURCE_RESEARCH.md`](./OPEN_SOURCE_RESEARCH.md) records which external
@@ -123,13 +144,20 @@ required elapsed forward-test period cannot be compressed by adding compute.
 - **Reliable macro refresh:** API-limit-aware vintage chunks, transient retries,
   incremental overlap, and a hard failure signal after all sources are tried.
 - **HTTP:** rate-limited client (SEC's 10 req/s, 429 backoff, retries).
+- **Immutable provider evidence:** the shared HTTP boundary can atomically
+  retain exact response bytes with secret-free request fingerprints and ingest
+  links. Reviewed SEC Company Facts/Submissions are live on this path; Treasury
+  fallback capture is wired. FRED and yfinance still require explicitly labeled
+  library/normalized-export adapters before the raw-data gate is complete.
 - **Factors:** PIT-aware Quality, Value, 12-minus-1 Momentum, and one-year Low
   Volatility. QV remains the backtested baseline; experimental QVML keeps the
   regime-relative Q/V tilt inside a 60% core and adds 25% Momentum plus 15% Low
   Volatility. A decision-scoped cache shares PIT fundamentals and identity-safe
-  price windows, then is discarded after every decision. The Streamlit UI has
-  a QV/QVML selector and exposes raw evidence, weights, coverage, and withheld
-  inputs.
+  price windows, then is discarded after every decision. The Streamlit control
+  room anchors readiness to the latest market close that also has a certified
+  investable universe; Research Explorer
+  has a QV/QVML selector plus opportunity-map, ranked-universe, and explicit
+  missing-evidence views.
 - **Backtest:** quarterly PIT policy comparison against fixed 60/40, with
   an explicit market-calendar ticker, exact shared next-session/quarter-end
   dates, stable-security price paths across ticker changes, historical
@@ -146,20 +174,48 @@ required elapsed forward-test period cannot be compressed by adding compute.
   separately from the certified research window and returns a failing exit code
   when current paper-use evidence is incomplete. The dashboard refuses dates
   outside the reviewed window instead of silently using raw rows. The current
-  reviewed U.S. decision date is 2026-07-20.
-- **Current refresh and local scheduling:** `aios refresh-us-current` updates
-  prices, SEC filings, SPY, and release-aware macro data only through already
-  reviewed identities. It records each failure and never auto-approves a new
-  S&P member. Confirmed user-level timers can run weekday price/macro refreshes,
-  weekly filing refreshes and checksum-verified backups; pause/resume/status/
-  removal stay behind supported CLI commands. The generated units passed the
-  native systemd verifier. They were explicitly installed on 2026-07-21 and
-  the backup, prices/macro, and filing services all passed real first runs.
+  reviewed U.S. decision date is 2026-07-23. A newer price can value an existing
+  simulated holding without silently becoming a newer portfolio-decision date.
+- **Current refresh and local scheduling:** normal operation uses
+  `aios refresh-us-daily`. It refreshes action-safe SPY first, reviews the
+  unchanged universe through that completed session, refreshes all member
+  prices and macro evidence inside the newly extended identity windows, and
+  succeeds only when broad exact-date readiness reaches the same close. Its
+  independent SQLite job record remains visibly `running` if the process is
+  killed, allowing the next startup to recover it. `aios refresh-us-current`
+  remains the lower-level selective prices, filings, SPY, and macro command and
+  never auto-approves a new S&P member. `aios review-universe-current`
+  separately archives the official S&P Global release archive and an
+  independent current-component CSV. It
+  extends unchanged membership, security, issuer/CIK, and provider-symbol
+  windows together or extends none of them. A real announcement, source/parser
+  failure, ticker drift, or unreviewed identity mismatch opens an incident and
+  stops for review. One confirmed user-level daily timer runs the complete
+  dependency chain at 02:00 New York time after every U.S. weekday, followed
+  by weekly filing refreshes and checksum-verified backups;
+  pause/resume/status/removal stay behind supported CLI commands. The timer
+  retries ordinary failures, runs an idempotent check three minutes after the
+  user manager starts, and Linux linger keeps it active after desktop logout
+  while the computer is on. The dashboard uses short-lived read-only connections, while
+  scheduled writers wait up to five minutes for a brief overlap, so leaving
+  the dashboard open no longer prevents automatic updates. The generated units passed the
+  native systemd verifier. The replacement daily service passed a real
+  503-member July 23 catch-up and an immediate no-download startup run. The
+  backup and filing services retain their passed first runs. The
+  2026-07-22 current-data incident exposed isolated transient Yahoo empty
+  responses. The adapter now retries those responses three times with bounded
+  backoff while preserving reviewed provider and date limits.
   When today's membership is not yet reviewed, raw refresh may use the newest
   reviewed snapshot up to seven days old for collection only; it displays that
   date and does not approve a current portfolio decision. New reviewed issuers
   without Company Facts remain visible and are retried; an established issuer
   unexpectedly returning no facts still fails the refresh.
+  Freshness is measured against the latest completed **U.S.** session, not the
+  computer's calendar date. In India, a U.S. session dated July 24 finishes
+  after midnight on July 25 IST and becomes eligible for the following refresh.
+  Every EOD adapter independently rejects rows beyond the latest completed New
+  York close, so an early manual run or persistent catch-up cannot store a
+  partial daily candle.
 - **Portfolio risk:** the deterministic long-only risk contract rejects missing
   sector/liquidity evidence, leverage, excessive position or sector
   concentration, excessive rebalance turnover, and breached drawdown limits.
@@ -173,7 +229,10 @@ required elapsed forward-test period cannot be compressed by adding compute.
   the factor, macro, risk, cost/tax, calendar, readiness, and paper rules plus
   the reviewed configuration. `forward-status` detects drift, every later
   proposal is registered, and drift blocks simulation while market data remains
-  free to advance.
+  free to advance. `forward-restart --confirm-restart` creates a prospective
+  baseline, archives a genuinely drifted predecessor without rewriting it, and
+  atomically activates the replacement; it refuses to replace an unchanged
+  trial and never executes the proposal.
 - **Historical universe:** `universe_membership` stores effective intervals,
   start `known_date`, and independently dated `end_known_date`. A backtest
   target is membership known at the decision close and effective on the
@@ -182,8 +241,11 @@ required elapsed forward-test period cannot be compressed by adding compute.
   default; `--allow-current-universe` is an explicitly labeled survivorship-
   biased diagnostic escape hatch. The original 60-event manifest certifies the
   bounded 2023-08-01 through 2024-12-31 window; reviewed event/reference batches
-  now extend the current operating path through 2026-07-21. This still does not
-  claim a complete 1996-present announcement archive.
+  extend the manually reviewed path through 2026-07-21. The first immutable
+  no-change attestation advanced current operating coverage through 2026-07-22;
+  the next independently archived attestation advanced it through 2026-07-23,
+  both without inventing an announcement date. This still does not claim a
+  complete 1996-present announcement archive.
 - **Stable identities:** 533 membership intervals link to 529 internal security
   IDs. Four source-verified ticker transitions are joined; ordinary index
   replacements and WRK→SW remain separate. Bounded ticker-derived IDs are
@@ -272,22 +334,37 @@ required elapsed forward-test period cannot be compressed by adding compute.
   EBITDA derivation, membership intervals, action provenance, provider split
   basis, separate membership start/end knowledge, execution-date universes,
   cost/tax accounting, benchmark reporting, plain-language dashboard copy, and
-  the supported dashboard launcher, current-use readiness, and fail-closed
+  the supported dashboard launcher, separate valuation/decision clocks,
+  current-use readiness, and fail-closed
   portfolio risk, paper state, security conversions, and liquidation-only price
-  extensions, current refresh orchestration, and managed scheduler safety. The
-  current suite has 182 passing tests.
+  extensions, current refresh orchestration, independent incident lifecycle,
+  verified-backup archiving, evidence-backed no-change universe roll-forward,
+  and managed scheduler safety.
 
 ## What comes next
 
 Current U.S. membership, stable identity, action-safe prices, SPY, PIT filings,
 macro evidence, risk checks, and supervised paper state now reach the reviewed
-2026-07-20 decision close. The current refresh, health, backup/recovery,
-scheduler controls, and local dashboard smoke are implemented and tested. The
-six-period stateful rerun and its held-security evidence are complete. The
-timers are installed and their three services passed manual first runs. The
-untouched U.S. forward-policy gate is active from the reviewed 2026-07-20
-proposal; the next safe slice is to observe naturally triggered cycles. New S&P
-membership announcements still require source review; automation does not
-approve provenance. Final after-tax or controlled-capital claims still require
+2026-07-23 decision close. The benchmark-first daily workflow, free-source
+universe review, health, backup/recovery,
+scheduler controls, local incident ledger, systemd failure/recovery handlers,
+and local dashboard smoke are implemented and tested. The six-period stateful
+rerun and its held-security evidence are complete. Three timers are installed;
+the daily service passed a live 503-member July 23 catch-up and an immediate
+no-download startup proof, and it remains active after desktop logout while the
+computer is on. The old 2026-07-20 forward trial was archived unchanged with
+zero executions. Replacement trial `us-qv-forward-8559d86b6a02` is active from
+the 2026-07-23 close with one registered, unexecuted proposal. The next gate is
+untouched elapsed observation while immutable evidence is extended beyond the
+now-live SEC Company Facts/Submissions path. No-change days can advance
+automatically; a real S&P
+membership announcement still requires source review and is never
+auto-approved. Final after-tax or controlled-capital claims still require
 the user's jurisdiction, account, broker, tax, and risk-budget decisions.
 Neither regime tilts nor QVML are validated alpha.
+
+Immutable snapshot storage now has content-addressed atomic files, per-fetch
+metadata, ingest links, checksum verification, and backup/restore coverage. The
+live database contains two verified SEC payloads linked to one reviewed AAPL
+issuer ingest. This proves the SEC path, not full vendor reconstruction: parsed
+replay evidence, FRED, yfinance, and remaining transports are still pending.

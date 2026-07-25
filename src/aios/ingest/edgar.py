@@ -33,7 +33,7 @@ from zipfile import BadZipFile, ZipFile, ZipInfo
 
 from structlog import get_logger
 
-from aios.ingest.http_client import get_http
+from aios.ingest.http_client import RawSnapshotContext, get_http
 
 if TYPE_CHECKING:
     from aios.storage.store import Store
@@ -112,10 +112,22 @@ def _cik_zero_padded(cik: int) -> str:
     return f"{cik:010d}"
 
 
-def load_ticker_cik_map() -> dict[str, int]:
+def load_ticker_cik_map(
+    *,
+    store: Store | None = None,
+    ingest_run_id: str | None = None,
+) -> dict[str, int]:
     """Fetch SEC's master ticker→CIK map. Returns {TICKER_UPPER: cik}."""
-    http = get_http()
-    raw: dict[str, Any] = http.get_json(TICKER_MAP_URL)
+    raw: dict[str, Any] = _get_sec_json(
+        TICKER_MAP_URL,
+        snapshot=_sec_snapshot(
+            store,
+            ingest_run_id,
+            dataset="company-tickers",
+            role="ticker-map",
+            parser_version="sec-company-tickers-v1",
+        ),
+    )
     out: dict[str, int] = {}
     # Format: {"0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}, ...}
     for entry in raw.values():
@@ -126,23 +138,99 @@ def load_ticker_cik_map() -> dict[str, int]:
     return out
 
 
-def fetch_submissions(cik: int) -> dict[str, Any]:
+def fetch_submissions(
+    cik: int,
+    *,
+    store: Store | None = None,
+    ingest_run_id: str | None = None,
+) -> dict[str, Any]:
     """Fetch the submissions index (filings list + metadata) for a CIK."""
     url = SUBMISSIONS_URL.format(cik=_cik_zero_padded(cik))
-    return get_http().get_json(url)
+    return _get_sec_json(
+        url,
+        snapshot=_sec_snapshot(
+            store,
+            ingest_run_id,
+            dataset="submissions",
+            role="submissions",
+            parser_version="sec-submissions-v1",
+        ),
+    )
 
 
-def fetch_submission_file(name: str) -> dict[str, Any]:
+def fetch_submission_file(
+    name: str,
+    *,
+    store: Store | None = None,
+    ingest_run_id: str | None = None,
+) -> dict[str, Any]:
     """Fetch one older filing-history shard named by a submissions payload."""
     if not re.fullmatch(r"CIK\d{10}-submissions-\d{3}\.json", name):
         raise ValueError(f"invalid SEC submissions history filename {name!r}")
-    return get_http().get_json(SUBMISSIONS_FILE_URL.format(name=name))
+    return _get_sec_json(
+        SUBMISSIONS_FILE_URL.format(name=name),
+        snapshot=_sec_snapshot(
+            store,
+            ingest_run_id,
+            dataset="submissions-history",
+            role="submissions-history",
+            parser_version="sec-submissions-history-v1",
+        ),
+    )
 
 
-def fetch_facts(cik: int) -> dict[str, Any]:
+def fetch_facts(
+    cik: int,
+    *,
+    store: Store | None = None,
+    ingest_run_id: str | None = None,
+) -> dict[str, Any]:
     """Fetch the full XBRL Company Facts blob for a CIK."""
     url = FACTS_URL.format(cik=_cik_zero_padded(cik))
-    return get_http().get_json(url)
+    return _get_sec_json(
+        url,
+        snapshot=_sec_snapshot(
+            store,
+            ingest_run_id,
+            dataset="companyfacts",
+            role="companyfacts",
+            parser_version="sec-companyfacts-v1",
+        ),
+    )
+
+
+def _get_sec_json(
+    url: str,
+    *,
+    snapshot: RawSnapshotContext | None,
+) -> Any:
+    """Keep uninstrumented test/discovery callers backward compatible."""
+    http = get_http()
+    if snapshot is None:
+        return http.get_json(url)
+    return http.get_json(url, raw_snapshot=snapshot)
+
+
+def _sec_snapshot(
+    store: Store | None,
+    ingest_run_id: str | None,
+    *,
+    dataset: str,
+    role: str,
+    parser_version: str,
+) -> RawSnapshotContext | None:
+    if store is None:
+        return None
+    return RawSnapshotContext(
+        provider="sec-edgar",
+        dataset=dataset,
+        store=store,
+        ingest_run_id=ingest_run_id,
+        role=role,
+        adapter_name="aios-sec-http",
+        adapter_version="1",
+        parser_version=parser_version,
+    )
 
 
 class CompanyFactsArchive:
@@ -391,6 +479,8 @@ def extract_fundamentals(
     issuer_id: str | None = None,
     security_id: str | None = None,
     facts_payload: dict[str, Any] | None = None,
+    snapshot_store: Store | None = None,
+    ingest_run_id: str | None = None,
 ) -> tuple[list[dict], dict[str, Any]]:
     """Full extract: return a list of fundamental row dicts (PIT-tagged).
 
@@ -408,7 +498,15 @@ def extract_fundamentals(
                     instant/EPS metrics: equals value).
     """
     facts = _validate_companyfacts_payload(
-        fetch_facts(cik) if facts_payload is None else facts_payload,
+        (
+            fetch_facts(
+                cik,
+                store=snapshot_store,
+                ingest_run_id=ingest_run_id,
+            )
+            if facts_payload is None
+            else facts_payload
+        ),
         cik,
     )
     us_gaap = facts.get("facts", {}).get("us-gaap", {})
@@ -418,7 +516,11 @@ def extract_fundamentals(
     # Fetch submissions for company metadata (name, SIC, exchange) — cached so
     # the single-filing-date path doesn't refetch. Stash on facts for _extract_company_meta.
     try:
-        submissions = fetch_submissions(cik)
+        submissions = fetch_submissions(
+            cik,
+            store=snapshot_store,
+            ingest_run_id=ingest_run_id,
+        )
         facts["_meta"] = {
             "name": submissions.get("name"),
             "sic": submissions.get("sic"),
@@ -531,6 +633,8 @@ def ingest_issuer(
         extract_kwargs: dict[str, Any] = {
             "issuer_id": issuer_id,
             "security_id": security_id,
+            "snapshot_store": db,
+            "ingest_run_id": run_id,
         }
         if facts_payload is not None:
             extract_kwargs["facts_payload"] = facts_payload
@@ -651,11 +755,16 @@ def ingest_ticker(ticker: str, cik_map: dict[str, int] | None = None) -> int:
     ticker_up = ticker.upper()
     try:
         if cik_map is None:
-            cik_map = load_ticker_cik_map()
+            cik_map = load_ticker_cik_map(store=store, ingest_run_id=run_id)
         if ticker_up not in cik_map:
             raise ValueError(f"Ticker {ticker_up} not found in SEC ticker map.")
         cik = cik_map[ticker_up]
-        rows, meta = extract_fundamentals(ticker_up, cik)
+        rows, meta = extract_fundamentals(
+            ticker_up,
+            cik,
+            snapshot_store=store,
+            ingest_run_id=run_id,
+        )
         rejected = int(meta.get("rows_rejected_future_period") or 0)
         n = store.upsert_fundamentals(rows)
 

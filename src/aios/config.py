@@ -42,12 +42,22 @@ class Settings(BaseSettings):
 
     # --- Paths ---
     duckdb_path: Path = Field(default=Path("data/aios.duckdb"))
+    operations_db_path: Path = Field(default=Path("data/operations/alerts.sqlite3"))
+    raw_data_dir: Path = Field(default=Path("data/raw"))
     parquet_dir: Path = Field(default=Path("data/parquet"))
     log_dir: Path = Field(default=Path("logs"))
 
     # --- Ingest tuning ---
     edgar_max_rps: int = Field(default=8, description="SEC fair-access limit is 10; we stay under.")
     yfinance_sleep_sec: float = Field(default=0.5)
+    yfinance_max_attempts: int = Field(default=3, ge=1, le=5)
+    yfinance_retry_base_sec: float = Field(default=1.0, ge=0.0, le=30.0)
+    duckdb_lock_wait_seconds: float = Field(
+        default=10.0,
+        ge=0.0,
+        le=600.0,
+        description="Bounded wait when another local AIOS process briefly owns DuckDB.",
+    )
 
     @computed_field  # type: ignore[prop-defined]
     @property
@@ -60,6 +70,8 @@ class Settings(BaseSettings):
         """Create data/log directories if missing. Call at startup."""
         for p in (
             self.duckdb_path.parent,
+            self.operations_db_path.parent,
+            self.raw_data_dir,
             self.parquet_dir,
             self.log_dir,
         ):

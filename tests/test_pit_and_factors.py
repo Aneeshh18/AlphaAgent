@@ -972,7 +972,11 @@ def test_macro_ingest_continues_after_one_series_fails(monkeypatch, tmp_path):
 
     monkeypatch.setattr(fred_ingest, "get_store", lambda: store)
     monkeypatch.setattr(fred_ingest, "fetch_series_fred", fake_fetch)
-    monkeypatch.setattr(fred_ingest, "fetch_treasury_yield_curve", lambda: [])
+    monkeypatch.setattr(
+        fred_ingest,
+        "fetch_treasury_yield_curve",
+        lambda **_kwargs: [],
+    )
     try:
         with pytest.raises(fred_ingest.MacroIngestError, match="BAD"):
             fred_ingest.ingest_macro(["BAD", "GOOD"])

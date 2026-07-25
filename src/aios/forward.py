@@ -72,6 +72,14 @@ class ForwardTrialStatus:
         return self.active and not self.issues
 
 
+@dataclass(frozen=True)
+class ForwardTrialReplacement:
+    """A newly activated trial and the immutable path of its predecessor."""
+
+    active: ForwardTrialDocument
+    archived_previous: Path
+
+
 def create_forward_trial(
     project_root: Path,
     path: Path,
@@ -132,6 +140,86 @@ def create_forward_trial(
         ),
     }
     return _write_forward_document(destination, payload)
+
+
+def replace_drifted_forward_trial(
+    project_root: Path,
+    path: Path,
+    account_path: Path,
+    proposal_path: Path,
+    *,
+    confirm: bool,
+    now: datetime | None = None,
+    policy_files: tuple[str, ...] = FORWARD_POLICY_FILES,
+) -> ForwardTrialReplacement:
+    """Archive a genuinely drifted trial and atomically activate its successor.
+
+    An unchanged active trial cannot be replaced. The predecessor is moved
+    without rewriting its checksum-protected contents, and a failed activation
+    restores it to the active path.
+    """
+    if not confirm:
+        raise ValueError("explicit --confirm-restart approval is required")
+
+    root = Path(project_root).resolve()
+    destination = Path(path)
+    previous = read_forward_trial(destination)
+    previous_policy_files = tuple(previous.payload["policy_files"])
+    restart_reasons = _base_issues(
+        root,
+        previous.payload,
+        account_path,
+        previous_policy_files,
+    )
+    if not restart_reasons:
+        raise ValueError("active forward trial is unchanged; continue the existing trial")
+
+    previous_dates = [
+        date.fromisoformat(str(row["decision_date"]))
+        for row in previous.payload.get("proposals", [])
+        if row.get("decision_date")
+    ]
+    proposal = read_paper_document(
+        proposal_path,
+        expected_kind=PROPOSAL_DOCUMENT_KIND,
+    )
+    replacement_date = date.fromisoformat(str(proposal.payload["decision_date"]))
+    if previous_dates and replacement_date <= max(previous_dates):
+        raise ValueError("replacement proposal must be later than the prior trial evidence")
+
+    archive_directory = destination.parent / "forward_trials"
+    archive_path = archive_directory / f"{previous.payload['trial_id']}.json"
+    if archive_path.exists():
+        raise ValueError(f"forward trial archive already exists: {archive_path}")
+
+    staged_path = destination.with_name(
+        f".{destination.name}.{uuid4().hex}.replacement"
+    )
+    create_forward_trial(
+        root,
+        staged_path,
+        account_path,
+        proposal_path,
+        confirm=True,
+        now=now,
+        policy_files=policy_files,
+    )
+    archive_directory.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(destination, archive_path)
+        try:
+            os.replace(staged_path, destination)
+        except Exception:
+            os.replace(archive_path, destination)
+            raise
+    finally:
+        if staged_path.exists():
+            staged_path.unlink()
+
+    return ForwardTrialReplacement(
+        active=read_forward_trial(destination),
+        archived_previous=archive_path,
+    )
 
 
 def read_forward_trial(path: Path) -> ForwardTrialDocument:

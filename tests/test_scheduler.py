@@ -8,14 +8,19 @@ from typer.testing import CliRunner
 import aios.scheduler as scheduler_module
 from aios import cli
 from aios.scheduler import (
+    ALERT_SERVICE_NAME,
+    LEGACY_TIMER_NAMES,
+    LEGACY_UNIT_NAMES,
     MANAGED_MARKER,
     TIMER_NAMES,
     UNIT_NAMES,
     SchedulerInstallResult,
+    enable_user_linger,
     install_user_scheduler,
     remove_user_scheduler,
     render_systemd_units,
     set_user_scheduler_active,
+    user_linger_status,
     user_scheduler_status,
 )
 
@@ -34,14 +39,25 @@ def test_rendered_scheduler_uses_supported_commands_and_no_dashboard_service(tmp
     units = render_systemd_units(project)
 
     assert set(units) == set(UNIT_NAMES)
-    assert "refresh-us-current --no-fundamentals" in units["aios-us-current.service"]
+    assert "refresh-us-daily" in units["aios-us-daily.service"]
+    assert "Restart=on-failure" in units["aios-us-daily.service"]
+    assert "AIOS_DUCKDB_LOCK_WAIT_SECONDS=300" in units["aios-us-daily.service"]
+    assert (
+        "Tue..Sat *-*-* 02:00:00 America/New_York"
+        in units["aios-us-daily.timer"]
+    )
+    assert "OnStartupSec=3min" in units["aios-us-daily.timer"]
     assert "refresh-us-current --no-prices --no-macro" in units["aios-us-filings.service"]
-    assert "ExecStartPost=" in units["aios-us-current.service"]
-    assert " health\n" in units["aios-us-current.service"]
+    assert "ExecStartPost=" in units["aios-us-daily.service"]
+    assert " health\n" in units["aios-us-daily.service"]
+    assert "OnFailure=aios-alert@%n.service" in units["aios-us-daily.service"]
+    assert "alert-service-recovered --unit %n" in units["aios-us-daily.service"]
+    assert "alert-service-failure --unit %i" in units[ALERT_SERVICE_NAME]
+    assert "OnFailure=" not in units[ALERT_SERVICE_NAME]
     assert " backup\n" in units["aios-backup.service"]
     assert "dashboard" not in "\n".join(units.values()).lower()
-    assert "WorkingDirectory=/" in units["aios-us-current.service"]
-    assert "AI\\x20Invester" in units["aios-us-current.service"]
+    assert "WorkingDirectory=/" in units["aios-us-daily.service"]
+    assert "AI\\x20Invester" in units["aios-us-daily.service"]
 
 
 def test_scheduler_install_requires_confirmation_and_enables_managed_timers(tmp_path) -> None:
@@ -67,9 +83,28 @@ def test_scheduler_install_requires_confirmation_and_enables_managed_timers(tmp_
     assert {path.name for path in result.units} == set(UNIT_NAMES)
     assert all(path.read_text(encoding="utf-8").startswith(MANAGED_MARKER) for path in result.units)
     assert calls == [
+        ["systemctl", "--user", "disable", "--now", *LEGACY_TIMER_NAMES],
         ["systemctl", "--user", "daemon-reload"],
         ["systemctl", "--user", "enable", "--now", *TIMER_NAMES],
     ]
+
+
+def test_scheduler_install_replaces_only_managed_legacy_units(tmp_path) -> None:
+    project = _project(tmp_path)
+    unit_dir = tmp_path / "units"
+    unit_dir.mkdir()
+    for name in LEGACY_UNIT_NAMES:
+        (unit_dir / name).write_text(f"{MANAGED_MARKER}\n[Unit]\n", encoding="utf-8")
+
+    install_user_scheduler(
+        project,
+        confirm=True,
+        unit_dir=unit_dir,
+        runner=lambda command, **_kwargs: CompletedProcess(command, 0, "", ""),
+    )
+
+    assert not any((unit_dir / name).exists() for name in LEGACY_UNIT_NAMES)
+    assert all((unit_dir / name).is_file() for name in UNIT_NAMES)
 
 
 def test_scheduler_install_refuses_unmanaged_unit(tmp_path) -> None:
@@ -131,7 +166,14 @@ def test_scheduler_pause_resume_status_and_removal_are_bounded(tmp_path) -> None
     assert not any(path.exists() for path in removed)
     assert calls[0] == ["systemctl", "--user", "disable", "--now", *TIMER_NAMES]
     assert calls[1] == ["systemctl", "--user", "enable", "--now", *TIMER_NAMES]
-    assert calls[-2] == ["systemctl", "--user", "disable", "--now", *TIMER_NAMES]
+    assert calls[-2] == [
+        "systemctl",
+        "--user",
+        "disable",
+        "--now",
+        *TIMER_NAMES,
+        *LEGACY_TIMER_NAMES,
+    ]
     assert calls[-1] == ["systemctl", "--user", "daemon-reload"]
 
 
@@ -181,7 +223,32 @@ def test_scheduler_status_times_out_to_installed_file_evidence(tmp_path) -> None
     assert all(value["service_result"] == "unverified" for value in status.values())
 
 
+def test_scheduler_status_inaccessible_user_bus_uses_file_evidence(tmp_path) -> None:
+    unit_dir = tmp_path / "systemd" / "user"
+    wants = unit_dir / "timers.target.wants"
+    wants.mkdir(parents=True)
+    for timer in TIMER_NAMES:
+        unit = unit_dir / timer
+        unit.write_text(f"{MANAGED_MARKER}\n[Timer]\n", encoding="utf-8")
+        (wants / timer).symlink_to(unit)
+
+    def runner(command, **_kwargs):
+        return CompletedProcess(
+            command,
+            1,
+            "",
+            "Failed to connect to bus: Operation not permitted\n",
+        )
+
+    status = user_scheduler_status(runner=runner, unit_dir=unit_dir)
+
+    assert all(value["enabled"] is True for value in status.values())
+    assert all(value["runtime_verified"] is False for value in status.values())
+    assert all(value["service_result"] == "unverified" for value in status.values())
+
+
 def test_scheduler_status_cli_explains_unverified_runtime(monkeypatch) -> None:
+    emitted = []
     fallback = {
         timer: {
             "enabled": True,
@@ -196,20 +263,24 @@ def test_scheduler_status_cli_explains_unverified_runtime(monkeypatch) -> None:
         for timer in TIMER_NAMES
     }
     monkeypatch.setattr(scheduler_module, "user_scheduler_status", lambda: fallback)
+    monkeypatch.setattr(scheduler_module, "user_linger_status", lambda: None)
+    monkeypatch.setattr(cli, "_emit_operational_alert", emitted.append)
 
     result = CliRunner().invoke(cli.app, ["scheduler-status"])
 
     assert result.exit_code == 0
     assert "not verified" in result.output
     assert "did not answer within 5 seconds" in result.output
+    assert [alert.code for alert in emitted] == ["scheduler_runtime_unverified"]
 
 
-def test_scheduler_cli_requires_confirmation_and_explains_single_process(
+def test_scheduler_cli_requires_confirmation_and_explains_safe_dashboard_overlap(
     monkeypatch,
     tmp_path,
 ) -> None:
-    def fake_install(project_root, *, confirm):
+    def fake_install(project_root, *, confirm, enable_linger):
         assert project_root == cli.settings.project_root
+        assert enable_linger is False
         if not confirm:
             raise ValueError("scheduler installation requires explicit confirmation")
         return SchedulerInstallResult(tmp_path, (), TIMER_NAMES)
@@ -224,5 +295,21 @@ def test_scheduler_cli_requires_confirmation_and_explains_single_process(
     assert refused.exit_code == 1
     assert "explicit" in refused.output and "confirmation" in refused.output
     assert installed.exit_code == 0
-    assert "Close the dashboard" in installed.output
-    assert "single-process" in installed.output
+    assert "short read-only database sessions" in installed.output
+    assert "five minutes" in installed.output
+
+
+def test_scheduler_can_explicitly_enable_and_verify_linger(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def runner(command, **_kwargs):
+        calls.append(command)
+        output = "yes\n" if command[:2] == ["loginctl", "show-user"] else ""
+        return CompletedProcess(command, 0, output, "")
+
+    with pytest.raises(ValueError, match="explicit confirmation"):
+        enable_user_linger(runner=runner)
+    enable_user_linger(confirm=True, runner=runner)
+    assert user_linger_status(runner=runner) is True
+    assert calls[0][0:2] == ["loginctl", "enable-linger"]
+    assert calls[1][0:2] == ["loginctl", "show-user"]

@@ -14,9 +14,10 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from math import isfinite
 from pathlib import Path
+from time import monotonic, sleep
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -40,11 +41,34 @@ MACRO_LEGACY_PURGED_MIGRATION = "macro_legacy_active_copies_purged"
 class Store:
     """Thin wrapper around a DuckDB connection."""
 
-    def __init__(self, db_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        db_path: Path | None = None,
+        *,
+        read_only: bool = False,
+        lock_wait_seconds: float | None = None,
+    ) -> None:
         self.db_path = db_path or _resolve(settings.duckdb_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._con = duckdb.connect(str(self.db_path))
-        self._init_schema()
+        self.read_only = read_only
+        if read_only:
+            if not self.db_path.is_file():
+                raise FileNotFoundError(f"DuckDB database does not exist: {self.db_path}")
+        else:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        wait_seconds = (
+            settings.duckdb_lock_wait_seconds
+            if lock_wait_seconds is None
+            else float(lock_wait_seconds)
+        )
+        if wait_seconds < 0:
+            raise ValueError("lock_wait_seconds cannot be negative")
+        self._con = _connect_with_lock_wait(
+            self.db_path,
+            read_only=read_only,
+            wait_seconds=wait_seconds,
+        )
+        if not read_only:
+            self._init_schema()
 
     def _init_schema(self) -> None:
         """Run all CREATE TABLE IF NOT EXISTS statements."""
@@ -1909,6 +1933,509 @@ class Store:
         )
         return run_id
 
+    def record_raw_snapshot(
+        self,
+        *,
+        payload: dict[str, Any],
+        snapshot: dict[str, Any],
+        ingest_run_id: str | None = None,
+        role: str = "source",
+    ) -> None:
+        """Register immutable payload metadata and one fetch observation."""
+        self._con.execute("BEGIN TRANSACTION")
+        try:
+            self._con.execute(
+                """
+                INSERT INTO raw_payloads
+                (payload_sha256, relative_path, original_bytes, stored_bytes,
+                 compression)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (payload_sha256) DO NOTHING
+                """,
+                (
+                    payload["payload_sha256"],
+                    payload["relative_path"],
+                    payload["original_bytes"],
+                    payload["stored_bytes"],
+                    payload["compression"],
+                ),
+            )
+            stored = self.query(
+                """
+                SELECT relative_path, original_bytes, stored_bytes, compression
+                FROM raw_payloads WHERE payload_sha256 = ?
+                """,
+                (payload["payload_sha256"],),
+            )[0]
+            expected = {
+                key: payload[key]
+                for key in ("relative_path", "original_bytes", "stored_bytes", "compression")
+            }
+            if stored != expected:
+                raise ValueError("raw payload metadata conflicts with existing content hash")
+            self._con.execute(
+                """
+                INSERT INTO raw_snapshots
+                (snapshot_id, provider, dataset, artifact_kind, requested_at,
+                 received_at, http_status, content_type, request_fingerprint,
+                 payload_sha256, adapter_name, adapter_version, parser_version,
+                 parsed_row_count, parsed_rows_sha256)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot["snapshot_id"],
+                    snapshot["provider"],
+                    snapshot["dataset"],
+                    snapshot["artifact_kind"],
+                    snapshot["requested_at"],
+                    snapshot["received_at"],
+                    snapshot.get("http_status"),
+                    snapshot.get("content_type"),
+                    snapshot["request_fingerprint"],
+                    snapshot["payload_sha256"],
+                    snapshot["adapter_name"],
+                    snapshot["adapter_version"],
+                    snapshot["parser_version"],
+                    snapshot.get("parsed_row_count"),
+                    snapshot.get("parsed_rows_sha256"),
+                ),
+            )
+            if ingest_run_id is not None:
+                self._con.execute(
+                    """
+                    INSERT INTO ingest_raw_snapshots (run_id, snapshot_id, role)
+                    VALUES (?, ?, ?)
+                    """,
+                    (ingest_run_id, snapshot["snapshot_id"], role),
+                )
+            self._con.execute("COMMIT")
+        except Exception:
+            self._con.execute("ROLLBACK")
+            raise
+
+    def raw_payload_records(self) -> list[dict]:
+        """Return immutable payload records for filesystem verification."""
+        return self.query(
+            """
+            SELECT payload_sha256, relative_path, original_bytes, stored_bytes,
+                   compression
+            FROM raw_payloads
+            ORDER BY relative_path
+            """
+        )
+
+    def raw_payload_record(self, payload_sha256: str) -> dict | None:
+        """Return an existing globally deduplicated payload, if present."""
+        rows = self.query(
+            """
+            SELECT payload_sha256, relative_path, original_bytes, stored_bytes,
+                   compression
+            FROM raw_payloads
+            WHERE payload_sha256 = ?
+            """,
+            (payload_sha256,),
+        )
+        return rows[0] if rows else None
+
+    def apply_universe_coverage_attestation(
+        self,
+        attestation: dict[str, Any],
+        references: list[dict[str, Any]],
+    ) -> dict[str, int]:
+        """Record one review and atomically extend every bounded reference window.
+
+        ``accepted_no_change`` is the only status allowed to mutate reference
+        windows. The exact official/component responses must already be linked
+        to the attestation's ingest run. Any mismatch rolls back the attestation
+        and every reference update together.
+        """
+        status = str(attestation.get("status") or "").strip()
+        if status not in {"accepted_no_change", "blocked_review_required"}:
+            raise ValueError("unsupported universe coverage attestation status")
+        prior = _as_date(attestation["prior_coverage_through"])
+        target = _as_date(attestation["requested_coverage_through"])
+        if target <= prior:
+            raise ValueError("universe coverage target must follow prior coverage")
+
+        counts = {
+            "membership_rows_extended": 0,
+            "security_rows_extended": 0,
+            "owner_rows_extended": 0,
+            "cik_rows_extended": 0,
+            "provider_rows_extended": 0,
+        }
+        normalized_references = [
+            {
+                "ticker": _required_text(row, "ticker", "universe reference").upper(),
+                "security_id": _required_text(row, "security_id", "universe reference"),
+                "issuer_id": _required_text(row, "issuer_id", "universe reference"),
+                "cik": _required_text(row, "cik", "universe reference"),
+            }
+            for row in references
+        ]
+        if status == "accepted_no_change" and not normalized_references:
+            raise ValueError("accepted universe coverage requires reviewed references")
+
+        self._con.register("_tmp_coverage_refs", _rows_to_arrowable(normalized_references))
+        self._con.execute("BEGIN TRANSACTION")
+        try:
+            run_id = _required_text(attestation, "run_id", "universe attestation")
+            evidence = self.query(
+                """
+                SELECT
+                    COUNT(*) FILTER (
+                        WHERE linked.role LIKE 'official_release_archive_page_%'
+                    ) AS official_pages,
+                    COUNT(*) FILTER (
+                        WHERE linked.role = 'independent_component_snapshot'
+                    ) AS component_pages
+                FROM ingest_raw_snapshots AS linked
+                JOIN raw_snapshots AS snapshot USING (snapshot_id)
+                WHERE linked.run_id = ?
+                  AND snapshot.artifact_kind = 'exact_response'
+                  AND snapshot.http_status BETWEEN 200 AND 299
+                """,
+                (run_id,),
+            )[0]
+            if int(evidence["official_pages"]) < 1 or int(evidence["component_pages"]) != 1:
+                raise ValueError(
+                    "universe attestation requires archived official and component responses"
+                )
+
+            if status == "accepted_no_change":
+                expected = {
+                    (str(row["ticker"]), str(row["security_id"]))
+                    for row in normalized_references
+                }
+                active_members = self.query(
+                    """
+                    SELECT membership.ticker, membership.security_id,
+                           membership.effective_end, membership.end_known_date
+                    FROM universe_membership AS membership
+                    WHERE membership.universe_id = ?
+                      AND membership.known_date <= CAST(? AS DATE)
+                      AND membership.effective_start <= CAST(? AS DATE)
+                      AND (
+                          membership.effective_end IS NULL
+                          OR membership.effective_end > CAST(? AS DATE)
+                          OR membership.end_known_date > CAST(? AS DATE)
+                      )
+                    ORDER BY membership.ticker
+                    """,
+                    (
+                        attestation["universe_id"],
+                        prior.isoformat(),
+                        prior.isoformat(),
+                        prior.isoformat(),
+                        prior.isoformat(),
+                    ),
+                )
+                observed = {
+                    (str(row["ticker"]), str(row["security_id"])) for row in active_members
+                }
+                if observed != expected or len(active_members) != len(expected):
+                    raise ValueError("reviewed member/reference set changed before extension")
+                boundary = prior + timedelta(days=1)
+                if any(
+                    row["effective_end"] != boundary or row["end_known_date"] != prior
+                    for row in active_members
+                ):
+                    raise ValueError(
+                        "universe rows do not share the expected certified coverage boundary"
+                    )
+
+                identity_rows = self.query(
+                    """
+                    SELECT identity.ticker, identity.security_id, identity.effective_end
+                    FROM security_identity_assignments AS identity
+                    JOIN _tmp_coverage_refs AS reference
+                      ON reference.ticker = identity.ticker
+                     AND reference.security_id = identity.security_id
+                    WHERE identity.universe_id = ?
+                      AND identity.known_date <= CAST(? AS DATE)
+                      AND identity.effective_start <= CAST(? AS DATE)
+                      AND (
+                          identity.effective_end IS NULL
+                          OR identity.effective_end > CAST(? AS DATE)
+                      )
+                    """,
+                    (
+                        attestation["universe_id"],
+                        prior.isoformat(),
+                        prior.isoformat(),
+                        prior.isoformat(),
+                    ),
+                )
+                if (
+                    {(str(row["ticker"]), str(row["security_id"])) for row in identity_rows}
+                    != expected
+                    or len(identity_rows) != len(expected)
+                    or any(row["effective_end"] != boundary for row in identity_rows)
+                ):
+                    raise ValueError("security identity windows do not match the member boundary")
+
+                owner_rows = self.query(
+                    """
+                    SELECT owner.security_id, owner.issuer_id, owner.effective_end
+                    FROM security_issuer_assignments AS owner
+                    JOIN _tmp_coverage_refs AS reference
+                      ON reference.security_id = owner.security_id
+                     AND reference.issuer_id = owner.issuer_id
+                    WHERE owner.effective_start <= CAST(? AS DATE)
+                      AND (owner.effective_end IS NULL OR owner.effective_end > CAST(? AS DATE))
+                    """,
+                    (prior.isoformat(), prior.isoformat()),
+                )
+                expected_owners = {
+                    (str(row["security_id"]), str(row["issuer_id"]))
+                    for row in normalized_references
+                }
+                if (
+                    {
+                        (str(row["security_id"]), str(row["issuer_id"]))
+                        for row in owner_rows
+                    }
+                    != expected_owners
+                    or len(owner_rows) != len(expected_owners)
+                    or any(row["effective_end"] != boundary for row in owner_rows)
+                ):
+                    raise ValueError("issuer ownership windows do not match the member boundary")
+
+                expected_ciks = {
+                    (str(row["issuer_id"]), str(row["cik"]))
+                    for row in normalized_references
+                }
+                cik_rows = self.query(
+                    """
+                    SELECT cik.issuer_id, cik.cik, cik.effective_end
+                    FROM issuer_cik_history AS cik
+                    JOIN (
+                        SELECT DISTINCT issuer_id, cik FROM _tmp_coverage_refs
+                    ) AS reference
+                      ON reference.issuer_id = cik.issuer_id
+                     AND reference.cik = cik.cik
+                    WHERE cik.effective_start <= CAST(? AS DATE)
+                      AND (cik.effective_end IS NULL OR cik.effective_end > CAST(? AS DATE))
+                    """,
+                    (prior.isoformat(), prior.isoformat()),
+                )
+                if (
+                    {(str(row["issuer_id"]), str(row["cik"])) for row in cik_rows}
+                    != expected_ciks
+                    or len(cik_rows) != len(expected_ciks)
+                    or any(row["effective_end"] != boundary for row in cik_rows)
+                ):
+                    raise ValueError("issuer CIK windows do not match the member boundary")
+
+                provider_rows = self.query(
+                    """
+                    SELECT mapping.provider, mapping.security_id, mapping.data_start,
+                           mapping.data_end
+                    FROM provider_symbol_history AS mapping
+                    JOIN (
+                        SELECT DISTINCT security_id FROM _tmp_coverage_refs
+                    ) AS reference USING (security_id)
+                    WHERE mapping.mapping_status = 'verified'
+                      AND mapping.data_start <= CAST(? AS DATE)
+                      AND (mapping.data_end IS NULL OR mapping.data_end > CAST(? AS DATE))
+                    """,
+                    (prior.isoformat(), prior.isoformat()),
+                )
+                provider_security_ids = {
+                    str(row["security_id"]) for row in provider_rows
+                }
+                if (
+                    provider_security_ids
+                    != {str(row["security_id"]) for row in normalized_references}
+                    or any(row["data_end"] != boundary for row in provider_rows)
+                ):
+                    raise ValueError("provider-symbol windows do not match the member boundary")
+
+                marker = f"|coverage-attestation:{attestation['attestation_id']}"
+                membership_source = (
+                    "regexp_replace("
+                    "regexp_replace(source, '\\\\|coverage-end:[0-9-]+$', ''), "
+                    "'\\\\|coverage-attestation:[^|]+$', '') || ?"
+                )
+                counts["membership_rows_extended"] = int(
+                    self._con.execute(
+                        f"""
+                        UPDATE universe_membership AS membership
+                        SET effective_end = CAST(? AS DATE),
+                            end_known_date = CAST(? AS DATE),
+                            source = {membership_source},
+                            fetched_at = now()
+                        FROM _tmp_coverage_refs AS reference
+                        WHERE membership.universe_id = ?
+                          AND membership.ticker = reference.ticker
+                          AND membership.security_id = reference.security_id
+                          AND membership.effective_end = CAST(? AS DATE)
+                          AND membership.end_known_date = CAST(? AS DATE)
+                        """,
+                        (
+                            (target + timedelta(days=1)).isoformat(),
+                            target.isoformat(),
+                            marker,
+                            attestation["universe_id"],
+                            boundary.isoformat(),
+                            prior.isoformat(),
+                        ),
+                    ).fetchone()[0]
+                )
+                counts["security_rows_extended"] = int(
+                    self._con.execute(
+                        f"""
+                        UPDATE security_identity_assignments AS identity
+                        SET effective_end = CAST(? AS DATE),
+                            source = {membership_source},
+                            fetched_at = now()
+                        FROM _tmp_coverage_refs AS reference
+                        WHERE identity.universe_id = ?
+                          AND identity.ticker = reference.ticker
+                          AND identity.security_id = reference.security_id
+                          AND identity.effective_end = CAST(? AS DATE)
+                        """,
+                        (
+                            (target + timedelta(days=1)).isoformat(),
+                            marker,
+                            attestation["universe_id"],
+                            boundary.isoformat(),
+                        ),
+                    ).fetchone()[0]
+                )
+                counts["owner_rows_extended"] = int(
+                    self._con.execute(
+                        """
+                        UPDATE security_issuer_assignments AS owner
+                        SET effective_end = CAST(? AS DATE), fetched_at = now()
+                        FROM _tmp_coverage_refs AS reference
+                        WHERE owner.security_id = reference.security_id
+                          AND owner.issuer_id = reference.issuer_id
+                          AND owner.effective_end = CAST(? AS DATE)
+                        """,
+                        (
+                            (target + timedelta(days=1)).isoformat(),
+                            boundary.isoformat(),
+                        ),
+                    ).fetchone()[0]
+                )
+                counts["cik_rows_extended"] = int(
+                    self._con.execute(
+                        """
+                        UPDATE issuer_cik_history AS cik
+                        SET effective_end = CAST(? AS DATE), fetched_at = now()
+                        FROM (
+                            SELECT DISTINCT issuer_id, cik FROM _tmp_coverage_refs
+                        ) AS reference
+                        WHERE cik.issuer_id = reference.issuer_id
+                          AND cik.cik = reference.cik
+                          AND cik.effective_end = CAST(? AS DATE)
+                        """,
+                        (
+                            (target + timedelta(days=1)).isoformat(),
+                            boundary.isoformat(),
+                        ),
+                    ).fetchone()[0]
+                )
+                counts["provider_rows_extended"] = int(
+                    self._con.execute(
+                        """
+                        UPDATE provider_symbol_history AS mapping
+                        SET data_end = CAST(? AS DATE), fetched_at = now()
+                        FROM (
+                            SELECT DISTINCT security_id FROM _tmp_coverage_refs
+                        ) AS reference
+                        WHERE mapping.security_id = reference.security_id
+                          AND mapping.mapping_status = 'verified'
+                          AND mapping.data_end = CAST(? AS DATE)
+                        """,
+                        (
+                            (target + timedelta(days=1)).isoformat(),
+                            boundary.isoformat(),
+                        ),
+                    ).fetchone()[0]
+                )
+                expected_counts = {
+                    "membership_rows_extended": len(expected),
+                    "security_rows_extended": len(expected),
+                    "owner_rows_extended": len(expected_owners),
+                    "cik_rows_extended": len(expected_ciks),
+                    "provider_rows_extended": len(provider_rows),
+                }
+                if counts != expected_counts:
+                    raise ValueError(
+                        f"reference extension count mismatch: {counts} != {expected_counts}"
+                    )
+
+            row = dict(attestation)
+            row.update(counts)
+            self._insert_universe_coverage_attestation(row)
+            self._con.execute("COMMIT")
+            return counts
+        except Exception:
+            self._con.execute("ROLLBACK")
+            raise
+        finally:
+            self._con.unregister("_tmp_coverage_refs")
+
+    def _insert_universe_coverage_attestation(self, row: dict[str, Any]) -> None:
+        """Insert one immutable universe review inside the caller's transaction."""
+        columns = (
+            "attestation_id",
+            "run_id",
+            "universe_id",
+            "prior_coverage_through",
+            "requested_coverage_through",
+            "checked_at",
+            "completed_new_york_date",
+            "status",
+            "official_source_url",
+            "component_source_url",
+            "official_release_count",
+            "relevant_release_count",
+            "reviewed_member_count",
+            "component_count",
+            "reviewed_member_set_sha256",
+            "component_set_sha256",
+            "identity_match_count",
+            "identity_mismatch_count",
+            "candidate_releases_json",
+            "mismatch_detail_json",
+            "membership_rows_extended",
+            "security_rows_extended",
+            "owner_rows_extended",
+            "cik_rows_extended",
+            "provider_rows_extended",
+            "detail",
+        )
+        missing = [column for column in columns if column not in row]
+        if missing:
+            raise ValueError(
+                "universe attestation is missing fields: " + ", ".join(missing)
+            )
+        placeholders = ", ".join("?" for _ in columns)
+        self._con.execute(
+            f"""
+            INSERT INTO universe_coverage_attestations ({", ".join(columns)})
+            VALUES ({placeholders})
+            """,
+            tuple(row[column] for column in columns),
+        )
+
+    def universe_coverage_attestations(self, limit: int = 20) -> list[dict]:
+        """Return the newest immutable no-change reviews for operators."""
+        if limit < 1:
+            return []
+        return self.query(
+            """
+            SELECT *
+            FROM universe_coverage_attestations
+            ORDER BY checked_at DESC, created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+
     def ingest_history(self, limit: int = 20) -> list[dict]:
         """Return the most recent ingest outcomes for operators and agents."""
         if limit < 1:
@@ -2202,6 +2729,94 @@ class Store:
             )[0]["n"],
             "fail",
             "Future membership knowledge dates cannot be used in a backtest.",
+        )
+        add(
+            "universe_attestation_invalid_rows",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM universe_coverage_attestations
+                WHERE requested_coverage_through <= prior_coverage_through
+                   OR completed_new_york_date >= CAST(checked_at AS DATE)
+                   OR official_release_count < 1
+                   OR component_count NOT BETWEEN 450 AND 550
+                   OR (
+                       status = 'accepted_no_change'
+                       AND (
+                           relevant_release_count <> 0
+                           OR identity_mismatch_count <> 0
+                           OR reviewed_member_count <> component_count
+                           OR identity_match_count <> reviewed_member_count
+                           OR reviewed_member_set_sha256 <> component_set_sha256
+                           OR membership_rows_extended <> reviewed_member_count
+                           OR security_rows_extended <> reviewed_member_count
+                           OR owner_rows_extended <> reviewed_member_count
+                           OR provider_rows_extended < reviewed_member_count
+                       )
+                   )
+                   OR (
+                       status = 'blocked_review_required'
+                       AND (
+                           membership_rows_extended <> 0
+                           OR security_rows_extended <> 0
+                           OR owner_rows_extended <> 0
+                           OR cik_rows_extended <> 0
+                           OR provider_rows_extended <> 0
+                       )
+                   )
+                """
+            )[0]["n"],
+            "fail",
+            "Universe no-change attestations must retain consistent clocks, hashes, and counts.",
+        )
+        add(
+            "universe_attestation_missing_raw_evidence",
+            self.query(
+                """
+                WITH evidence AS (
+                    SELECT attestation.attestation_id,
+                           COUNT(*) FILTER (
+                               WHERE linked.role LIKE 'official_release_archive_page_%'
+                                 AND snapshot.artifact_kind = 'exact_response'
+                                 AND snapshot.http_status BETWEEN 200 AND 299
+                           ) AS official_pages,
+                           COUNT(*) FILTER (
+                               WHERE linked.role = 'independent_component_snapshot'
+                                 AND snapshot.artifact_kind = 'exact_response'
+                                 AND snapshot.http_status BETWEEN 200 AND 299
+                           ) AS component_pages
+                    FROM universe_coverage_attestations AS attestation
+                    LEFT JOIN ingest_raw_snapshots AS linked
+                      ON linked.run_id = attestation.run_id
+                    LEFT JOIN raw_snapshots AS snapshot USING (snapshot_id)
+                    GROUP BY attestation.attestation_id
+                )
+                SELECT COUNT(*) AS n
+                FROM evidence
+                WHERE official_pages < 1 OR component_pages <> 1
+                """
+            )[0]["n"],
+            "fail",
+            "Every universe attestation needs exact official and independent raw responses.",
+        )
+        add(
+            "universe_attestation_orphan_markers",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM universe_membership AS membership
+                LEFT JOIN universe_coverage_attestations AS attestation
+                  ON attestation.attestation_id = regexp_extract(
+                      membership.source,
+                      'coverage-attestation:([^|]+)$',
+                      1
+                  )
+                WHERE membership.source LIKE '%|coverage-attestation:%'
+                  AND attestation.attestation_id IS NULL
+                """
+            )[0]["n"],
+            "fail",
+            "Every membership coverage marker must resolve to an immutable attestation.",
         )
         add(
             "universe_overlapping_intervals",
@@ -3612,6 +4227,65 @@ class Store:
         """Return members active and publicly known on the same date."""
         return self.universe_membership_known_on(universe_id, as_of, as_of)
 
+    def universe_identity_labels(
+        self,
+        universe_id: str,
+        known_as_of: date | str,
+        effective_on: date | str | None = None,
+    ) -> list[dict]:
+        """Return display labels from reviewed security-to-issuer identity links.
+
+        Canonical issuer names are presentation metadata only. They never enter
+        factor calculations, and missing names fall back visibly to the ticker
+        in the dashboard instead of being guessed from a provider response.
+        """
+        return self.query(
+            """
+            WITH members AS (
+                SELECT membership.ticker, membership.security_id,
+                       CAST(? AS DATE) AS known_as_of
+                FROM universe_membership AS membership
+                WHERE membership.universe_id = ?
+                  AND membership.known_date <= CAST(? AS DATE)
+                  AND membership.effective_start <= CAST(? AS DATE)
+                  AND (
+                      membership.effective_end IS NULL
+                      OR membership.effective_end > CAST(? AS DATE)
+                      OR membership.end_known_date > CAST(? AS DATE)
+                  )
+            ), identified AS (
+                SELECT members.ticker, members.security_id,
+                       (
+                           SELECT owner.issuer_id
+                           FROM security_issuer_assignments AS owner
+                           WHERE owner.security_id = members.security_id
+                             AND owner.effective_start <= members.known_as_of
+                             AND (
+                                 owner.effective_end IS NULL
+                                 OR owner.effective_end > members.known_as_of
+                             )
+                           ORDER BY owner.effective_start DESC
+                           LIMIT 1
+                       ) AS issuer_id
+                FROM members
+            )
+            SELECT identified.ticker, identified.security_id,
+                   identified.issuer_id, issuer.canonical_name,
+                   issuer.source AS name_source
+            FROM identified
+            LEFT JOIN issuer_master AS issuer USING (issuer_id)
+            ORDER BY identified.ticker
+            """,
+            (
+                str(known_as_of),
+                universe_id,
+                str(known_as_of),
+                str(effective_on or known_as_of),
+                str(effective_on or known_as_of),
+                str(known_as_of),
+            ),
+        )
+
     def universe_data_coverage(
         self,
         universe_id: str,
@@ -3757,6 +4431,7 @@ class Store:
             "fundamentals_quarantine",
             "macro",
             "universe_membership",
+            "universe_coverage_attestations",
         ):
             out[t] = self.query(f"SELECT COUNT(*) AS n FROM {t}")[0]["n"]
         return out
@@ -3853,10 +4528,56 @@ def get_store() -> Store:
 
 
 @contextmanager
-def store_scope() -> Iterator[Store]:
+def store_scope(
+    db_path: Path | None = None,
+    *,
+    read_only: bool = False,
+    lock_wait_seconds: float | None = None,
+) -> Iterator[Store]:
     """Context manager that yields a fresh Store and closes it after."""
-    s = Store()
+    s = Store(
+        db_path,
+        read_only=read_only,
+        lock_wait_seconds=lock_wait_seconds,
+    )
     try:
         yield s
     finally:
         s.close()
+
+
+def close_global_store() -> None:
+    """Release the process-global connection when moving to scoped access."""
+    global _store
+    if _store is None:
+        return
+    _store.close()
+    _store = None
+
+
+def _connect_with_lock_wait(
+    db_path: Path,
+    *,
+    read_only: bool,
+    wait_seconds: float,
+) -> duckdb.DuckDBPyConnection:
+    """Open DuckDB, retrying only its explicit cross-process lock conflict."""
+    deadline = monotonic() + wait_seconds
+    warned = False
+    while True:
+        try:
+            return duckdb.connect(str(db_path), read_only=read_only)
+        except duckdb.IOException as exc:
+            message = str(exc).lower()
+            lock_conflict = "could not set lock" in message or "conflicting lock" in message
+            if not lock_conflict or monotonic() >= deadline:
+                raise
+            if not warned:
+                log.info(
+                    "duckdb.lock_wait",
+                    db=str(db_path),
+                    read_only=read_only,
+                    wait_seconds=wait_seconds,
+                )
+                warned = True
+            sleep(min(0.5, max(0.0, deadline - monotonic())))

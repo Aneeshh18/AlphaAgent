@@ -19,7 +19,7 @@ from structlog import get_logger
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
 from aios.config import settings
-from aios.ingest.http_client import get_http
+from aios.ingest.http_client import RawSnapshotContext, get_http
 from aios.storage.store import Store, get_store
 
 log = get_logger(__name__)
@@ -136,7 +136,11 @@ def fetch_series_fred(
     return rows
 
 
-def fetch_treasury_yield_curve() -> list[dict]:
+def fetch_treasury_yield_curve(
+    *,
+    store: Store | None = None,
+    ingest_run_id: str | None = None,
+) -> list[dict]:
     """Fallback: US Treasury daily yield curve (no key). Returns rows."""
     url = "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/all/all?type=daily_rate_field&field_tdr_date_value=all&page&_format=csv"
     try:
@@ -144,7 +148,23 @@ def fetch_treasury_yield_curve() -> list[dict]:
 
         import pandas as pd
 
-        csv_text = get_http().get_text(url)
+        http = get_http()
+        if store is None:
+            csv_text = http.get_text(url)
+        else:
+            csv_text = http.get_text(
+                url,
+                raw_snapshot=RawSnapshotContext(
+                    provider="us-treasury",
+                    dataset="daily-yield-curve",
+                    store=store,
+                    ingest_run_id=ingest_run_id,
+                    role="treasury-yields",
+                    adapter_name="aios-treasury-http",
+                    adapter_version="1",
+                    parser_version="treasury-yield-csv-v1",
+                ),
+            )
         df = pd.read_csv(io.StringIO(csv_text))
     except Exception as e:  # pragma: no cover
         log.error("treasury.fetch_failed", error=str(e))
@@ -296,7 +316,10 @@ def ingest_macro(
     needs_treasury = not settings.fred_api_key or bool(TREASURY_YIELD_SERIES & failures.keys())
     if needs_treasury:
         try:
-            trows = fetch_treasury_yield_curve()
+            trows = fetch_treasury_yield_curve(
+                store=store,
+                ingest_run_id=run_id,
+            )
             if trows:
                 total += store.upsert_macro(trows)
             else:

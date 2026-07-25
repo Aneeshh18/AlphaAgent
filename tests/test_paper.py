@@ -11,10 +11,13 @@ from aios.paper import (
     create_paper_proposal,
     execute_paper_proposal,
     initialize_paper_account,
+    latest_paper_decision_date,
+    latest_reviewed_market_close,
     mark_paper_account,
     paper_account_summary,
     read_paper_document,
 )
+from aios.readiness import USReadinessPolicy
 from aios.storage.store import Store
 
 
@@ -144,6 +147,51 @@ def test_paper_document_checksum_detects_manual_payload_edit(tmp_path) -> None:
 
         with pytest.raises(ValueError, match="checksum mismatch"):
             read_paper_document(path)
+    finally:
+        store.close()
+
+
+def test_decision_date_stops_at_universe_boundary_but_valuation_can_advance(tmp_path) -> None:
+    store = Store(tmp_path / "paper-clocks.duckdb")
+    try:
+        policy = USReadinessPolicy(
+            minimum_universe_members=2,
+            maximum_universe_members=3,
+        )
+        store.upsert_universe_membership(
+            [
+                {
+                    "universe_id": "sp500",
+                    "ticker": ticker,
+                    "effective_start": "2026-01-01",
+                    "effective_end": "2026-07-22",
+                    "known_date": "2025-12-20",
+                    "end_known_date": "2026-07-21",
+                    "source": "test:certified-through-2026-07-21",
+                }
+                for ticker in ("A", "B")
+            ]
+        )
+        store.upsert_prices(
+            [
+                {
+                    "ticker": "SPY",
+                    "date": observed.isoformat(),
+                    "close": 500.0,
+                    "source": "test",
+                }
+                for observed in (date(2026, 7, 21), date(2026, 7, 22))
+            ]
+        )
+
+        assert latest_reviewed_market_close(store, today=date(2026, 7, 23)) == date(
+            2026, 7, 22
+        )
+        assert latest_paper_decision_date(
+            store,
+            today=date(2026, 7, 23),
+            policy=policy,
+        ) == date(2026, 7, 21)
     finally:
         store.close()
 

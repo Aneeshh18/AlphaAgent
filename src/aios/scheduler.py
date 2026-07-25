@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import pwd
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -11,23 +12,36 @@ from pathlib import Path
 
 MANAGED_MARKER = "# Managed by AI Investment OS. Re-run `aios scheduler-install` to update."
 TIMER_NAMES = (
-    "aios-us-current.timer",
+    "aios-us-daily.timer",
     "aios-us-filings.timer",
     "aios-backup.timer",
 )
 SERVICE_BY_TIMER = {
-    "aios-us-current.timer": "aios-us-current.service",
+    "aios-us-daily.timer": "aios-us-daily.service",
     "aios-us-filings.timer": "aios-us-filings.service",
     "aios-backup.timer": "aios-backup.service",
 }
+SERVICE_NAMES = tuple(SERVICE_BY_TIMER.values())
+LEGACY_TIMER_NAMES = (
+    "aios-us-current.timer",
+    "aios-universe-review.timer",
+)
+LEGACY_SERVICE_NAMES = (
+    "aios-us-current.service",
+    "aios-universe-review.service",
+)
+LEGACY_UNIT_NAMES = LEGACY_SERVICE_NAMES + LEGACY_TIMER_NAMES
+MANAGED_SERVICE_NAMES = SERVICE_NAMES + LEGACY_SERVICE_NAMES
+ALERT_SERVICE_NAME = "aios-alert@.service"
 STATUS_QUERY_TIMEOUT_SECONDS = 5.0
 UNIT_NAMES = (
-    "aios-us-current.service",
-    "aios-us-current.timer",
+    "aios-us-daily.service",
+    "aios-us-daily.timer",
     "aios-us-filings.service",
     "aios-us-filings.timer",
     "aios-backup.service",
     "aios-backup.timer",
+    ALERT_SERVICE_NAME,
 )
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -39,6 +53,7 @@ class SchedulerInstallResult:
     unit_dir: Path
     units: tuple[Path, ...]
     timers: tuple[str, ...]
+    linger_enabled: bool | None = None
 
 
 def render_systemd_units(project_root: Path) -> dict[str, str]:
@@ -53,29 +68,37 @@ def render_systemd_units(project_root: Path) -> dict[str, str]:
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists={launcher_condition}
+OnFailure=aios-alert@%n.service
 
 [Service]
 Type=oneshot
 WorkingDirectory={root_value}
 Environment=PYTHONUNBUFFERED=1
+Environment=AIOS_DUCKDB_LOCK_WAIT_SECONDS=300
 UMask=0077
 Nice=10
 TimeoutStartSec=45min
 """
     units = {
-        "aios-us-current.service": (
+        "aios-us-daily.service": (
             common_service.replace(
                 "[Unit]\n",
-                "[Unit]\nDescription=AIOS weekday U.S. price and macro refresh\n",
+                "[Unit]\nDescription=AIOS recoverable weekday U.S. daily update\n"
+                "StartLimitIntervalSec=45min\n"
+                "StartLimitBurst=3\n",
                 1,
             )
-            + f"ExecStart={launcher_value} refresh-us-current --no-fundamentals\n"
+            + "Restart=on-failure\n"
+            + "RestartSec=5min\n"
+            + f"ExecStart={launcher_value} refresh-us-daily\n"
             + f"ExecStartPost={launcher_value} health\n"
+            + f"ExecStartPost=-{launcher_value} alert-service-recovered --unit %n\n"
         ),
-        "aios-us-current.timer": _timer_unit(
-            "AIOS weekday U.S. current-data refresh",
-            "Mon..Fri *-*-* 07:30:00",
-            "aios-us-current.service",
+        "aios-us-daily.timer": _timer_unit(
+            "AIOS recoverable weekday U.S. daily update",
+            "Tue..Sat *-*-* 02:00:00 America/New_York",
+            "aios-us-daily.service",
+            startup_delay="3min",
         ),
         "aios-us-filings.service": (
             common_service.replace(
@@ -85,6 +108,7 @@ TimeoutStartSec=45min
             )
             + f"ExecStart={launcher_value} refresh-us-current --no-prices --no-macro\n"
             + f"ExecStartPost={launcher_value} health\n"
+            + f"ExecStartPost=-{launcher_value} alert-service-recovered --unit %n\n"
         ),
         "aios-us-filings.timer": _timer_unit(
             "AIOS weekly SEC filing refresh",
@@ -98,12 +122,26 @@ TimeoutStartSec=45min
                 1,
             )
             + f"ExecStart={launcher_value} backup\n"
+            + f"ExecStartPost=-{launcher_value} alert-service-recovered --unit %n\n"
         ),
         "aios-backup.timer": _timer_unit(
             "AIOS weekly verified local backup",
             "Sun *-*-* 09:00:00",
             "aios-backup.service",
         ),
+        ALERT_SERVICE_NAME: f"""{MANAGED_MARKER}
+[Unit]
+Description=AIOS local failure recorder for %i
+ConditionPathExists={launcher_condition}
+
+[Service]
+Type=oneshot
+WorkingDirectory={root_value}
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+TimeoutStartSec=30s
+ExecStart={launcher_value} alert-service-failure --unit %i
+""",
     }
     if set(units) != set(UNIT_NAMES):
         raise RuntimeError("internal scheduler unit set is incomplete")
@@ -114,6 +152,7 @@ def install_user_scheduler(
     project_root: Path,
     *,
     confirm: bool = False,
+    enable_linger: bool = False,
     unit_dir: Path | None = None,
     runner: Runner = subprocess.run,
 ) -> SchedulerInstallResult:
@@ -130,8 +169,17 @@ def install_user_scheduler(
         else (Path.home() / ".config" / "systemd" / "user").resolve()
     )
     units = render_systemd_units(root)
-    _preflight_managed_paths(destination, units)
+    _preflight_managed_paths(destination, units, LEGACY_UNIT_NAMES)
     destination.mkdir(parents=True, exist_ok=True)
+    _run(
+        runner,
+        ["systemctl", "--user", "disable", "--now", *LEGACY_TIMER_NAMES],
+        check=False,
+    )
+    for name in LEGACY_UNIT_NAMES:
+        path = destination / name
+        if path.exists():
+            path.unlink()
     paths: list[Path] = []
     for name, content in units.items():
         target = destination / name
@@ -140,7 +188,13 @@ def install_user_scheduler(
 
     _run(runner, ["systemctl", "--user", "daemon-reload"])
     _run(runner, ["systemctl", "--user", "enable", "--now", *TIMER_NAMES])
-    return SchedulerInstallResult(destination, tuple(paths), TIMER_NAMES)
+    linger_enabled = None
+    if enable_linger:
+        enable_user_linger(confirm=True, runner=runner)
+        linger_enabled = user_linger_status(runner=runner)
+        if linger_enabled is not True:
+            raise RuntimeError("login manager did not confirm keep-running-after-logout")
+    return SchedulerInstallResult(destination, tuple(paths), TIMER_NAMES, linger_enabled)
 
 
 def set_user_scheduler_active(
@@ -170,6 +224,8 @@ def user_scheduler_status(
                 runner,
                 ["systemctl", "--user", "is-active", timer],
             )
+            if _user_bus_unavailable(enabled) or _user_bus_unavailable(active):
+                return _scheduler_file_status(unit_dir)
             timer_properties = _show_properties(
                 runner,
                 timer,
@@ -255,13 +311,21 @@ def remove_user_scheduler(
         if unit_dir is not None
         else (Path.home() / ".config" / "systemd" / "user").resolve()
     )
-    existing = [destination / name for name in UNIT_NAMES if (destination / name).exists()]
+    all_names = UNIT_NAMES + LEGACY_UNIT_NAMES
+    existing = [destination / name for name in all_names if (destination / name).exists()]
     for path in existing:
         if path.is_symlink() or not _is_managed(path):
             raise ValueError(f"refusing to remove unmanaged scheduler file: {path}")
     _run(
         runner,
-        ["systemctl", "--user", "disable", "--now", *TIMER_NAMES],
+        [
+            "systemctl",
+            "--user",
+            "disable",
+            "--now",
+            *TIMER_NAMES,
+            *LEGACY_TIMER_NAMES,
+        ],
         check=False,
     )
     for path in existing:
@@ -270,14 +334,51 @@ def remove_user_scheduler(
     return tuple(existing)
 
 
-def _timer_unit(description: str, calendar: str, service: str) -> str:
+def enable_user_linger(
+    *,
+    confirm: bool = False,
+    runner: Runner = subprocess.run,
+) -> None:
+    """Keep the user service manager alive after logout; never disable it implicitly."""
+    if not confirm:
+        raise ValueError("keep-running-after-logout requires explicit confirmation")
+    username = pwd.getpwuid(os.getuid()).pw_name
+    _run(runner, ["loginctl", "enable-linger", username])
+
+
+def user_linger_status(*, runner: Runner = subprocess.run) -> bool | None:
+    """Return linger state, or None when the login manager cannot be queried."""
+    username = pwd.getpwuid(os.getuid()).pw_name
+    try:
+        completed = _status_query(
+            runner,
+            ["loginctl", "show-user", username, "--property", "Linger", "--value"],
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode:
+        return None
+    value = completed.stdout.strip().lower()
+    if value not in {"yes", "no"}:
+        return None
+    return value == "yes"
+
+
+def _timer_unit(
+    description: str,
+    calendar: str,
+    service: str,
+    *,
+    startup_delay: str | None = None,
+) -> str:
+    startup = f"OnStartupSec={startup_delay}\n" if startup_delay else ""
     return f"""{MANAGED_MARKER}
 [Unit]
 Description={description}
 
 [Timer]
 OnCalendar={calendar}
-Persistent=true
+{startup}Persistent=true
 AccuracySec=5min
 RandomizedDelaySec=5min
 Unit={service}
@@ -287,8 +388,12 @@ WantedBy=timers.target
 """
 
 
-def _preflight_managed_paths(destination: Path, units: dict[str, str]) -> None:
-    for name in units:
+def _preflight_managed_paths(
+    destination: Path,
+    units: dict[str, str],
+    legacy_names: tuple[str, ...] = (),
+) -> None:
+    for name in (*units, *legacy_names):
         target = destination / name
         if target.is_symlink():
             raise ValueError(f"refusing to replace symbolic-link scheduler file: {target}")
@@ -377,6 +482,21 @@ def _status_query(runner: Runner, command: list[str]) -> subprocess.CompletedPro
     if completed.returncode in {124, 137}:
         raise subprocess.TimeoutExpired(command, STATUS_QUERY_TIMEOUT_SECONDS)
     return completed
+
+
+def _user_bus_unavailable(completed: subprocess.CompletedProcess[str]) -> bool:
+    """Distinguish an inaccessible user bus from a genuinely disabled timer."""
+    if completed.returncode == 0:
+        return False
+    detail = f"{completed.stderr}\n{completed.stdout}".lower()
+    return any(
+        marker in detail
+        for marker in (
+            "failed to connect to bus",
+            "no medium found",
+            "transport endpoint is not connected",
+        )
+    )
 
 
 def _path_text(value: Path) -> str:

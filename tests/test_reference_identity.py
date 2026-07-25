@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import sys
 from datetime import date
@@ -16,6 +17,7 @@ from aios.ingest.reference_identity import (
     load_issuer_cik_csv,
     load_provider_symbol_csv,
 )
+from aios.raw_snapshots import verify_raw_snapshots
 from aios.storage.store import Store
 
 SECURITY_ID = "aios:security:demo-common"
@@ -57,7 +59,162 @@ def test_yfinance_fetch_explicitly_requests_and_marks_actions(monkeypatch) -> No
     assert rows[0]["actions_complete"] is True
     assert rows[0]["close_split_adjusted"] is True
     assert rows[0]["split_normalization_factor"] == 2.0
-    assert rows[0]["split_normalization_through"] == date.today().isoformat()
+    assert (
+        rows[0]["split_normalization_through"]
+        == prices.latest_completed_us_equity_session().isoformat()
+    )
+
+
+def test_yfinance_excludes_an_open_us_session_after_india_midnight(monkeypatch) -> None:
+    def fake_download(*_args, **_kwargs):
+        return pd.DataFrame(
+            {
+                "Open": [100.0, 50.0],
+                "High": [101.0, 51.0],
+                "Low": [99.0, 49.0],
+                "Close": [100.0, 50.0],
+                "Adj Close": [100.0, 50.0],
+                "Volume": [1000, 2000],
+                "Dividends": [0.0, 0.0],
+                "Stock Splits": [0.0, 2.0],
+            },
+            index=[pd.Timestamp("2026-07-22"), pd.Timestamp("2026-07-23")],
+        )
+
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(download=fake_download))
+    monkeypatch.setattr(
+        prices,
+        "latest_completed_us_equity_session",
+        lambda: date(2026, 7, 22),
+    )
+
+    rows = prices.fetch_yfinance("TEST", start="2026-07-22", end="2026-07-25")
+
+    assert [row["date"] for row in rows] == ["2026-07-22"]
+    assert rows[0]["split_normalization_factor"] == 1.0
+    assert rows[0]["split_normalization_through"] == "2026-07-22"
+
+
+def test_yfinance_fetch_retries_an_isolated_empty_response(monkeypatch) -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def fake_download(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return pd.DataFrame()
+        return pd.DataFrame(
+            {
+                "Open": [100.0],
+                "High": [101.0],
+                "Low": [99.0],
+                "Close": [100.0],
+                "Adj Close": [100.0],
+                "Volume": [1000],
+                "Dividends": [0.0],
+                "Stock Splits": [0.0],
+            },
+            index=[pd.Timestamp("2024-01-02")],
+        )
+
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(download=fake_download))
+    monkeypatch.setattr(prices.time, "sleep", sleeps.append)
+
+    rows = prices.fetch_yfinance("TEST", start="2024-01-01", end="2024-01-03")
+
+    assert attempts == 2
+    assert sleeps == [prices.settings.yfinance_retry_base_sec]
+    assert [row["date"] for row in rows] == ["2024-01-02"]
+
+
+def test_yfinance_fetch_fails_closed_after_bounded_empty_retries(monkeypatch) -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def fake_download(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return pd.DataFrame()
+
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(download=fake_download))
+    monkeypatch.setattr(prices.time, "sleep", sleeps.append)
+
+    rows = prices.fetch_yfinance("TEST", start="2024-01-01", end="2024-01-03")
+
+    assert rows == []
+    assert attempts == prices.settings.yfinance_max_attempts
+    assert sleeps == [
+        prices.settings.yfinance_retry_base_sec,
+        prices.settings.yfinance_retry_base_sec * 2,
+    ]
+
+
+def test_yfinance_normalized_export_is_linked_and_replay_verified(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    def fake_download(*_args, **_kwargs):
+        return pd.DataFrame(
+            {
+                "Open": [100.0, 50.0],
+                "High": [101.0, 51.0],
+                "Low": [99.0, 49.0],
+                "Close": [100.0, 50.0],
+                "Adj Close": [99.0, 50.0],
+                "Volume": [1000, 2000],
+                "Dividends": [1.0, 0.0],
+                "Stock Splits": [0.0, 2.0],
+            },
+            index=[pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-04")],
+        )
+
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(download=fake_download))
+    monkeypatch.setattr(
+        prices,
+        "latest_completed_us_equity_session",
+        lambda: date(2024, 1, 5),
+    )
+    store = Store(tmp_path / "data" / "test.duckdb")
+    try:
+        rows = prices.fetch_yfinance(
+            "TEST",
+            start="2024-01-01",
+            end="2024-01-03",
+            store=store,
+            ingest_run_id="price-run",
+            project_root=tmp_path,
+        )
+
+        snapshot = store.query(
+            """
+            SELECT snapshot_id, artifact_kind, parsed_row_count,
+                   parsed_rows_sha256, payload_sha256
+            FROM raw_snapshots
+            """
+        )[0]
+        assert snapshot["artifact_kind"] == "normalized_provider_export"
+        assert snapshot["parsed_row_count"] == 1
+        assert snapshot["parsed_rows_sha256"]
+        assert store.query(
+            "SELECT run_id, role FROM ingest_raw_snapshots"
+        ) == [{"run_id": "price-run", "role": "prices:TEST"}]
+        payload_record = store.raw_payload_record(snapshot["payload_sha256"])
+        payload = gzip.decompress(
+            (tmp_path / payload_record["relative_path"]).read_bytes()
+        )
+        assert prices.parse_yfinance_normalized_export(payload) == rows
+        verification = verify_raw_snapshots(store=store, project_root=tmp_path)
+        assert verification.replayed_snapshots == 1
+
+        store.execute(
+            "UPDATE raw_snapshots SET parsed_rows_sha256 = ? WHERE snapshot_id = ?",
+            ("0" * 64, snapshot["snapshot_id"]),
+        )
+        with pytest.raises(ValueError, match="replay checksum mismatch"):
+            verify_raw_snapshots(store=store, project_root=tmp_path)
+    finally:
+        store.close()
 
 
 def test_companyfacts_archive_reads_reviewed_cik_and_rejects_wrong_payload(tmp_path):
@@ -163,6 +320,25 @@ def _reference_rows(
 
 def _install_reference_rows(store: Store, *, provider_start: str = "2024-01-01") -> None:
     store.upsert_reference_identities(*_reference_rows(provider_start=provider_start))
+
+
+def test_universe_identity_labels_use_reviewed_issuer_names(tmp_path):
+    store = Store(tmp_path / "identity-labels.duckdb")
+    try:
+        _setup_security(store)
+        _install_reference_rows(store)
+
+        old_label = store.universe_identity_labels("demo", "2024-06-30")[0]
+        new_label = store.universe_identity_labels("demo", "2024-07-01")[0]
+
+        assert old_label["ticker"] == "OLD"
+        assert new_label["ticker"] == "NEW"
+        assert old_label["security_id"] == new_label["security_id"] == SECURITY_ID
+        assert old_label["issuer_id"] == new_label["issuer_id"] == ISSUER_ID
+        assert old_label["canonical_name"] == new_label["canonical_name"] == "Demo Corporation"
+        assert old_label["name_source"] == EVIDENCE
+    finally:
+        store.close()
 
 
 def _fundamental(
@@ -597,10 +773,20 @@ def test_ingest_issuer_uses_reviewed_cik_and_tags_rows(monkeypatch, tmp_path):
             ]
         )
 
-        def fake_extract(ticker, cik, *, issuer_id, security_id):
+        def fake_extract(
+            ticker,
+            cik,
+            *,
+            issuer_id,
+            security_id,
+            snapshot_store,
+            ingest_run_id,
+        ):
             assert (ticker, cik) == ("NEW", 1)
             assert issuer_id == ISSUER_ID
             assert security_id == SECURITY_ID
+            assert snapshot_store is store
+            assert isinstance(ingest_run_id, str) and ingest_run_id
             return (
                 [
                     _fundamental(

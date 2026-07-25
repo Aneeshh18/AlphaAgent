@@ -17,7 +17,11 @@ from __future__ import annotations
 
 import random
 import time
-from typing import Any
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 from structlog import get_logger
@@ -30,7 +34,38 @@ from tenacity import (
 
 from aios.config import settings
 
+if TYPE_CHECKING:
+    from aios.storage.store import Store
+
 log = get_logger(__name__)
+
+_SECRET_QUERY_KEYS = {
+    "api_key",
+    "apikey",
+    "access_token",
+    "authorization",
+    "key",
+    "secret",
+    "sig",
+    "signature",
+    "token",
+}
+
+
+@dataclass(frozen=True)
+class RawSnapshotContext:
+    """Opt-in immutable evidence settings for one external GET response."""
+
+    provider: str
+    dataset: str
+    store: Store
+    ingest_run_id: str | None
+    role: str
+    adapter_name: str
+    adapter_version: str
+    parser_version: str
+    artifact_kind: str = "exact_response"
+    project_root: Path | None = None
 
 
 class RateLimiter:
@@ -116,7 +151,7 @@ class HttpClient:
         # raising a transient error that tenacity catches.
         if resp.status_code == 429:
             sleep_for = random.uniform(2.0, 5.0)
-            log.warning("http.429_throttle", url=url, sleep=sleep_for)
+            log.warning("http.429_throttle", url=_secret_free_url(url), sleep=sleep_for)
             time.sleep(sleep_for)
             raise httpx.HTTPStatusError(
                 "429 Too Many Requests", request=resp.request, response=resp
@@ -129,15 +164,89 @@ class HttpClient:
         resp.raise_for_status()
         return resp
 
-    def get_json(self, url: str, headers: dict[str, str] | None = None) -> Any:
+    def get_json(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        *,
+        raw_snapshot: RawSnapshotContext | None = None,
+    ) -> Any:
+        requested_at = datetime.now(UTC)
         resp = self._get(url, headers=headers)
+        self._capture_response(resp, url, requested_at, raw_snapshot)
         return resp.json()
 
-    def get_text(self, url: str, headers: dict[str, str] | None = None) -> str:
-        return self._get(url, headers=headers).text
+    def get_text(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        *,
+        raw_snapshot: RawSnapshotContext | None = None,
+    ) -> str:
+        requested_at = datetime.now(UTC)
+        resp = self._get(url, headers=headers)
+        self._capture_response(resp, url, requested_at, raw_snapshot)
+        return resp.text
 
-    def get_bytes(self, url: str, headers: dict[str, str] | None = None) -> bytes:
-        return self._get(url, headers=headers).content
+    def get_bytes(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        *,
+        raw_snapshot: RawSnapshotContext | None = None,
+    ) -> bytes:
+        requested_at = datetime.now(UTC)
+        resp = self._get(url, headers=headers)
+        self._capture_response(resp, url, requested_at, raw_snapshot)
+        return resp.content
+
+    @staticmethod
+    def _capture_response(
+        response: httpx.Response,
+        requested_url: str,
+        requested_at: datetime,
+        context: RawSnapshotContext | None,
+    ) -> None:
+        if context is None:
+            return
+        from aios.raw_snapshots import (
+            canonical_request_fingerprint,
+            capture_raw_snapshot,
+        )
+
+        capture_raw_snapshot(
+            response.content,
+            provider=context.provider,
+            dataset=context.dataset,
+            artifact_kind=context.artifact_kind,
+            requested_at=requested_at,
+            received_at=datetime.now(UTC),
+            request_fingerprint=canonical_request_fingerprint(
+                {"method": "GET", "url": _secret_free_url(requested_url)}
+            ),
+            adapter_name=context.adapter_name,
+            adapter_version=context.adapter_version,
+            parser_version=context.parser_version,
+            http_status=response.status_code,
+            content_type=response.headers.get("content-type"),
+            ingest_run_id=context.ingest_run_id,
+            role=context.role,
+            store=context.store,
+            project_root=context.project_root,
+        )
+
+
+def _secret_free_url(url: str) -> str:
+    """Return a stable request description with secret-shaped query values removed."""
+    split = urlsplit(url)
+    safe_query = urlencode(
+        [
+            (key, "<redacted>" if key.lower() in _SECRET_QUERY_KEYS else value)
+            for key, value in parse_qsl(split.query, keep_blank_values=True)
+        ],
+        doseq=True,
+    )
+    return urlunsplit((split.scheme, split.netloc, split.path, safe_query, ""))
 
 
 # Module-level singleton; import and use. Lazy-init so tests can swap it.
