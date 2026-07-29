@@ -18,10 +18,12 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from datetime import date, datetime
+from io import StringIO
 from pathlib import Path
 from urllib.parse import urlparse
 from uuid import uuid4
 
+from aios.artifacts import publish_text_write_once
 from aios.storage.store import Store, get_store
 
 REQUIRED_COLUMNS = {"ticker", "effective_start", "known_date"}
@@ -405,21 +407,21 @@ def build_membership_from_events(
 def write_membership_csv(path: str | Path, rows: list[dict]) -> None:
     """Write import-ready membership rows after all validation has succeeded."""
     output_path = Path(path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=MEMBERSHIP_COLUMNS)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(
-                {
-                    **row,
-                    "effective_start": row["effective_start"].isoformat(),
-                    "effective_end": (
-                        row["effective_end"].isoformat() if row["effective_end"] else ""
-                    ),
-                    "known_date": row["known_date"].isoformat(),
-                }
-            )
+    handle = StringIO(newline="")
+    writer = csv.DictWriter(handle, fieldnames=MEMBERSHIP_COLUMNS)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(
+            {
+                **row,
+                "effective_start": row["effective_start"].isoformat(),
+                "effective_end": (
+                    row["effective_end"].isoformat() if row["effective_end"] else ""
+                ),
+                "known_date": row["known_date"].isoformat(),
+            }
+        )
+    publish_text_write_once(output_path, handle.getvalue())
 
 
 def load_membership_csv(

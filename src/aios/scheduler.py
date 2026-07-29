@@ -16,10 +16,15 @@ TIMER_NAMES = (
     "aios-us-filings.timer",
     "aios-backup.timer",
 )
+EMAIL_TIMER_NAME = "aios-notifications-email.timer"
+EMAIL_SERVICE_NAME = "aios-notifications-email.service"
+OPTIONAL_TIMER_NAMES = (EMAIL_TIMER_NAME,)
+ALL_TIMER_NAMES = TIMER_NAMES + OPTIONAL_TIMER_NAMES
 SERVICE_BY_TIMER = {
     "aios-us-daily.timer": "aios-us-daily.service",
     "aios-us-filings.timer": "aios-us-filings.service",
     "aios-backup.timer": "aios-backup.service",
+    EMAIL_TIMER_NAME: EMAIL_SERVICE_NAME,
 }
 SERVICE_NAMES = tuple(SERVICE_BY_TIMER.values())
 LEGACY_TIMER_NAMES = (
@@ -34,6 +39,8 @@ LEGACY_UNIT_NAMES = LEGACY_SERVICE_NAMES + LEGACY_TIMER_NAMES
 MANAGED_SERVICE_NAMES = SERVICE_NAMES + LEGACY_SERVICE_NAMES
 ALERT_SERVICE_NAME = "aios-alert@.service"
 STATUS_QUERY_TIMEOUT_SECONDS = 5.0
+SCHEDULED_LOCK_WAIT_SECONDS = 30 * 60
+FLOCK_PATH = Path("/usr/bin/flock")
 UNIT_NAMES = (
     "aios-us-daily.service",
     "aios-us-daily.timer",
@@ -41,6 +48,8 @@ UNIT_NAMES = (
     "aios-us-filings.timer",
     "aios-backup.service",
     "aios-backup.timer",
+    "aios-notifications-email.service",
+    "aios-notifications-email.timer",
     ALERT_SERVICE_NAME,
 )
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -63,6 +72,12 @@ def render_systemd_units(project_root: Path) -> dict[str, str]:
     root_value = _unit_scalar_path(root)
     launcher_condition = _unit_scalar_path(launcher)
     launcher_value = _unit_exec_path(launcher)
+    flock_value = _unit_exec_path(FLOCK_PATH)
+    scheduler_lock = _unit_exec_path(root / "data" / "operations" / "scheduler.lock")
+    serialized_launcher = (
+        f"{flock_value} --exclusive --wait {SCHEDULED_LOCK_WAIT_SECONDS} "
+        f"{scheduler_lock} {launcher_value}"
+    )
     common_service = f"""{MANAGED_MARKER}
 [Unit]
 After=network-online.target
@@ -74,7 +89,7 @@ OnFailure=aios-alert@%n.service
 Type=oneshot
 WorkingDirectory={root_value}
 Environment=PYTHONUNBUFFERED=1
-Environment=AIOS_DUCKDB_LOCK_WAIT_SECONDS=300
+Environment=DUCKDB_LOCK_WAIT_SECONDS=300
 UMask=0077
 Nice=10
 TimeoutStartSec=45min
@@ -90,8 +105,8 @@ TimeoutStartSec=45min
             )
             + "Restart=on-failure\n"
             + "RestartSec=5min\n"
-            + f"ExecStart={launcher_value} refresh-us-daily\n"
-            + f"ExecStartPost={launcher_value} health\n"
+            + f"ExecStart={serialized_launcher} refresh-us-daily\n"
+            + f"ExecStartPost={serialized_launcher} health\n"
             + f"ExecStartPost=-{launcher_value} alert-service-recovered --unit %n\n"
         ),
         "aios-us-daily.timer": _timer_unit(
@@ -106,8 +121,11 @@ TimeoutStartSec=45min
                 "[Unit]\nDescription=AIOS weekly SEC filing refresh\n",
                 1,
             )
-            + f"ExecStart={launcher_value} refresh-us-current --no-prices --no-macro\n"
-            + f"ExecStartPost={launcher_value} health\n"
+            + (
+                f"ExecStart={serialized_launcher} refresh-us-current "
+                "--no-prices --no-macro\n"
+            )
+            + f"ExecStartPost={serialized_launcher} health\n"
             + f"ExecStartPost=-{launcher_value} alert-service-recovered --unit %n\n"
         ),
         "aios-us-filings.timer": _timer_unit(
@@ -121,13 +139,33 @@ TimeoutStartSec=45min
                 "[Unit]\nDescription=AIOS weekly verified local backup\n",
                 1,
             )
-            + f"ExecStart={launcher_value} backup\n"
+            + f"ExecStart={serialized_launcher} backup\n"
             + f"ExecStartPost=-{launcher_value} alert-service-recovered --unit %n\n"
         ),
         "aios-backup.timer": _timer_unit(
             "AIOS weekly verified local backup",
             "Sun *-*-* 09:00:00",
             "aios-backup.service",
+        ),
+        EMAIL_SERVICE_NAME: f"""{MANAGED_MARKER}
+[Unit]
+Description=AIOS bounded external email delivery
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists={launcher_condition}
+
+[Service]
+Type=oneshot
+WorkingDirectory={root_value}
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+Nice=10
+TimeoutStartSec=8min
+ExecStart={launcher_value} email-deliver --limit 2
+""",
+        EMAIL_TIMER_NAME: _interval_timer_unit(
+            "AIOS bounded external email delivery",
+            EMAIL_SERVICE_NAME,
         ),
         ALERT_SERVICE_NAME: f"""{MANAGED_MARKER}
 [Unit]
@@ -163,6 +201,12 @@ def install_user_scheduler(
     launcher = root / ".venv" / "bin" / "aios"
     if launcher.is_symlink() or not launcher.is_file() or not os.access(launcher, os.X_OK):
         raise ValueError(f"AIOS virtual-environment launcher is missing or unsafe: {launcher}")
+    if not FLOCK_PATH.is_file() or not os.access(FLOCK_PATH, os.X_OK):
+        raise ValueError(f"required scheduler lock utility is unavailable: {FLOCK_PATH}")
+    scheduler_lock_dir = root / "data" / "operations"
+    scheduler_lock_dir.mkdir(parents=True, exist_ok=True)
+    if scheduler_lock_dir.is_symlink() or not scheduler_lock_dir.is_dir():
+        raise ValueError(f"scheduler lock directory is unsafe: {scheduler_lock_dir}")
     destination = (
         Path(unit_dir).expanduser().resolve()
         if unit_dir is not None
@@ -207,15 +251,52 @@ def set_user_scheduler_active(
     _run(runner, ["systemctl", "--user", action, "--now", *TIMER_NAMES])
 
 
+def set_email_scheduler_active(
+    active: bool,
+    *,
+    runner: Runner = subprocess.run,
+) -> None:
+    """Enable or disable only the explicitly opted-in external email timer."""
+    action = "enable" if active else "disable"
+    _run(runner, ["systemctl", "--user", action, "--now", EMAIL_TIMER_NAME])
+
+
 def user_scheduler_status(
     *,
     runner: Runner = subprocess.run,
     unit_dir: Path | None = None,
 ) -> dict[str, dict[str, bool | str]]:
-    """Return enabled/active state without hanging on an unavailable user bus."""
+    """Return core timer state without hanging on an unavailable user bus."""
+    return _scheduler_status(
+        TIMER_NAMES,
+        runner=runner,
+        unit_dir=unit_dir,
+    )
+
+
+def email_scheduler_status(
+    *,
+    runner: Runner = subprocess.run,
+    unit_dir: Path | None = None,
+) -> dict[str, bool | str]:
+    """Return the optional email timer state without enabling or starting it."""
+    return _scheduler_status(
+        OPTIONAL_TIMER_NAMES,
+        runner=runner,
+        unit_dir=unit_dir,
+    )[EMAIL_TIMER_NAME]
+
+
+def _scheduler_status(
+    timer_names: tuple[str, ...],
+    *,
+    runner: Runner,
+    unit_dir: Path | None,
+) -> dict[str, dict[str, bool | str]]:
+    """Return bounded runtime or installed-file evidence for selected timers."""
     result: dict[str, dict[str, bool | str]] = {}
     try:
-        for timer in TIMER_NAMES:
+        for timer in timer_names:
             enabled = _status_query(
                 runner,
                 ["systemctl", "--user", "is-enabled", timer],
@@ -225,7 +306,7 @@ def user_scheduler_status(
                 ["systemctl", "--user", "is-active", timer],
             )
             if _user_bus_unavailable(enabled) or _user_bus_unavailable(active):
-                return _scheduler_file_status(unit_dir)
+                return _scheduler_file_status(unit_dir, timer_names=timer_names)
             timer_properties = _show_properties(
                 runner,
                 timer,
@@ -246,7 +327,10 @@ def user_scheduler_status(
                 "ExecMainExitTimestamp",
                 service_properties.get("ExecMainStartTimestamp", "never"),
             )
-            last_run = last_trigger if last_trigger != "never" else service_last_run
+            # A service can also be started manually for a recovery proof. Its
+            # actual execution time is newer and more useful than the timer's
+            # last trigger; fall back to the trigger only before any service run.
+            last_run = service_last_run if service_last_run != "never" else last_trigger
             service_result = service_properties.get("Result", "not-run")
             exit_status = service_properties.get("ExecMainStatus", "unknown")
             # systemd reports Result=success and ExecMainStatus=0 for a freshly
@@ -266,11 +350,15 @@ def user_scheduler_status(
                 "runtime_verified": True,
             }
     except subprocess.TimeoutExpired:
-        return _scheduler_file_status(unit_dir)
+        return _scheduler_file_status(unit_dir, timer_names=timer_names)
     return result
 
 
-def _scheduler_file_status(unit_dir: Path | None) -> dict[str, dict[str, bool | str]]:
+def _scheduler_file_status(
+    unit_dir: Path | None,
+    *,
+    timer_names: tuple[str, ...] = TIMER_NAMES,
+) -> dict[str, dict[str, bool | str]]:
     """Report safe installation evidence when runtime systemd state is unavailable."""
     destination = (
         Path(unit_dir).expanduser().resolve()
@@ -279,7 +367,7 @@ def _scheduler_file_status(unit_dir: Path | None) -> dict[str, dict[str, bool | 
     )
     wants = destination / "timers.target.wants"
     result: dict[str, dict[str, bool | str]] = {}
-    for timer in TIMER_NAMES:
+    for timer in timer_names:
         unit = destination / timer
         enabled_link = wants / timer
         installed = unit.is_file() and not unit.is_symlink() and _is_managed(unit)
@@ -324,6 +412,7 @@ def remove_user_scheduler(
             "disable",
             "--now",
             *TIMER_NAMES,
+            *OPTIONAL_TIMER_NAMES,
             *LEGACY_TIMER_NAMES,
         ],
         check=False,
@@ -381,6 +470,23 @@ OnCalendar={calendar}
 {startup}Persistent=true
 AccuracySec=5min
 RandomizedDelaySec=5min
+Unit={service}
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def _interval_timer_unit(description: str, service: str) -> str:
+    return f"""{MANAGED_MARKER}
+[Unit]
+Description={description}
+
+[Timer]
+OnStartupSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+RandomizedDelaySec=15s
 Unit={service}
 
 [Install]

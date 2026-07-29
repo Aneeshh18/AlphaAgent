@@ -1,7 +1,55 @@
 [theme]
-base = "dark"
-primaryColor = "#2DD4BF"
-backgroundColor = "#07111F"
-secondaryBackgroundColor = "#0E1C2D"
-textColor = "#E6EDF7"
+base = "light"
+primaryColor = "#A84F30"
+backgroundColor = "#FAF9F5"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#141413"
+linkColor = "#A84F30"
+linkUnderline = true
+redColor = "#A73D39"
+redBackgroundColor = "#F7ECEC"
+redTextColor = "#7F2C28"
+yellowColor = "#805C1F"
+yellowBackgroundColor = "#F6EEDF"
+yellowTextColor = "#5A4815"
+blueColor = "#3266AD"
+blueBackgroundColor = "#D6E4F6"
+blueTextColor = "#28558F"
+greenColor = "#437426"
+greenBackgroundColor = "#E9F1DC"
+greenTextColor = "#265B19"
+grayColor = "#73726C"
+grayBackgroundColor = "#F5F4ED"
+grayTextColor = "#3D3D3A"
 font = "sans-serif"
+baseFontSize = 17
+baseFontWeight = 400
+headingFontSizes = ["1.7rem", "1.2rem", "1.05rem", "1rem", "0.95rem", "0.9rem"]
+headingFontWeights = [700, 650, 650, 600, 600, 600]
+metricValueFontSize = "1.75rem"
+metricValueFontWeight = 700
+baseRadius = "0.5rem"
+buttonRadius = "0.5rem"
+borderColor = "#D9D6CC"
+dataframeBorderColor = "#D9D6CC"
+dataframeHeaderBackgroundColor = "#F5F4ED"
+showWidgetBorder = true
+showSidebarBorder = true
+chartCategoricalColors = [
+  "#3266AD",
+  "#C96442",
+  "#6B5B95",
+  "#4F7C82",
+  "#8A6D3B",
+  "#76556F",
+  "#73726C",
+]
+
+[theme.sidebar]
+primaryColor = "#A84F30"
+backgroundColor = "#F5F4ED"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#141413"
+linkColor = "#A84F30"
+borderColor = "#D9D6CC"
+showWidgetBorder = true

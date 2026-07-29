@@ -19,19 +19,20 @@ import re
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import nullcontext
 from datetime import date, timedelta
+from io import StringIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from aios.artifacts import publish_text_write_once
 from aios.ingest.edgar import (
     SUBMISSIONS_FILE_URL,
     SUBMISSIONS_URL,
-    TICKER_MAP_URL,
     CompanyFactsArchive,
+    fetch_company_ticker_records,
     fetch_submission_file,
     fetch_submissions,
 )
-from aios.ingest.http_client import get_http
 from aios.ingest.prices import (
     fetch_provider_prices,
     ingest_security_prices,
@@ -452,13 +453,20 @@ def write_reference_window_batches(
     )
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    paths: list[Path] = []
-    for offset in range(0, len(normalized), batch_size):
-        number = start_number + len(paths)
-        path = directory / f"{batch_prefix}_{number:02d}_windows.csv"
-        _write_csv(path, BATCH_WINDOW_FIELDS, normalized[offset : offset + batch_size])
+    chunks = [
+        normalized[offset : offset + batch_size]
+        for offset in range(0, len(normalized), batch_size)
+    ]
+    paths = [
+        directory / f"{batch_prefix}_{start_number + index:02d}_windows.csv"
+        for index in range(len(chunks))
+    ]
+    existing = [path for path in paths if path.exists() or path.is_symlink()]
+    if existing:
+        raise ValueError(f"reference window artifact already exists: {existing[0]}")
+    for path, rows in zip(paths, chunks, strict=True):
+        _write_csv(path, BATCH_WINDOW_FIELDS, rows)
         load_batch_windows(path)
-        paths.append(path)
     return paths
 
 
@@ -524,22 +532,7 @@ def _subtract_intervals(
 
 def fetch_sec_ticker_records() -> dict[str, list[dict[str, Any]]]:
     """Fetch SEC ticker records without discarding duplicate ticker mappings."""
-    raw = get_http().get_json(TICKER_MAP_URL)
-    if not isinstance(raw, dict):
-        raise ValueError("SEC ticker response is not an object")
-    output: dict[str, list[dict[str, Any]]] = {}
-    for entry in raw.values():
-        if not isinstance(entry, dict):
-            continue
-        ticker = str(entry.get("ticker") or "").strip().upper()
-        title = str(entry.get("title") or "").strip()
-        cik_value = entry.get("cik_str")
-        if not ticker or not title or cik_value is None:
-            continue
-        output.setdefault(ticker, []).append(
-            {"ticker": ticker, "title": title, "cik": int(cik_value)}
-        )
-    return output
+    return fetch_company_ticker_records()
 
 
 def build_stable_reference_batch(
@@ -1020,6 +1013,18 @@ def write_reference_batch(
         "provider_symbols": directory / f"{batch_name}_provider_symbols.csv",
         "review": directory / f"{batch_name}_review.csv",
     }
+    required_paths = [paths["review"]]
+    if result.get("issuer_rows"):
+        required_paths.extend(
+            (
+                paths["issuer_ciks"],
+                paths["security_issuers"],
+                paths["provider_symbols"],
+            )
+        )
+    existing = [path for path in required_paths if path.exists() or path.is_symlink()]
+    if existing:
+        raise ValueError(f"reference batch artifact already exists: {existing[0]}")
     _write_csv(paths["review"], REVIEW_FIELDS, result["review_rows"])
     if not result.get("issuer_rows"):
         return {"review": paths["review"]}
@@ -1836,19 +1841,20 @@ def _as_date(value: date | str | Any, field: str) -> date:
 
 
 def _write_csv(path: Path, fields: tuple[str, ...], rows: list[dict]) -> None:
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=fields,
-            extrasaction="ignore",
-            lineterminator="\n",
+    handle = StringIO(newline="")
+    writer = csv.DictWriter(
+        handle,
+        fieldnames=fields,
+        extrasaction="ignore",
+        lineterminator="\n",
+    )
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(
+            {
+                field: value.isoformat() if isinstance(value, date) else value
+                for field, value in row.items()
+                if field in fields
+            }
         )
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(
-                {
-                    field: value.isoformat() if isinstance(value, date) else value
-                    for field, value in row.items()
-                    if field in fields
-                }
-            )
+    publish_text_write_once(path, handle.getvalue())

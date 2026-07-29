@@ -1,12 +1,12 @@
 """AI Investment OS — Dashboard (Streamlit).
 
 Six decision-oriented views:
-  1. OVERVIEW          — operating status, evidence clocks, and next workflow
-  2. RESEARCH EXPLORER — baseline or experimental comparison + chart
-  3. COMPANY LENS      — one-stock score and evidence review
-  4. PORTFOLIO MONITOR — supervised local simulation state and next action
-  5. SYSTEM CONTROL    — scheduler, ingests, backups, and policy evidence
-  6. METHODOLOGY       — non-technical explanation + optional audit details
+  1. TODAY          — scoped status and one highest-priority safe action
+  2. RESEARCH       — one selected ranked, map, or coverage surface
+  3. COMPANY DETAIL — one-stock score and evidence review
+  4. PAPER TRIAL    — supervised local simulation state and next action
+  5. SYSTEM HEALTH  — scheduler, ingests, backups, incidents, and policy evidence
+  6. HOW IT WORKS   — non-technical explanation + optional audit details
 
 Run:  .venv/bin/aios dashboard
 """
@@ -14,10 +14,12 @@ Run:  .venv/bin/aios dashboard
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from datetime import date, timedelta
 from html import escape
 from pathlib import Path
+from threading import Lock
 
 import duckdb
 import pandas as pd
@@ -27,17 +29,25 @@ import streamlit as st
 # Ensure src/ on path when run via `streamlit run`
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from aios.alerts import get_alert_store  # noqa: E402
 from aios.config import settings  # noqa: E402
-from aios.daily import DAILY_JOB_NAME  # noqa: E402
+from aios.dashboard_components import (  # noqa: E402
+    apply_design_system,
+    evidence_list,
+    key_value_list,
+    page_header,
+    render_action_notice,
+    render_control_list,
+    render_metric_strip,
+    render_pipeline_stepper,
+    section_header,
+)
 from aios.dashboard_copy import (  # noqa: E402
-    MODEL_OPTIONS,
     MODEL_QV_LABEL,
+    MODEL_QVML_LABEL,
     RESEARCH_ONLY_NOTICE,
     VIEW_DETAILS,
     VIEW_HOME,
     VIEW_METHOD,
-    VIEW_OPTIONS,
     VIEW_PAPER,
     VIEW_RANKINGS,
     VIEW_SYSTEM,
@@ -49,440 +59,152 @@ from aios.dashboard_copy import (  # noqa: E402
     friendly_regime,
     model_key,
     us_certification_freshness_message,
-    us_eod_freshness_message,
 )
+from aios.dashboard_ui import (  # noqa: E402
+    NextAction,
+    PaperViewModel,
+    StressReviewViewModel,
+    build_home_view_model,
+    build_paper_view_model,
+    build_stress_review_view_model,
+    notification_route_matches,
+)
+from aios.factor_batch import DecisionScopedFactorStore  # noqa: E402
 from aios.factors.composite import compute_composite  # noqa: E402
-from aios.forward import (  # noqa: E402
-    DEFAULT_FORWARD_RELATIVE_PATH,
-    assess_forward_trial,
+from aios.notifications import (  # noqa: E402
+    smtp_email_config,
 )
 from aios.operations import verify_local_backup  # noqa: E402
-from aios.paper import (  # noqa: E402
-    ACCOUNT_DOCUMENT_KIND,
-    DEFAULT_ACCOUNT_RELATIVE_PATH,
-    PROPOSAL_DOCUMENT_KIND,
-    latest_paper_decision_date,
-    paper_account_summary,
-    read_paper_document,
+from aios.operator_evidence import (  # noqa: E402
+    load_operations_evidence_read_only,
+    load_paper_monitor_evidence,
 )
+from aios.paper import latest_paper_decision_date  # noqa: E402
 from aios.readiness import assess_us_readiness  # noqa: E402
+from aios.risk.stress import (  # noqa: E402
+    build_stress_source_identity,
+    load_scenario_bundle,
+    review_registered_paper_proposal_stress,
+)
 from aios.scheduler import (  # noqa: E402
     TIMER_NAMES,
+    email_scheduler_status,
     user_linger_status,
     user_scheduler_status,
 )
 from aios.storage.store import close_global_store, store_scope  # noqa: E402
 
+_VIEW_SLUGS = {
+    VIEW_HOME: "today",
+    VIEW_RANKINGS: "research",
+    VIEW_DETAILS: "company",
+    VIEW_PAPER: "paper",
+    VIEW_SYSTEM: "system",
+    VIEW_METHOD: "method",
+}
+_VIEWS_BY_SLUG = {slug: label for label, slug in _VIEW_SLUGS.items()}
+_PRIMARY_NAVIGATION = {
+    "today": "Overview",
+    "research": "Research",
+    "paper": "Paper Trial",
+    "system": "Operations",
+    "method": "Methodology & Sources",
+}
+_MODEL_SLUGS = {
+    MODEL_QV_LABEL: "qv",
+    MODEL_QVML_LABEL: "qvml",
+}
+_MODELS_BY_SLUG = {slug: label for label, slug in _MODEL_SLUGS.items()}
+_MODEL_CONTROL_LABELS = {
+    "qv": "Baseline · Quality + Value",
+    "qvml": "Experimental · Four factor",
+}
+_RESEARCH_SURFACE_SLUGS = {
+    "Ranked List": "ranked",
+    "Opportunity Map": "map",
+    "Data Coverage": "coverage",
+}
+_RESEARCH_SURFACES_BY_SLUG = {slug: label for label, slug in _RESEARCH_SURFACE_SLUGS.items()}
+
+
+def _query_value(key: str) -> str:
+    value = st.query_params.get(key, "")
+    if isinstance(value, list):
+        value = value[-1] if value else ""
+    return str(value or "")
+
+
+def _url_marker(key: str) -> str:
+    return f"_aios_url_seen_{key}"
+
+
+def _hydrate_widget_from_url(key: str, decoded_value: object) -> None:
+    """Let an external URL change win without clobbering a widget interaction."""
+    raw_value = _query_value(key)
+    marker = _url_marker(key)
+    if (
+        key not in st.session_state
+        or marker not in st.session_state
+        or st.session_state[marker] != raw_value
+    ):
+        st.session_state[key] = decoded_value
+    st.session_state[marker] = raw_value
+
+
+def _persist_widget_query(key: str, encoded_value: str) -> None:
+    """Canonicalize one widget value in the URL and remember its origin."""
+    if _query_value(key) != encoded_value:
+        st.query_params[key] = encoded_value
+    st.session_state[_url_marker(key)] = encoded_value
+
+
+def _go_to_workspace(slug: str) -> None:
+    """Navigate through the URL-backed workspace control on the next rerun."""
+    if slug in _VIEWS_BY_SLUG:
+        st.query_params["view"] = slug
+        st.session_state["workspace"] = "research" if slug == "company" else slug
+
+
 st.set_page_config(
     page_title="AI Investment OS",
     page_icon="◆",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",
 )
 
 
-def _apply_visual_system() -> None:
-    """Apply a compact institutional shell without changing data semantics."""
-    st.markdown(
-        """
-        <style>
-        html { color-scheme: dark; }
-        :root {
-            --aios-bg: #07111F;
-            --aios-sidebar: #091626;
-            --aios-surface: #0E1C2D;
-            --aios-surface-2: #12243A;
-            --aios-surface-3: #172C45;
-            --aios-line: #20364F;
-            --aios-line-strong: #2B4766;
-            --aios-text: #E6EDF7;
-            --aios-muted: #91A4BA;
-            --aios-subtle: #6F849B;
-            --aios-teal: #2DD4BF;
-            --aios-green: #34D399;
-            --aios-amber: #FBBF24;
-            --aios-red: #FB7185;
-            --aios-blue: #60A5FA;
-        }
-        [data-testid="stAppViewContainer"] {
-            background:
-                radial-gradient(circle at 72% -10%, rgba(45, 212, 191, 0.08), transparent 28rem),
-                var(--aios-bg);
-            color: var(--aios-text);
-        }
-        [data-testid="stSidebar"] {
-            background: linear-gradient(180deg, #0A1829 0%, var(--aios-sidebar) 100%);
-            border-right: 1px solid var(--aios-line);
-        }
-        [data-testid="stSidebarContent"] { padding-top: 0.55rem; }
-        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
-            color: var(--aios-muted);
-        }
-        header[data-testid="stHeader"] {
-            background: transparent;
-            height: 2.25rem;
-        }
-        .block-container {
-            max-width: 1540px;
-            padding-top: 1.25rem;
-            padding-bottom: 3rem;
-            padding-left: 1.65rem;
-            padding-right: 1.65rem;
-        }
-        h1, h2, h3 {
-            color: var(--aios-text);
-            letter-spacing: -0.025em;
-            text-wrap: balance;
-        }
-        h1 { font-size: 1.7rem !important; font-weight: 700 !important; }
-        h2 { font-size: 1.08rem !important; font-weight: 680 !important; }
-        h3 { font-size: 0.94rem !important; font-weight: 670 !important; }
-        p, li, label { color: var(--aios-muted); }
-        hr { border-color: var(--aios-line) !important; }
-        [data-testid="stMetric"] {
-            background: var(--aios-surface);
-            border: 1px solid var(--aios-line);
-            border-radius: 10px;
-            padding: 0.78rem 0.9rem;
-            min-height: 92px;
-            box-shadow: 0 10px 28px rgba(0, 0, 0, 0.12);
-        }
-        [data-testid="stMetricLabel"] {
-            color: var(--aios-muted);
-            font-size: 0.72rem;
-            font-weight: 600;
-            letter-spacing: 0.02em;
-        }
-        [data-testid="stMetricValue"] {
-            color: var(--aios-text);
-            font-size: 1.55rem;
-            font-variant-numeric: tabular-nums;
-        }
-        [data-testid="stAlert"] {
-            border-radius: 9px;
-            border-width: 1px;
-            background: var(--aios-surface) !important;
-        }
-        [data-testid="stDataFrame"] {
-            border: 1px solid var(--aios-line);
-            border-radius: 9px;
-            overflow: hidden;
-        }
-        [data-testid="stPlotlyChart"] {
-            background: var(--aios-surface);
-            border: 1px solid var(--aios-line);
-            border-radius: 10px;
-            padding: 0.2rem;
-        }
-        [data-testid="stAppDeployButton"] { display: none; }
-        [data-testid="stSidebar"] div[role="radiogroup"] {
-            gap: 0.18rem;
-        }
-        [data-testid="stSidebar"] div[role="radiogroup"] label {
-            border-radius: 7px;
-            min-height: 40px;
-            padding: 0.55rem 0.62rem;
-            border: 1px solid transparent;
-            cursor: pointer;
-            touch-action: manipulation;
-        }
-        [data-testid="stSidebar"] div[role="radiogroup"] label > div:first-child {
-            display: none;
-        }
-        [data-testid="stSidebar"] div[role="radiogroup"] label p::before {
-            display: inline-block;
-            width: 1.35rem;
-            color: #6F849B;
-            font-weight: 700;
-        }
-        [data-testid=stSidebar] [role=radiogroup] label:nth-child(1) p::before { content: "◫"; }
-        [data-testid=stSidebar] [role=radiogroup] label:nth-child(2) p::before { content: "⌕"; }
-        [data-testid=stSidebar] [role=radiogroup] label:nth-child(3) p::before { content: "◎"; }
-        [data-testid=stSidebar] [role=radiogroup] label:nth-child(4) p::before { content: "◇"; }
-        [data-testid=stSidebar] [role=radiogroup] label:nth-child(5) p::before { content: "⚙"; }
-        [data-testid=stSidebar] [role=radiogroup] label:nth-child(6) p::before { content: "≡"; }
-        [data-testid="stSidebar"] div[role="radiogroup"] label:hover {
-            background: rgba(45, 212, 191, 0.07);
-            border-color: rgba(45, 212, 191, 0.18);
-        }
-        [data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked) {
-            background: linear-gradient(90deg, rgba(45, 212, 191, 0.16), rgba(45, 212, 191, 0.05));
-            border-color: rgba(45, 212, 191, 0.3);
-            box-shadow: inset 3px 0 0 var(--aios-teal);
-        }
-        [data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked) p {
-            color: #D8FFFA !important;
-            font-weight: 650;
-        }
-        button:focus-visible,
-        [data-testid="stSidebar"] label:has(input:focus-visible) {
-            outline: 2px solid var(--aios-teal) !important;
-            outline-offset: 2px;
-        }
-        [data-testid="stExpander"] {
-            background: rgba(14, 28, 45, 0.72);
-            border-color: var(--aios-line) !important;
-            border-radius: 9px !important;
-        }
-        [data-testid="stVerticalBlockBorderWrapper"] {
-            border-color: var(--aios-line) !important;
-            border-radius: 10px !important;
-            background: linear-gradient(180deg, rgba(18, 36, 58, 0.68), rgba(14, 28, 45, 0.82));
-        }
-        .aios-eyebrow {
-            color: var(--aios-teal);
-            font-size: 0.68rem;
-            font-weight: 700;
-            letter-spacing: 0.11em;
-            text-transform: uppercase;
-            margin-bottom: 0.12rem;
-            line-height: 1.5;
-        }
-        .aios-header-note {
-            color: var(--aios-muted);
-            font-size: 0.82rem;
-            margin-top: -0.45rem;
-            margin-bottom: 0.7rem;
-        }
-        .aios-section-note {
-            color: var(--aios-muted);
-            font-size: 0.78rem;
-            margin-top: -0.35rem;
-            margin-bottom: 0.62rem;
-        }
-        .aios-brand {
-            display: flex;
-            align-items: center;
-            gap: 0.72rem;
-            padding: 0.45rem 0 0.7rem;
-        }
-        .aios-brand-mark {
-            width: 36px;
-            height: 36px;
-            display: grid;
-            place-items: center;
-            border-radius: 10px;
-            color: #06211F;
-            background: linear-gradient(135deg, #5EEAD4, #2DD4BF);
-            font-size: 1.05rem;
-            font-weight: 900;
-            box-shadow: 0 8px 22px rgba(45, 212, 191, 0.2);
-        }
-        .aios-brand-name { color: var(--aios-text); font-size: 1.05rem; font-weight: 760; }
-        .aios-brand-sub { color: var(--aios-subtle); font-size: 0.68rem; margin-top: 0.04rem; }
-        .aios-market-tag {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.42rem;
-            color: #A8C0D8;
-            font-size: 0.72rem;
-            font-weight: 650;
-            margin: 0.1rem 0 0.55rem;
-        }
-        .aios-market-tag::before {
-            content: "";
-            width: 7px;
-            height: 7px;
-            border-radius: 50%;
-            background: var(--aios-green);
-            box-shadow: 0 0 0 4px rgba(52, 211, 153, 0.1);
-        }
-        .aios-title-row {
-            display: flex;
-            align-items: flex-end;
-            justify-content: space-between;
-            gap: 1rem;
-        }
-        .aios-title-row h1 { margin: 0.15rem 0 0.22rem; }
-        .aios-chip-row { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.42rem; }
-        .aios-chip {
-            display: inline-flex;
-            align-items: center;
-            min-height: 30px;
-            padding: 0.28rem 0.62rem;
-            border: 1px solid var(--aios-line);
-            border-radius: 7px;
-            background: rgba(18, 36, 58, 0.86);
-            color: #BFD0E2;
-            font-size: 0.7rem;
-            font-weight: 650;
-            white-space: nowrap;
-        }
-        .aios-chip.success { color: #78F4D7; border-color: rgba(45, 212, 191, 0.28); }
-        .aios-chip.warning { color: #FDE68A; border-color: rgba(251, 191, 36, 0.28); }
-        .aios-chip.danger { color: #FDB3C0; border-color: rgba(251, 113, 133, 0.3); }
-        .aios-status-strip {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 1rem;
-            margin: 0.5rem 0 0.72rem;
-            padding: 0.58rem 0.78rem;
-            border: 1px solid rgba(45, 212, 191, 0.24);
-            border-radius: 8px;
-            background: rgba(45, 212, 191, 0.07);
-            color: #A7F3E4;
-            font-size: 0.76rem;
-        }
-        .aios-status-strip strong { color: #58E8CC; }
-        .aios-status-strip.danger {
-            border-color: rgba(251, 113, 133, 0.3);
-            background: rgba(251, 113, 133, 0.08);
-            color: #FDC5CF;
-        }
-        .aios-status-strip.danger strong { color: #FB9AAB; }
-        .aios-kpi-grid {
-            display: grid;
-            grid-template-columns: repeat(6, minmax(0, 1fr));
-            gap: 0.58rem;
-            margin-bottom: 0.9rem;
-        }
-        .aios-kpi-card {
-            min-width: 0;
-            padding: 0.72rem 0.78rem 0.68rem;
-            border: 1px solid var(--aios-line);
-            border-radius: 9px;
-            background: linear-gradient(145deg, rgba(20, 41, 65, 0.96), rgba(13, 28, 45, 0.98));
-            box-shadow: 0 12px 30px rgba(0, 0, 0, 0.12);
-        }
-        .aios-kpi-label {
-            color: #91A4BA;
-            font-size: 0.67rem;
-            font-weight: 650;
-            letter-spacing: 0.015em;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-        .aios-kpi-value {
-            color: var(--aios-text);
-            font-size: 1.32rem;
-            font-weight: 720;
-            line-height: 1.15;
-            margin: 0.32rem 0 0.27rem;
-            font-variant-numeric: tabular-nums;
-            white-space: nowrap;
-        }
-        .aios-kpi-value.success { color: var(--aios-green); }
-        .aios-kpi-value.warning { color: var(--aios-amber); }
-        .aios-kpi-value.danger { color: var(--aios-red); }
-        .aios-kpi-detail {
-            color: var(--aios-subtle);
-            font-size: 0.64rem;
-            line-height: 1.35;
-            min-height: 1.72rem;
-        }
-        .aios-panel-title {
-            color: var(--aios-text);
-            font-size: 0.88rem !important;
-            font-weight: 680 !important;
-            margin: 0 !important;
-            letter-spacing: -0.01em;
-        }
-        .aios-panel-kicker { color: var(--aios-subtle); font-size: 0.68rem; margin-top: 0.08rem; }
-        .aios-account-value {
-            color: var(--aios-text);
-            font-size: 1.78rem;
-            line-height: 1.1;
-            font-weight: 720;
-            font-variant-numeric: tabular-nums;
-            margin: 0.4rem 0 0.15rem;
-        }
-        .aios-account-label { color: var(--aios-subtle); font-size: 0.68rem; }
-        .aios-divider { height: 1px; background: var(--aios-line); margin: 0.72rem 0; }
-        .aios-next-action {
-            margin-top: 0.72rem;
-            padding: 0.62rem 0.68rem;
-            border-radius: 7px;
-            border: 1px solid rgba(96, 165, 250, 0.22);
-            background: rgba(96, 165, 250, 0.07);
-            color: #B9D7FA;
-            font-size: 0.7rem;
-            line-height: 1.45;
-        }
-        .aios-next-action strong { color: #D9EAFE; }
-        .aios-key-row {
-            display: flex;
-            justify-content: space-between;
-            gap: 0.75rem;
-            padding: 0.29rem 0;
-            color: var(--aios-muted);
-            font-size: 0.7rem;
-        }
-        .aios-key-row strong { color: var(--aios-text); font-variant-numeric: tabular-nums; }
-        .aios-source-list { display: grid; gap: 0.42rem; }
-        .aios-source-item {
-            display: grid;
-            grid-template-columns: minmax(0, 1fr) auto;
-            align-items: center;
-            gap: 0.75rem;
-            padding-bottom: 0.42rem;
-            border-bottom: 1px solid rgba(32, 54, 79, 0.72);
-            color: var(--aios-muted);
-            font-size: 0.7rem;
-        }
-        .aios-source-item:last-child { border-bottom: 0; padding-bottom: 0; }
-        .aios-source-item strong { color: #C6D5E5; font-variant-numeric: tabular-nums; }
-        .aios-footnote { color: var(--aios-subtle); font-size: 0.64rem; line-height: 1.45; }
-        [data-testid="stTabs"] button { min-height: 42px; }
-        [data-testid="stTabs"] button[aria-selected="true"] { color: var(--aios-teal); }
-        [data-testid="stSelectbox"] > div > div,
-        [data-testid="stDateInput"] > div > div { background: var(--aios-surface); }
-        code {
-            overflow-wrap: anywhere;
-            color: #9FE8DB;
-            background: #0A1726;
-        }
-        @media (max-width: 1280px) {
-            .aios-kpi-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-            [data-testid="stHorizontalBlock"] { flex-wrap: wrap; }
-            [data-testid="stColumn"] {
-                flex: 1 1 320px !important;
-                width: 100% !important;
-                min-width: 0 !important;
-            }
-        }
-        @media (max-width: 900px) {
-            .block-container { padding: 1rem 0.9rem 2.5rem; }
-            h1 { font-size: 1.45rem !important; }
-            .aios-title-row { align-items: flex-start; flex-direction: column; }
-            .aios-chip-row { justify-content: flex-start; }
-            .aios-header-note { margin-top: 0.3rem; }
-            .aios-status-strip { align-items: flex-start; flex-direction: column; gap: 0.3rem; }
-            .aios-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-            [data-testid="stMetric"] { min-height: 84px; }
-        }
-        @media (max-width: 520px) {
-            .aios-kpi-grid { grid-template-columns: 1fr; }
-        }
-        @media (prefers-reduced-motion: reduce) {
-            *, *::before, *::after {
-                scroll-behavior: auto !important;
-                animation-duration: 0.01ms !important;
-                animation-iteration-count: 1 !important;
-            }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-_apply_visual_system()
+apply_design_system()
+st.markdown(
+    '<a class="aios-skip-link" href="#aios-main">Skip to main content</a>',
+    unsafe_allow_html=True,
+)
 # Older dashboard versions held one process-wide writable DuckDB connection.
 # Release it once after a hot reload; every loader below now uses a bounded,
 # read-only scope so scheduled writers can run while the dashboard stays open.
 close_global_store()
+_COMPOSITE_BUILD_LOCK = Lock()
 
 
 # ----------------------------------------------------------------------
 # Cached data loaders
 # ----------------------------------------------------------------------
-@st.cache_data(ttl=300)
-def load_composite(as_of: str) -> pd.DataFrame:
-    with store_scope(read_only=True) as store:
+@st.cache_data(
+    ttl=300,
+    show_spinner="Building reviewed stock scores from verified filings and prices…",
+)
+def load_composite(as_of: str, include_market_factors: bool) -> pd.DataFrame:
+    # Batch reads trade a bounded working set for a much shorter cold load.
+    # Serialize cache misses so two local sessions cannot double that memory
+    # footprint with competing cold DuckDB scans.
+    with _COMPOSITE_BUILD_LOCK, store_scope(read_only=True) as store:
         tickers = [row["ticker"] for row in store.universe_membership_on("sp500", as_of)]
-        rows = compute_composite(tickers, as_of, store, include_market_factors=True)
+        factor_store = DecisionScopedFactorStore(store, tickers)
+        rows = compute_composite(
+            tickers,
+            as_of,
+            factor_store,
+            include_market_factors=include_market_factors,
+        )
         labels = {
             str(row["ticker"]): row.get("canonical_name")
             for row in store.universe_identity_labels("sp500", as_of)
@@ -500,51 +222,69 @@ def load_us_readiness() -> dict:
 
 @st.cache_data(ttl=60)
 def load_paper_monitor() -> dict:
-    """Load checksum-validated local simulation state and its newest proposal."""
-    account_path = settings.project_root / DEFAULT_ACCOUNT_RELATIVE_PATH
-    if not account_path.exists():
-        return {"exists": False, "account_path": str(account_path), "proposal": None}
+    """Load the checksum-validated account and active registered proposal."""
     with store_scope(read_only=True) as store:
-        summary = paper_account_summary(account_path, store)
-    proposals_dir = settings.project_root / "data" / "paper" / "proposals"
-    proposal_paths = sorted(proposals_dir.glob("us-qv-*.json"), reverse=True)
-    proposal = None
-    proposal_path = None
-    if proposal_paths:
-        proposal_document = read_paper_document(
-            proposal_paths[0], expected_kind=PROPOSAL_DOCUMENT_KIND
+        monitor = load_paper_monitor_evidence(
+            settings.project_root,
+            store,
         )
-        proposal = proposal_document.payload
-        proposal_path = str(proposal_document.path)
-        account_document = read_paper_document(account_path, expected_kind=ACCOUNT_DOCUMENT_KIND)
-        executed_ids = {row.get("proposal_id") for row in account_document.payload["executions"]}
-        proposal["already_simulated"] = proposal.get("proposal_id") in executed_ids
-    forward = None
-    forward_path = settings.project_root / DEFAULT_FORWARD_RELATIVE_PATH
-    if forward_path.exists():
-        try:
-            status = assess_forward_trial(settings.project_root, forward_path, account_path)
-            forward = {
-                "ready": status.ready,
-                "trial_id": status.trial_id,
-                "registered_proposals": status.registered_proposals,
-                "issues": list(status.issues),
-            }
-        except (OSError, ValueError) as exc:
-            forward = {
-                "ready": False,
-                "trial_id": "unavailable",
-                "registered_proposals": 0,
-                "issues": [str(exc)],
-            }
-    return {
-        "exists": True,
-        "account_path": str(account_path),
-        "summary": summary,
-        "proposal": proposal,
-        "proposal_path": proposal_path,
-        "forward": forward,
+    # Dashboard internals pass these values to file-backed stress-review calls.
+    # Keep their established absolute-path contract while the shared operator
+    # adapter exposes project-relative labels to the CLI.
+    for key in ("account_path", "proposal_path", "trial_path"):
+        value = monitor.get(key)
+        if value:
+            path = Path(str(value))
+            monitor[key] = str(
+                path.resolve()
+                if path.is_absolute()
+                else (settings.project_root / path).resolve()
+            )
+    return monitor
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_proposal_stress_review(
+    *,
+    account_path: str,
+    account_payload_sha256: str,
+    proposal_path: str,
+    proposal_payload_sha256: str,
+    trial_path: str,
+    trial_payload_sha256: str,
+    scenario_bundle_sha256: str,
+    source_bundle_sha256: str,
+) -> dict:
+    """Load one governed stress report keyed by every immutable input identity."""
+    governed = review_registered_paper_proposal_stress(
+        settings.project_root,
+        Path(trial_path),
+        Path(account_path),
+        Path(proposal_path),
+    )
+    report = governed.report
+    payload = report.payload
+    source = payload.get("source", {})
+    governance = source.get("forward_governance", {})
+    scenario_bundle = payload.get("scenario_bundle", {})
+    source_code = payload.get("source_code", {})
+    observed = {
+        "account": source.get("account_payload_sha256"),
+        "proposal": source.get("proposal_payload_sha256"),
+        "trial": governance.get("trial_payload_sha256"),
+        "scenario_bundle": scenario_bundle.get("bundle_sha256"),
+        "source_bundle": source_code.get("source_bundle_sha256"),
     }
+    expected = {
+        "account": account_payload_sha256,
+        "proposal": proposal_payload_sha256,
+        "trial": trial_payload_sha256,
+        "scenario_bundle": scenario_bundle_sha256,
+        "source_bundle": source_bundle_sha256,
+    }
+    if observed != expected:
+        raise ValueError("stress review inputs changed while the dashboard cache was loading")
+    return report.envelope()
 
 
 @st.cache_data(ttl=300)
@@ -558,6 +298,15 @@ def load_identity_labels(as_of: str) -> dict[str, str | None]:
 
 
 @st.cache_data(ttl=60)
+def load_operating_summary() -> dict:
+    """Load only the operating evidence needed by the decision-first home page."""
+    path = settings.operations_db_path
+    if not path.is_absolute():
+        path = settings.project_root / path
+    return load_operations_evidence_read_only(path)
+
+
+@st.cache_data(ttl=60)
 def load_system_operations() -> dict:
     """Collect bounded, read-only operating evidence for the control workspace."""
     with store_scope(read_only=True) as store:
@@ -568,23 +317,47 @@ def load_system_operations() -> dict:
     try:
         state["scheduler"] = user_scheduler_status()
         state["scheduler_error"] = None
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
         state["scheduler"] = {}
         state["scheduler_error"] = str(exc)
     state["linger_enabled"] = user_linger_status()
+    try:
+        state["email_scheduler"] = email_scheduler_status()
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
+        state["email_scheduler"] = {
+            "enabled": False,
+            "active": False,
+            "runtime_verified": False,
+        }
 
     state["backup"] = load_latest_backup()
-    try:
-        incident_store = get_alert_store()
-        incidents = incident_store.list(limit=100)
-        state["incidents"] = [incident.__dict__ for incident in incidents]
-        daily_cycle = incident_store.latest_job(DAILY_JOB_NAME)
-        state["daily_cycle"] = daily_cycle.__dict__ if daily_cycle is not None else None
-        state["incident_error"] = None
-    except (OSError, RuntimeError, ValueError) as exc:
-        state["incidents"] = []
-        state["daily_cycle"] = None
-        state["incident_error"] = str(exc)
+    operations_path = settings.operations_db_path
+    if not operations_path.is_absolute():
+        operations_path = settings.project_root / operations_path
+    operations = load_operations_evidence_read_only(operations_path)
+    state["incidents"] = operations["incidents"]
+    state["incident_summary"] = operations["incident_summary"]
+    state["daily_cycle"] = operations["daily_cycle"]
+    state["incident_error"] = operations["error"]
+    state["notification_summary"] = operations["notification_summary"]
+    state["notifications"] = operations["notifications"]
+    state["notification_route"] = operations["notification_route"]
+    state["notification_error"] = operations["error"]
+    if operations["error"] is None:
+        route = operations["notification_route"]
+        try:
+            email_config = smtp_email_config()
+            state["email_config_complete"] = True
+            state["email_config_matches"] = notification_route_matches(
+                route,
+                email_config.fingerprint,
+            )
+        except ValueError:
+            state["email_config_complete"] = False
+            state["email_config_matches"] = False
+    else:
+        state["email_config_complete"] = False
+        state["email_config_matches"] = False
     return state
 
 
@@ -693,79 +466,411 @@ def _page_header(
     *,
     chips: list[tuple[str, str]] | None = None,
 ) -> None:
-    chip_html = "".join(
-        f'<span class="aios-chip {escape(tone)}">{escape(label)}</span>'
-        for label, tone in (chips or [])
-    )
-    st.markdown(
-        f"""
-        <div class="aios-title-row">
-          <div>
-            <div class="aios-eyebrow">{escape(eyebrow)}</div>
-            <h1>{escape(title)}</h1>
-          </div>
-          <div class="aios-chip-row">{chip_html}</div>
-        </div>
-        <div class="aios-header-note">{escape(note)}</div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def _kpi_card(label: str, value: str, detail: str, tone: str = "") -> str:
-    return (
-        '<div class="aios-kpi-card">'
-        f'<div class="aios-kpi-label">{escape(label)}</div>'
-        f'<div class="aios-kpi-value {escape(tone)}">{escape(value)}</div>'
-        f'<div class="aios-kpi-detail">{escape(detail)}</div>'
-        "</div>"
+    """Compatibility wrapper around the shared page-header component."""
+    page_header(
+        eyebrow,
+        title,
+        note,
+        metadata=chips or (),
     )
 
 
 def _render_kpi_grid(cards: list[tuple[str, str, str, str]]) -> None:
+    """Compatibility wrapper for the shared, border-light metric strip."""
+    render_metric_strip(cards)
+
+
+def _render_paper_workflow(model: PaperViewModel) -> None:
+    """Render one governance answer followed by the fixed prospective workflow."""
+    tone = model.status.tone if model.status.tone in {"success", "warning", "danger"} else ""
+    role = "alert" if tone == "danger" else "status"
     st.markdown(
-        '<div class="aios-kpi-grid">'
-        + "".join(_kpi_card(label, value, detail, tone) for label, value, detail, tone in cards)
-        + "</div>",
+        f'<section class="aios-paper-state {escape(tone)}" role="{role}">'
+        '<div class="aios-paper-state-label">Current governance state</div>'
+        f'<div class="aios-paper-state-value">{escape(model.status.value)}</div>'
+        f'<div class="aios-paper-state-detail">{escape(model.status.detail)}</div>'
+        "</section>",
         unsafe_allow_html=True,
     )
+    render_pipeline_stepper(model.stages)
+
+
+def _render_stress_review(
+    model: StressReviewViewModel,
+    *,
+    report: dict | None,
+    proposal_path: str | None,
+    review_error: str | None = None,
+) -> None:
+    """Render one compact advisory panel without adding a workflow stage or CTA."""
+    with st.container(border=True, key="proposal_stress_review"):
+        section_header(
+            "Proposal downside review",
+            "Deterministic mark shocks and a separate statistical sensitivity proxy.",
+        )
+        if model.status.tone == "danger":
+            st.error(f"{model.status.value}. {model.status.detail}")
+        elif model.status.tone == "warning":
+            st.warning(f"{model.status.value}. {model.status.detail}")
+        else:
+            st.info(f"{model.status.value}. {model.status.detail}")
+        st.caption(model.advisory)
+
+        if model.state not in {"complete", "partial"}:
+            if model.blockers:
+                st.markdown(
+                    "\n".join(
+                        f"- {blocker.replace('_', ' ')}"
+                        for blocker in model.blockers
+                    )
+                )
+            if review_error:
+                with st.expander("Technical error details"):
+                    st.code(review_error)
+            return
+
+        largest_loss = (
+            f"${model.largest_fixed_loss:,.0f}"
+            if model.largest_fixed_loss is not None
+            else "Unavailable"
+        )
+        largest_loss_pct = (
+            f"{model.largest_fixed_loss_pct:.1%} of starting equity"
+            if model.largest_fixed_loss_pct is not None
+            else "No calculated fixed mark"
+        )
+        drawdown = (
+            f"{model.largest_fixed_drawdown:.1%}"
+            if model.largest_fixed_drawdown is not None
+            else "Unavailable"
+        )
+        _render_kpi_grid(
+            [
+                (
+                    "Largest deterministic loss",
+                    largest_loss,
+                    largest_loss_pct,
+                    "warning",
+                ),
+                (
+                    "Resulting drawdown",
+                    drawdown,
+                    model.largest_fixed_scenario_id or "No calculated fixed mark",
+                    "warning",
+                ),
+                (
+                    "Scenario coverage",
+                    f"{model.calculated_count} / {model.generated_count}",
+                    f"{model.withheld_count} result(s) withheld",
+                    "",
+                ),
+                (
+                    "Reference findings",
+                    str(len(model.reference_findings)),
+                    "Advisory comparisons; never approval gates.",
+                    "",
+                ),
+            ]
+        )
+
+        if model.fixed_marks:
+            st.markdown("#### Deterministic mark shocks")
+            fixed_table = pd.DataFrame(
+                [
+                    {
+                        "Scenario": row.label,
+                        "State": (
+                            "Calculated"
+                            if row.status == "calculated"
+                            else "Withheld"
+                        ),
+                        "Loss": (
+                            f"${row.loss:,.0f}" if row.loss is not None else "Withheld"
+                        ),
+                        "Loss / equity": (
+                            f"{row.loss_pct:.1%}"
+                            if row.loss_pct is not None
+                            else "Withheld"
+                        ),
+                        "Resulting drawdown": (
+                            f"{row.drawdown:.1%}"
+                            if row.drawdown is not None
+                            else "Withheld"
+                        ),
+                    }
+                    for row in model.fixed_marks
+                ]
+            )
+            st.dataframe(fixed_table, hide_index=True, width="stretch")
+
+        if model.statistical_proxies:
+            st.markdown("#### Statistical sensitivity — not a mark shock")
+            proxy_table = pd.DataFrame(
+                [
+                    {
+                        "Scenario": row.label,
+                        "State": (
+                            "Calculated"
+                            if row.status == "calculated"
+                            else "Withheld"
+                        ),
+                        "Loss proxy": (
+                            f"${row.loss:,.0f}" if row.loss is not None else "Withheld"
+                        ),
+                        "Loss proxy / equity": (
+                            f"{row.loss_pct:.1%}"
+                            if row.loss_pct is not None
+                            else "Withheld"
+                        ),
+                    }
+                    for row in model.statistical_proxies
+                ]
+            )
+            st.dataframe(proxy_table, hide_index=True, width="stretch")
+            st.caption(
+                "This volatility/correlation result allocates statistical risk. It does "
+                "not create stressed holdings, fills, liquidation paths, or a forecast."
+            )
+
+        if model.top_position_contributions or model.top_sector_contributions:
+            position_column, sector_column = st.columns(2, gap="large")
+            with position_column:
+                st.markdown("#### Largest position contributions")
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Target": row.label,
+                                "Business group": row.sector or "Unclassified",
+                                "Loss": f"${row.loss:,.0f}",
+                                "Loss / equity": (
+                                    f"{row.loss_pct_of_starting_equity:.1%}"
+                                ),
+                            }
+                            for row in model.top_position_contributions
+                        ]
+                    ),
+                    hide_index=True,
+                    width="stretch",
+                )
+            with sector_column:
+                st.markdown("#### Largest business-group contributions")
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Business group": row.label,
+                                "Loss": f"${row.loss:,.0f}",
+                                "Loss / equity": (
+                                    f"{row.loss_pct_of_starting_equity:.1%}"
+                                ),
+                            }
+                            for row in model.top_sector_contributions
+                        ]
+                    ),
+                    hide_index=True,
+                    width="stretch",
+                )
+
+        if model.reference_findings:
+            st.markdown("#### Hypothetical reference-limit findings")
+            for finding in model.reference_findings[:6]:
+                st.markdown(f"- {finding.message}")
+            if len(model.reference_findings) > 6:
+                st.caption(
+                    f"{len(model.reference_findings) - 6} additional scenario finding(s) "
+                    "remain in the canonical report."
+                )
+
+        if model.blockers:
+            st.warning(
+                "Some dependent calculations were withheld because required evidence "
+                "failed closed."
+            )
+            st.markdown(
+                "\n".join(
+                    f"- {blocker.replace('_', ' ')}"
+                    for blocker in model.blockers
+                )
+            )
+
+        if report is not None or review_error:
+            payload = report.get("payload", report) if report is not None else {}
+            with st.expander("Technical evidence and reproducible command"):
+                if proposal_path:
+                    st.code(
+                        f"aios stress-review --proposal {proposal_path}",
+                        language="bash",
+                    )
+                if report is not None:
+                    st.json(
+                        {
+                            "report_id": payload.get("report_id"),
+                            "report_payload_sha256": report.get("payload_sha256"),
+                            "scenario_bundle": payload.get("scenario_bundle"),
+                            "source_bundle_sha256": payload.get("source_code", {}).get(
+                                "source_bundle_sha256"
+                            ),
+                            "target_evidence_sha256": payload.get("evidence", {}).get(
+                                "target_evidence_sha256"
+                            ),
+                        },
+                        expanded=False,
+                    )
+                if review_error:
+                    st.code(review_error)
+
+
+def _render_next_action(action: NextAction) -> None:
+    render_action_notice(
+        label="Priority action",
+        title=action.title,
+        detail=action.detail,
+        cta_label=action.cta_label,
+        on_click=_go_to_workspace,
+        on_click_args=(action.destination,),
+        tone=action.tone,
+        technical_command=action.command,
+        key="next_action",
+    )
+
+
+def _research_surface_selector() -> str:
+    """Render one URL-bound research surface switch."""
+    options = tuple(_RESEARCH_SURFACES_BY_SLUG)
+    raw_surface = _query_value("surface")
+    default_surface = raw_surface if raw_surface in _RESEARCH_SURFACES_BY_SLUG else "ranked"
+    _hydrate_widget_from_url("surface", default_surface)
+    help_text = (
+        "Start with the ranked list. Use the map to compare quality and value, "
+        "or Data Coverage to inspect withheld scores."
+    )
+    selected = st.segmented_control(
+        "Research view",
+        options,
+        default=None,
+        format_func=_RESEARCH_SURFACES_BY_SLUG.__getitem__,
+        key="surface",
+        width="stretch",
+        help=help_text,
+    )
+    surface_slug = str(selected or "ranked")
+    _persist_widget_query("surface", surface_slug)
+    return _RESEARCH_SURFACES_BY_SLUG[surface_slug]
+
+
+def _research_context_controls(
+    certified_from: str,
+    certified_through: str,
+    *,
+    include_search: bool = True,
+    compact: bool = False,
+) -> tuple[str, str, str]:
+    """Render URL-backed research scope controls in the page where they apply."""
+
+    minimum_date = date.fromisoformat(certified_from)
+    maximum_date = date.fromisoformat(certified_through)
+    try:
+        query_date = date.fromisoformat(_query_value("date"))
+    except ValueError:
+        query_date = maximum_date
+    if not minimum_date <= query_date <= maximum_date:
+        query_date = maximum_date
+    _hydrate_widget_from_url("date", query_date)
+
+    raw_model = _query_value("model")
+    default_model_slug = raw_model if raw_model in _MODELS_BY_SLUG else "qv"
+    _hydrate_widget_from_url("model", default_model_slug)
+    raw_search = _query_value("q").strip()
+    _hydrate_widget_from_url("q", raw_search)
+
+    toolbar_key = "company_toolbar" if compact else "research_toolbar"
+    with st.container(key=toolbar_key):
+        toolbar_help = (
+            "" if compact else "<span>Change the evidence date or comparison method.</span>"
+        )
+        st.markdown(
+            '<div class="aios-command-heading">'
+            f"<strong>{'Evidence scope' if compact else 'Research scope'}</strong>"
+            f"{toolbar_help}"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        column_widths = [1, 2.1, 1.45] if include_search else [1, 2.1]
+        control_columns = st.columns(column_widths, vertical_alignment="bottom")
+        date_col, model_col = control_columns[:2]
+        with date_col:
+            selected_date = st.date_input(
+                "Research date",
+                value=None,
+                min_value=minimum_date,
+                max_value=maximum_date,
+                key="date",
+                format="YYYY-MM-DD",
+                help="Scores use only information that was publicly available by this date.",
+            )
+        with model_col:
+            selected_model = st.segmented_control(
+                "Scoring model",
+                tuple(_MODELS_BY_SLUG),
+                default=None,
+                format_func=_MODEL_CONTROL_LABELS.__getitem__,
+                key="model",
+                width="stretch",
+                help=(
+                    "Quality + Value is the reviewed baseline. The experimental method "
+                    "also considers price trend and stability."
+                ),
+            )
+        if include_search:
+            with control_columns[2]:
+                search_value = st.text_input(
+                    "Find a company",
+                    key="q",
+                    placeholder="Name or symbol",
+                    help="Filter the current reviewed universe by company name or symbol.",
+                )
+        else:
+            search_value = raw_search
+        if not compact:
+            st.markdown(
+                '<div class="aios-command-footnote">'
+                f"Reviewed range: {escape(display_date(certified_from))}–"
+                f"{escape(display_date(certified_through))}"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+    as_of_value = (selected_date or maximum_date).isoformat()
+    model_slug = str(selected_model or "qv")
+    _persist_widget_query("date", as_of_value)
+    _persist_widget_query("model", model_slug)
+    normalized_search = str(search_value or "").strip()
+    _persist_widget_query("q", normalized_search)
+    return as_of_value, _MODELS_BY_SLUG[model_slug], normalized_search
 
 
 def _source_list(rows: list[tuple[str, str]]) -> str:
-    items = "".join(
-        '<div class="aios-source-item">'
-        f"<span>{escape(label)}</span><strong>{escape(value)}</strong>"
-        "</div>"
-        for label, value in rows
-    )
-    return f'<div class="aios-source-list">{items}</div>'
-
-
-def _key_row(label: str, value: object) -> str:
-    return (
-        '<div class="aios-key-row">'
-        f"<span>{escape(label)}</span><strong>{escape(str(value))}</strong>"
-        "</div>"
-    )
+    return evidence_list(rows)
 
 
 def _style_figure(figure, *, height: int, show_legend: bool = True) -> None:
-    """Apply one accessible dark chart treatment across the dashboard."""
+    """Apply one accessible institutional chart treatment across the dashboard."""
     figure.update_layout(
         height=height,
         paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="#0E1C2D",
-        font=dict(color="#B9C8D8", size=11),
-        hoverlabel=dict(bgcolor="#172C45", font_color="#F2F7FC", bordercolor="#2B4766"),
+        plot_bgcolor="#FFFFFF",
+        font=dict(color="#3D3D3A", size=14),
+        hoverlabel=dict(bgcolor="#FFFFFF", font_color="#141413", bordercolor="#B9B5AA"),
         legend=dict(
             bgcolor="rgba(0,0,0,0)",
-            font=dict(color="#AFC0D2"),
-            title_font=dict(color="#91A4BA"),
+            font=dict(color="#3D3D3A", size=14),
+            title_font=dict(color="#3D3D3A", size=14),
         ),
         showlegend=show_legend,
     )
-    figure.update_xaxes(gridcolor="#20364F", zerolinecolor="#2B4766", linecolor="#2B4766")
-    figure.update_yaxes(gridcolor="#20364F", zerolinecolor="#2B4766", linecolor="#2B4766")
+    figure.update_xaxes(gridcolor="#ECEAE2", zerolinecolor="#D9D6CC", linecolor="#D9D6CC")
+    figure.update_yaxes(gridcolor="#ECEAE2", zerolinecolor="#D9D6CC", linecolor="#D9D6CC")
 
 
 def _render_coverage_chart(report: dict) -> None:
@@ -803,362 +908,236 @@ def _render_coverage_chart(report: dict) -> None:
         orientation="h",
         text="Observed",
         color="Status",
-        color_discrete_map={"Pass": "#2DD4BF", "Warn": "#FBBF24", "Fail": "#FB7185"},
+        color_discrete_map={"Pass": "#437426", "Warn": "#805C1F", "Fail": "#A73D39"},
         hover_data={"Coverage %": ":.1f", "Observed": True, "Status": True},
     )
-    figure.add_vline(x=95, line_dash="dot", line_color="#6F849B")
+    figure.add_vline(x=95, line_dash="dot", line_color="#73726C")
     figure.update_traces(textposition="inside")
     figure.update_layout(
-        xaxis=dict(range=[0, 101], title="Reviewed coverage (%)"),
+        xaxis=dict(range=[0, 105], title="Reviewed coverage (%)"),
         yaxis=dict(title=None, autorange="reversed"),
         legend_title_text="Gate",
-        margin=dict(l=15, r=15, t=15, b=30),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=15, r=34, t=15, b=30),
     )
-    _style_figure(figure, height=292)
+    _style_figure(
+        figure,
+        height=292,
+        show_legend=coverage["Status"].nunique() > 1,
+    )
     st.plotly_chart(figure, width="stretch")
 
 
 def _render_overview(report: dict) -> None:
-    """Render the default operating cockpit from governed readiness evidence."""
+    """Render the decision-first command center with essential evidence visible."""
     checks = _checks_by_key(report)
-    decision = checks.get("decision_date", {})
     universe = checks.get("universe_membership", {})
     fundamentals = checks.get("fundamental_coverage", {})
     prices = checks.get("reviewed_price_freshness", {})
     macro = checks.get("macro_pit_readiness", {})
     integrity = checks.get("data_integrity", {})
-    filing_coverage = str(fundamentals.get("observed", "Not available")).split(" (")[0]
-    price_coverage = str(prices.get("observed", "Not available")).split(" (")[0]
-    reviewed_date = display_date(report["certified_research_through"])
-    macro_label = str(macro.get("observed") or "Unknown").replace("_", " ").title()
-    _, freshness_detail = us_eod_freshness_message(
-        report["raw_prices_through"]
-    )
-    certification_current, certification_detail = us_certification_freshness_message(
-        report["certified_research_through"]
-    )
-
-    _page_header(
-        "U.S. reference market",
-        "Executive Research Dashboard",
-        "Decision readiness, proposal state, source evidence, and operating controls in one view.",
-        chips=[
-            (
-                f"Economic regime: {macro_label}",
-                "success" if macro.get("status") == "pass" else "warning",
-            ),
-            (f"Certified decision close: {reviewed_date}", ""),
-            (
-                "Latest U.S. session certified"
-                if certification_current
-                else "Daily certification pending",
-                "success" if certification_current else "warning",
-            ),
-            ("Simulation only", "warning"),
-        ],
-    )
-
-    if report["ready"]:
-        status_title = "Research gates passed"
-        status_detail = (
-            "Supervised research and local paper monitoring are available for the certified date."
-        )
-        status_class = ""
-    else:
-        failed = [row for row in report["checks"] if row["status"] == "fail"]
-        if any(row["check"] == "universe_membership" for row in failed):
-            dependent = {
-                "stable_security_identity",
-                "fundamental_coverage",
-                "price_history_coverage",
-                "reviewed_price_freshness",
-            }
-            failed = [row for row in failed if row["check"] not in dependent]
-        blockers = [row["label"] for row in failed]
-        status_title = "New paper decisions blocked"
-        status_detail = (
-            ", ".join(blockers)
-            + ". Historical research remains available inside the reviewed window."
-        )
-        status_class = "danger"
-
-    st.markdown(
-        f'<div class="aios-status-strip {status_class}">'
-        f'<span><strong>{escape(status_title)}</strong> — {escape(status_detail)}</span>'
-        f'<span>{escape(str(integrity.get("observed", "Integrity unavailable")))}</span>'
-        "</div>",
-        unsafe_allow_html=True,
-    )
-    if certification_current:
-        st.success(certification_detail)
-    else:
-        st.warning(certification_detail)
-
-    _render_kpi_grid(
-        [
-            (
-                "Universe Coverage",
-                str(universe.get("observed", "Not available")),
-                "Point-in-time S&P 500 members",
-                "",
-            ),
-            (
-                "Company Filings (PIT)",
-                filing_coverage,
-                "Filings public by the decision close",
-                "",
-            ),
-            (
-                "Current Prices",
-                price_coverage,
-                "Action-safe member prices",
-                "",
-            ),
-            (
-                "Latest Filing Evidence",
-                display_date(report["fundamentals_through"]),
-                "Raw SEC evidence through",
-                "",
-            ),
-            (
-                "Latest Macro Release",
-                display_date(report["macro_releases_through"]),
-                "Required release-dated inputs",
-                "",
-            ),
-            (
-                "Research Readiness",
-                "READY" if report["ready"] else "BLOCKED",
-                "Paper research gate",
-                "success" if report["ready"] else "danger",
-            ),
-        ]
+    certification_current, _ = us_certification_freshness_message(
+        report.get("certified_research_through")
     )
 
     try:
         monitor = load_paper_monitor()
     except Exception as exc:
-        st.error(
-            "The local simulation state could not be verified. No portfolio information was "
-            "used; inspect the technical detail before continuing."
-        )
-        with st.expander("Technical detail"):
-            st.code(str(exc))
-        monitor = {"exists": False, "proposal": None}
+        monitor = {
+            "exists": False,
+            "proposal": None,
+            "error": str(exc),
+        }
+    operations = load_operating_summary()
+    model = build_home_view_model(report, monitor, operations)
+    unresolved = [row for row in operations.get("incidents", []) if row.get("state") != "resolved"]
+    critical_count = sum(row.get("severity") == "critical" for row in unresolved)
+    proposal = monitor.get("proposal") if isinstance(monitor, dict) else None
+    targets = proposal.get("targets", []) if isinstance(proposal, dict) else []
 
-    identity_labels = load_identity_labels(report["certified_research_through"])
-    proposal = monitor.get("proposal")
-    allocation_col, proposal_col, account_col = st.columns([0.82, 1.28, 0.72], gap="medium")
+    _page_header(
+        "AIOS Home",
+        "Investment Command Center",
+        "Know what is safe, what needs attention, and the next permitted action.",
+        chips=[
+            (
+                f"Reviewed through {display_date(report.get('certified_research_through'))}",
+                "success" if report.get("ready") else "danger",
+            ),
+            (
+                "Latest session certified"
+                if certification_current
+                else "Daily certification pending",
+                "success" if certification_current else "warning",
+            ),
+            ("Simulation only · No broker", "warning"),
+        ],
+    )
+    _render_next_action(model.next_action)
+    _render_kpi_grid(
+        [
+            (
+                "Research",
+                model.research.value,
+                display_date(report.get("certified_research_through")),
+                model.research.tone,
+            ),
+            (
+                "Paper trial",
+                model.paper.value,
+                (
+                    f"${monitor['summary']['equity']:,.0f} simulated"
+                    if monitor.get("exists") and not monitor.get("error")
+                    else "Local state unavailable"
+                ),
+                model.paper.tone,
+            ),
+            (
+                "Operations",
+                model.operations.value,
+                f"{critical_count} critical · {len(unresolved)} unresolved",
+                model.operations.tone,
+            ),
+            (
+                "Evidence universe",
+                str(universe.get("observed", "Unavailable")),
+                "Point-in-time members reviewed",
+                "success" if report.get("ready") else "danger",
+            ),
+        ]
+    )
 
-    with allocation_col, st.container(border=True):
-        st.markdown(
-            '<h2 class="aios-panel-title">Proposed Research Basket</h2>'
-            '<div class="aios-panel-kicker">Target mix by broad business group</div>',
-            unsafe_allow_html=True,
-        )
-        targets = proposal.get("targets", []) if proposal else []
-        if targets:
-            allocation = pd.DataFrame(
-                [
-                    {"Business group": row["sector"], "Target weight": row["target_weight"]}
-                    for row in targets
-                ]
-            )
-            allocation = allocation.groupby("Business group", as_index=False)[
-                "Target weight"
-            ].sum()
-            allocation["Business group"] = allocation["Business group"].replace(
-                {
-                    "Finance, insurance and real estate": "Finance & real estate",
-                    "Transport, communications and utilities": "Transport & utilities",
-                    "Wholesale trade": "Wholesale",
-                    "Retail trade": "Retail",
-                }
-            )
-            allocation_figure = px.pie(
-                allocation,
-                names="Business group",
-                values="Target weight",
-                hole=0.68,
-                color_discrete_sequence=[
-                    "#2DD4BF",
-                    "#60A5FA",
-                    "#A78BFA",
-                    "#F59E0B",
-                    "#34D399",
-                    "#F472B6",
-                ],
-            )
-            allocation_figure.update_traces(
-                textinfo="percent",
-                textfont_size=10,
-                marker=dict(line=dict(color="#0E1C2D", width=2)),
-                hovertemplate="%{label}<br>Target: %{percent}<extra></extra>",
-            )
-            allocation_figure.add_annotation(
-                text=f"{len(targets)}<br>targets",
-                x=0.5,
-                y=0.5,
-                showarrow=False,
-                font=dict(color="#E6EDF7", size=14),
-            )
-            allocation_figure.update_layout(
-                margin=dict(l=4, r=4, t=4, b=4),
-                legend=dict(orientation="h", y=-0.06, x=0.5, xanchor="center"),
-            )
-            _style_figure(allocation_figure, height=270)
-            st.plotly_chart(allocation_figure, width="stretch")
-            st.markdown(
-                '<div class="aios-footnote">Proposal composition only—not current holdings '
-                "or a personal allocation.</div>",
-                unsafe_allow_html=True,
-            )
-        else:
-            st.info("No current proposal is available to chart.")
-
-    with proposal_col, st.container(border=True):
-        st.markdown(
-            '<h2 class="aios-panel-title">Current Research Proposal</h2>'
-            '<div class="aios-panel-kicker">Reviewed targets waiting for the '
-            "supervised workflow</div>",
-            unsafe_allow_html=True,
-        )
-        if proposal is None:
-            st.info("No proposal exists yet. Create one only after the operating gates pass.")
-        else:
-            already_simulated = bool(proposal.get("already_simulated"))
-            if already_simulated:
-                status_text = "Recorded in the paper simulation"
-            elif proposal["status"] == "approved_for_supervised_simulation":
-                status_text = "Approved; waiting for reviewed execution-date prices"
-            else:
-                status_text = str(proposal["status"]).replace("_", " ").title()
-            st.markdown(
-                f'<div class="aios-status-strip"><span><strong>{escape(status_text)}</strong>'
-                f'</span><span>{escape(display_date(proposal["decision_date"]))} → '
-                f'{escape(display_date(proposal["scheduled_simulation_date"]))}</span></div>',
-                unsafe_allow_html=True,
-            )
-            if proposal.get("targets"):
-                targets = pd.DataFrame(
-                    [
-                        {
-                            "Rank": row["factor_rank"],
-                            "Company": company_symbol_label(
-                                identity_labels.get(row["ticker"]), row["ticker"]
-                            ),
-                            "Target": f"{row['target_weight']:.1%}",
-                            "Score": round(row["qv_score"], 1),
-                        }
-                        for row in proposal["targets"]
-                    ]
+    with st.container(key="home_layout"):
+        evidence_col, paper_col = st.columns([1.15, 0.85], gap="large")
+        with evidence_col:
+            with st.container(border=True, key="home_evidence"):
+                section_header(
+                    "Research readiness",
+                    "The evidence currently permitted for screening and comparison.",
                 )
-                st.dataframe(targets, hide_index=True, width="stretch", height=280)
-            if not already_simulated:
                 st.markdown(
-                    '<div class="aios-footnote">Next control: verify the scheduled close, '
-                    "then explicitly record or reject the local simulation. No broker order "
-                    "can be created here.</div>",
+                    key_value_list(
+                        [
+                            (
+                                "Certified decision close",
+                                display_date(report.get("certified_research_through")),
+                            ),
+                            ("Point-in-time universe", universe.get("observed", "Unavailable")),
+                            ("Company filings", fundamentals.get("observed", "Unavailable")),
+                            ("Reviewed prices", prices.get("observed", "Unavailable")),
+                            (
+                                "Economic regime",
+                                str(macro.get("observed") or "Unknown").replace("_", " ").title(),
+                            ),
+                            ("Database integrity", integrity.get("observed", "Unavailable")),
+                        ]
+                    ),
                     unsafe_allow_html=True,
                 )
+                st.caption(
+                    "Raw provider dates never advance the certified decision close by themselves."
+                )
 
-    with account_col, st.container(border=True):
-        st.markdown(
-            '<h2 class="aios-panel-title">Paper Account & Policy</h2>'
-            '<div class="aios-panel-kicker">Checksum-protected local simulation</div>',
-            unsafe_allow_html=True,
-        )
-        if not monitor.get("exists"):
-            st.info("No verified local paper account is available.")
-        else:
-            summary = monitor["summary"]
-            forward = monitor.get("forward")
-            account_html = (
-                '<div class="aios-account-label">Simulated account value</div>'
-                f'<div class="aios-account-value">${summary["equity"]:,.2f}</div>'
-                + _key_row("Cash", f'${summary["cash"]:,.2f}')
-                + _key_row("Holdings", len(summary["holdings"]))
-                + _key_row("Drawdown", f'{summary["drawdown"]:.2%}')
-                + _key_row("Recorded rebalances", summary["execution_count"])
-                + '<div class="aios-divider"></div>'
-            )
-            if forward and forward["ready"]:
-                policy_text = "Forward policy unchanged"
-                policy_tone = "success"
-            elif forward:
-                policy_text = "Policy drift requires review"
-                policy_tone = "danger"
-            else:
-                policy_text = "Forward policy unavailable"
-                policy_tone = "warning"
-            account_html += (
-                f'<span class="aios-chip {policy_tone}">{escape(policy_text)}</span>'
-                '<div class="aios-next-action"><strong>Current position:</strong> Entirely '
-                "simulated cash until the scheduled close is reviewed and explicitly recorded."
-                "</div>"
-            )
-            st.markdown(account_html, unsafe_allow_html=True)
+            with st.container(border=True, key="home_targets"):
+                section_header(
+                    "Current proposal targets",
+                    "The first five research targets in the local simulation proposal.",
+                )
+                if not targets:
+                    st.info("No reviewed paper-trial proposal is available.")
+                else:
+                    identity_labels = load_identity_labels(report["certified_research_through"])
+                    target_table = pd.DataFrame(
+                        [
+                            {
+                                "Rank": row["factor_rank"],
+                                "Company": company_symbol_label(
+                                    identity_labels.get(row["ticker"]), row["ticker"]
+                                ),
+                                "Score": round(row["qv_score"], 1),
+                                "Target": f"{row['target_weight']:.1%}",
+                                "Business group": row["sector"],
+                            }
+                            for row in targets[:5]
+                        ]
+                    )
+                    st.dataframe(
+                        target_table,
+                        hide_index=True,
+                        width="stretch",
+                        height=270,
+                        row_height=44,
+                        column_config={
+                            "Rank": st.column_config.NumberColumn(width="small", format="%d"),
+                            "Company": st.column_config.TextColumn(width="large"),
+                            "Score": st.column_config.NumberColumn(width="small", format="%.1f"),
+                            "Target": st.column_config.TextColumn(width="small"),
+                        },
+                    )
+                    st.caption(
+                        f"Showing 5 of {len(targets)} simulation-only targets. "
+                        "These are not holdings or personal recommendations."
+                    )
 
-    coverage_col, evidence_col = st.columns([1.34, 0.66], gap="medium")
-    with coverage_col, st.container(border=True):
-        st.markdown(
-            '<h2 class="aios-panel-title">Coverage by Operating Gate</h2>'
-            '<div class="aios-panel-kicker">Exact reviewed counts against '
-            "fail-closed requirements</div>",
-            unsafe_allow_html=True,
-        )
-        _render_coverage_chart(report)
+        with paper_col:
+            with st.container(border=True, key="home_paper"):
+                section_header(
+                    "Paper-trial progress",
+                    "Prospective, checksum-protected simulation only.",
+                )
+                if monitor.get("error"):
+                    st.error("The local paper state could not be verified.")
+                elif not monitor.get("exists"):
+                    st.info("No verified local paper account is available.")
+                else:
+                    paper_model = build_paper_view_model(monitor)
+                    render_pipeline_stepper(paper_model.stages)
+                    summary = monitor["summary"]
+                    st.markdown(
+                        key_value_list(
+                            [
+                                ("Current stage", paper_model.status.value),
+                                ("Simulated cash", f"${summary['cash']:,.2f}"),
+                                ("Holdings", len(summary["holdings"])),
+                            ]
+                        ),
+                        unsafe_allow_html=True,
+                    )
 
-    with evidence_col, st.container(border=True):
-        st.markdown(
-            '<h2 class="aios-panel-title">Evidence Clock</h2>'
-            '<div class="aios-panel-kicker">Raw freshness never overrides certification</div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            _source_list(
-                [
-                    ("Certified decision", reviewed_date),
-                    ("Market prices", display_date(report["raw_prices_through"])),
-                    ("Company filings", display_date(report["fundamentals_through"])),
-                    ("Economic releases", display_date(report["macro_releases_through"])),
-                ]
-            ),
-            unsafe_allow_html=True,
-        )
-        st.caption(freshness_detail)
-        st.markdown('<div class="aios-divider"></div>', unsafe_allow_html=True)
-        st.markdown(
-            _key_row("Decision evidence", decision.get("observed", "Unavailable"))
-            + _key_row("Database integrity", integrity.get("observed", "Unavailable"))
-            + '<div class="aios-next-action"><strong>Boundary:</strong> Research and local '
-            "simulation only. No broker connection or personal recommendation.</div>",
-            unsafe_allow_html=True,
-        )
-
-    with st.expander("All operating-gate details"):
-        gate_table = pd.DataFrame(
-            [
-                {
-                    "Control": row["label"],
-                    "Status": row["status"].title(),
-                    "Observed": row["observed"],
-                    "Required": row["required"],
-                }
-                for row in report["checks"]
-            ]
-        )
-        st.dataframe(gate_table, hide_index=True, width="stretch", height=388)
-
-    warning_checks = [row for row in report["checks"] if row["status"] == "warn"]
-    if warning_checks:
-        with st.expander(f"Known limitations ({len(warning_checks)})"):
-            for row in warning_checks:
-                st.markdown(f"**{row['label']} — {row['observed']}**")
-                st.write(row["detail"])
+            with st.container(border=True, key="home_incidents"):
+                section_header(
+                    "Open incidents",
+                    "Current exceptions from the independent operations ledger.",
+                )
+                if operations.get("error"):
+                    st.warning(
+                        "The operations ledger is unavailable; research evidence is unchanged."
+                    )
+                elif not unresolved:
+                    st.success("No unresolved operating incidents are recorded.")
+                else:
+                    for row in unresolved[:4]:
+                        severity = str(row.get("severity") or "unknown").title()
+                        title = str(row.get("title") or "Untitled operating incident")
+                        tone = "danger" if row.get("severity") == "critical" else "warning"
+                        st.markdown(
+                            f'<div class="aios-incident-row {tone}">'
+                            f"<span>{escape(severity)}</span>"
+                            f"<strong>{escape(title)}</strong>"
+                            "</div>",
+                            unsafe_allow_html=True,
+                        )
+                    if len(unresolved) > 4:
+                        st.caption(f"{len(unresolved) - 4} more incident(s) in Operations.")
 
 
-def _render_opportunity_map(df: pd.DataFrame, score_col: str, model_name: str) -> None:
+def _render_opportunity_map(
+    df: pd.DataFrame,
+    score_col: str,
+    model_name: str,
+    *,
+    show_market_factors: bool,
+) -> None:
     """Show the two core factor dimensions without labeling every security."""
     st.markdown("### Quality vs. Relative Value")
     st.caption(
@@ -1175,6 +1154,19 @@ def _render_opportunity_map(df: pd.DataFrame, score_col: str, model_name: str) -
     )
     label_tickers = set(plot_df.nlargest(12, score_col)["Ticker"])
     plot_df["Chart label"] = plot_df["Ticker"].where(plot_df["Ticker"].isin(label_tickers), "")
+    hover_data = {
+        "Chart label": False,
+        "P/E": True,
+        "EV/EBITDA": True,
+        "ROIC %": True,
+    }
+    if show_market_factors:
+        hover_data.update(
+            {
+                "12-1 Momentum %": True,
+                "Annualized Volatility %": True,
+            }
+        )
     figure = px.scatter(
         plot_df,
         x="Value",
@@ -1183,7 +1175,7 @@ def _render_opportunity_map(df: pd.DataFrame, score_col: str, model_name: str) -
         size="Market Cap ($B)",
         size_max=38,
         color=score_col,
-        color_continuous_scale=["#164E63", "#2DD4BF", "#60A5FA"],
+        color_continuous_scale=["#D6E4F6", "#7196C5", "#3266AD"],
         labels={
             "Value": "Relative value score",
             "Quality": "Business quality score",
@@ -1193,20 +1185,13 @@ def _render_opportunity_map(df: pd.DataFrame, score_col: str, model_name: str) -
             "Annualized Volatility %": "Past price volatility %",
         },
         hover_name="Company + Symbol",
-        hover_data={
-            "Chart label": False,
-            "P/E": True,
-            "EV/EBITDA": True,
-            "ROIC %": True,
-            "12-1 Momentum %": True,
-            "Annualized Volatility %": True,
-        },
+        hover_data=hover_data,
         range_x=[-5, 105],
         range_y=[-5, 105],
     )
     figure.update_traces(textposition="top center", textfont_size=10, marker_opacity=0.72)
-    figure.add_hline(y=50, line_dash="dot", line_color="#6F849B", opacity=0.7)
-    figure.add_vline(x=50, line_dash="dot", line_color="#6F849B", opacity=0.7)
+    figure.add_hline(y=50, line_dash="dot", line_color="#73726C", opacity=0.7)
+    figure.add_vline(x=50, line_dash="dot", line_color="#73726C", opacity=0.7)
     figure.update_layout(
         coloraxis_colorbar=dict(title="Research<br>score"),
         margin=dict(l=35, r=30, t=20, b=35),
@@ -1221,12 +1206,13 @@ def _render_ranked_universe(
     rank_col: str,
     grade_col: str,
     score_col: str,
+    show_market_factors: bool,
 ) -> None:
     """Render the lookup surface at one consistent universe grain."""
-    st.markdown("### Ranked Universe")
-    st.caption(
-        "Sort and scan the full reviewed universe. Missing scores remain visible and are "
-        "never filled with estimates."
+    section_header(
+        "Ranked universe",
+        "Sort the reviewed names and open company evidence directly. Missing scores "
+        "remain visible and are never filled with estimates.",
     )
     table_columns = [
         rank_col,
@@ -1236,15 +1222,20 @@ def _render_ranked_universe(
         score_col,
         "Quality",
         "Value",
-        "Momentum",
-        "Low Volatility",
-        "12-1 Momentum %",
-        "Annualized Volatility %",
-        "Missing data",
     ]
-    full_table = df.sort_values(
-        [score_col, "Ticker"], ascending=[False, True], na_position="last"
-    )[table_columns].rename(
+    if show_market_factors:
+        table_columns.extend(
+            [
+                "Momentum",
+                "Low Volatility",
+                "12-1 Momentum %",
+                "Annualized Volatility %",
+            ]
+        )
+    table_columns.append("Missing inputs")
+    full_table = df.sort_values([score_col, "Ticker"], ascending=[False, True], na_position="last")[
+        table_columns
+    ].rename(
         columns={
             rank_col: "Rank",
             "Company": "Company",
@@ -1257,13 +1248,63 @@ def _render_ranked_universe(
             "Low Volatility": "Stability",
             "12-1 Momentum %": "12–1M return %",
             "Annualized Volatility %": "Volatility %",
-            "Missing data": "Evidence gap",
+            "Missing inputs": "Evidence status",
         }
     )
-    st.dataframe(full_table, width="stretch", hide_index=True, height=600)
+    full_table["Evidence status"] = full_table["Evidence status"].apply(
+        lambda gaps: "Complete" if not gaps else f"{len(gaps)} gap{'s' if len(gaps) != 1 else ''}"
+    )
+    model_slug = _query_value("model")
+    if model_slug not in _MODELS_BY_SLUG:
+        model_slug = "qv"
+    full_table["Review"] = full_table["Symbol"].map(
+        lambda ticker: (
+            f"?view=company&date={_query_value('date')}&model={model_slug}&company={ticker}"
+        )
+    )
+    ordered_columns = [
+        "Rank",
+        "Company",
+        "Symbol",
+        "Overall",
+        "Quality",
+        "Value",
+        "Grade",
+    ]
+    if show_market_factors:
+        ordered_columns.extend(["Trend", "Stability", "12–1M return %", "Volatility %"])
+    ordered_columns.extend(["Evidence status", "Review"])
+    full_table = full_table[ordered_columns]
+    st.dataframe(
+        full_table,
+        key="ranked_universe",
+        width="stretch",
+        hide_index=True,
+        height=650,
+        row_height=46,
+        column_config={
+            "Rank": st.column_config.NumberColumn(width="small", format="%d"),
+            "Company": st.column_config.TextColumn(width="large"),
+            "Symbol": st.column_config.TextColumn(width="small"),
+            "Grade": st.column_config.TextColumn(width="small"),
+            "Overall": st.column_config.NumberColumn(width="small", format="%.1f"),
+            "Quality": st.column_config.NumberColumn(width="small", format="%.1f"),
+            "Value": st.column_config.NumberColumn(width="small", format="%.1f"),
+            "Trend": st.column_config.NumberColumn(width="small", format="%.1f"),
+            "Stability": st.column_config.NumberColumn(width="small", format="%.1f"),
+            "12–1M return %": st.column_config.NumberColumn(width="small", format="%.1f"),
+            "Volatility %": st.column_config.NumberColumn(width="small", format="%.1f"),
+            "Evidence status": st.column_config.TextColumn(width="medium"),
+            "Review": st.column_config.LinkColumn(
+                width="small",
+                display_text="Open",
+                help="Open the complete evidence view for this company.",
+            ),
+        },
+    )
     st.caption(
-        "Scores are cross-sectional research measures from 0–100, not expected returns or "
-        "probabilities."
+        "Scores are cross-sectional research measures from 0–100, not expected "
+        "returns or probabilities."
     )
 
 
@@ -1355,11 +1396,26 @@ def _next_operator_review(report: dict, operations: dict, monitor: dict | None) 
     unresolved_incidents = [
         row for row in operations.get("incidents", []) if row.get("state") != "resolved"
     ]
-    critical_incidents = [
-        row for row in unresolved_incidents if row.get("severity") == "critical"
-    ]
+    critical_incidents = [row for row in unresolved_incidents if row.get("severity") == "critical"]
     if critical_incidents:
         return f"Review critical incident {critical_incidents[0]['incident_id']}."
+
+    notification_summary = operations.get("notification_summary", {})
+    if int(notification_summary.get("dead_letter", 0)) > 0:
+        return (
+            "Review alert messages that exhausted delivery attempts with "
+            "`aios notifications --needs-review`."
+        )
+    route = operations.get("notification_route")
+    if (
+        route is not None
+        and route.get("state") == "enabled"
+        and not operations.get("email_config_matches")
+    ):
+        return "Repair the changed email configuration shown by `aios email-status`."
+    email_scheduler = operations.get("email_scheduler", {})
+    if route is not None and route.get("state") == "enabled" and not email_scheduler.get("enabled"):
+        return "Repair the stopped email worker shown by `aios email-status`."
 
     newest_ingest_failures = _latest_ingest_failures(operations.get("ingests", []))
     if newest_ingest_failures:
@@ -1384,20 +1440,33 @@ def _next_operator_review(report: dict, operations: dict, monitor: dict | None) 
 
     proposal = (monitor or {}).get("proposal")
     if proposal and not proposal.get("already_simulated"):
-        return (
-            "After the scheduled close is reviewed, confirm or reject the pending paper "
-            "proposal; no broker action is involved."
-        )
+        if proposal.get("status") != "approved_for_supervised_simulation":
+            return "Review the proposal's data or risk blocker; do not simulate it."
+        timing_status = proposal.get("timing", {}).get("status")
+        if timing_status == "waiting_for_scheduled_close":
+            return "Wait for the scheduled U.S. close, then run the read-only paper review."
+        if timing_status == "execution_window_open":
+            return "Run `aios paper-review` before confirming any local simulation."
+        if timing_status in {"expired", "invalid"}:
+            return "Let current data refresh, then create a new prospective paper proposal."
+        return "Review the proposal timing evidence before any local simulation."
     return "Review the next naturally triggered refresh, health, and backup cycle."
 
 
 def _render_system_control(report: dict) -> None:
     """Render a source-backed operator workspace without fabricated telemetry."""
     _page_header(
-        "Local operations",
-        "System Control",
-        "Check data readiness, scheduler execution, ingests, backups, policy stability, "
-        "and the next human action without opening DuckDB or systemd.",
+        "Operations",
+        "Operations & System Health",
+        "Start with active exceptions, then verify automation, data flow, safeguards, "
+        "and alert delivery from source-backed local evidence.",
+        chips=[
+            (
+                f"Reviewed through {display_date(report.get('certified_research_through'))}",
+                "success" if report.get("ready") else "danger",
+            ),
+            ("Read-only controls", "info"),
+        ],
     )
     try:
         operations = load_system_operations()
@@ -1424,85 +1493,211 @@ def _render_system_control(report: dict) -> None:
     )
 
     incidents = operations.get("incidents", [])
+    incident_summary = operations.get("incident_summary", {})
     unresolved_incidents = [row for row in incidents if row.get("state") != "resolved"]
-    critical_incidents = [
-        row for row in unresolved_incidents if row.get("severity") == "critical"
-    ]
+    critical_incidents = [row for row in unresolved_incidents if row.get("severity") == "critical"]
+    unresolved_count = int(incident_summary.get("unresolved", len(unresolved_incidents)))
+    critical_count = int(incident_summary.get("critical_unresolved", len(critical_incidents)))
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Research readiness", "Ready" if report["ready"] else "Blocked")
-    c2.metric("Certified decision date", display_date(report["certified_research_through"]))
-    c3.metric("Enabled local timers", f"{enabled_timers} / {len(TIMER_NAMES)}")
-    c4.metric(
-        "Latest verified backup",
-        display_date(backup_date) if backup.get("status") == "verified" else "Needs attention",
-    )
-    c5.metric(
-        "Unresolved incidents",
-        len(unresolved_incidents),
-        f"{len(critical_incidents)} critical",
+    next_review = _next_operator_review(report, operations, monitor)
+    if critical_incidents:
+        first_critical = critical_incidents[0]
+        incident_label = "incident" if critical_count == 1 else "incidents"
+        review_verb = "requires" if critical_count == 1 else "require"
+        st.error(
+            f"{critical_count} critical operating {incident_label} {review_verb} review. "
+            f"First issue: {first_critical.get('title') or 'Untitled operating incident'}. "
+            "Next action: inspect the first incident using the technical command below."
+        )
+        incident_id = str(first_critical.get("incident_id") or "").strip()
+        if incident_id:
+            with st.expander("Technical inspection command"):
+                st.code(f"aios alert-show {incident_id}", language="bash")
+    elif daily_cycle and daily_cycle.get("state") in {"failed", "interrupted"}:
+        st.error(f"The latest guarded daily workflow did not finish safely. {next_review}")
+    else:
+        st.info(f"Next required human review: {next_review}")
+
+    _render_kpi_grid(
+        [
+            (
+                "Research readiness",
+                "Ready" if report["ready"] else "Blocked",
+                display_date(report.get("certified_research_through")),
+                "success" if report["ready"] else "danger",
+            ),
+            (
+                "Local automation",
+                f"{enabled_timers} / {len(TIMER_NAMES)}",
+                "Enabled scheduler timers",
+                "success" if enabled_timers == len(TIMER_NAMES) else "warning",
+            ),
+            (
+                "Verified backup",
+                (
+                    display_date(backup_date)
+                    if backup.get("status") == "verified"
+                    else "Needs attention"
+                ),
+                "Latest checksum-verified snapshot",
+                "success" if backup.get("status") == "verified" else "warning",
+            ),
+            (
+                "Open incidents",
+                str(unresolved_count),
+                f"{critical_count} critical",
+                "danger" if critical_count else ("warning" if unresolved_count else "success"),
+            ),
+        ]
     )
 
     if certification_current:
         st.success(certification_detail)
     else:
         st.warning(certification_detail)
-    next_review = _next_operator_review(report, operations, monitor)
-    st.info(f"Next required human review: {next_review}")
 
-    readiness_col, policy_col = st.columns([1.35, 0.65], gap="large")
-    with readiness_col, st.container(border=True):
-        st.markdown("### Reviewed Data Coverage")
-        st.caption("These counts reconcile directly to the current fail-closed readiness report.")
-        _render_coverage_chart(report)
-    with policy_col, st.container(border=True):
-        st.markdown("### Control Status")
+    policy_col, readiness_col = st.columns(2, gap="medium", border=True)
+    with policy_col:
+        section_header(
+            "Safeguard status",
+            "Current recovery, policy, backup, and membership controls.",
+        )
         warnings = [row for row in report["checks"] if row["status"] == "warn"]
-        st.metric("Readiness warnings", len(warnings))
+        control_rows: list[tuple[str, str, str, str]] = []
         if daily_cycle is None:
-            st.warning("No recoverable daily update has completed yet.")
+            control_rows.append(
+                (
+                    "Daily update",
+                    "Not verified",
+                    "No recoverable daily update has completed yet.",
+                    "warning",
+                )
+            )
         elif daily_cycle["state"] == "success":
-            st.success(
-                "Latest daily workflow passed for "
-                f"{display_date(daily_cycle['target_session'])}."
+            control_rows.append(
+                (
+                    "Daily update",
+                    "Passed",
+                    f"Completed for {display_date(daily_cycle['target_session'])}.",
+                    "success",
+                )
             )
         elif daily_cycle["state"] == "running":
-            st.info(
-                "The daily workflow is currently updating "
-                f"{display_date(daily_cycle['target_session'])}."
+            control_rows.append(
+                (
+                    "Daily update",
+                    "Running",
+                    f"Updating {display_date(daily_cycle['target_session'])}.",
+                    "info",
+                )
             )
         else:
-            st.error(
-                "The latest daily workflow did not finish safely. Startup catch-up "
-                "will retry it."
+            control_rows.append(
+                (
+                    "Daily update",
+                    "Failed",
+                    "The latest workflow did not finish safely; startup catch-up will retry.",
+                    "danger",
+                )
             )
         if forward is None:
-            st.warning("Forward-policy evidence is unavailable.")
+            control_rows.append(
+                (
+                    "Forward policy",
+                    "Unavailable",
+                    "Policy evidence could not be verified.",
+                    "warning",
+                )
+            )
         elif forward["ready"]:
-            st.success("Forward-policy baseline unchanged.")
+            control_rows.append(
+                (
+                    "Forward policy",
+                    "Unchanged",
+                    "The frozen factor, risk, cost, and paper rules still match.",
+                    "success",
+                )
+            )
         else:
-            st.error("Forward-policy drift requires review.")
+            control_rows.append(
+                (
+                    "Forward policy",
+                    "Drift detected",
+                    "A governed policy change requires review.",
+                    "danger",
+                )
+            )
         if backup.get("status") == "verified":
-            st.success(f"Backup checksums verified across {backup['files']} file(s).")
-            st.caption(f"Manifest SHA-256: {backup['manifest_sha256'][:16]}…")
+            control_rows.append(
+                (
+                    "Local backup",
+                    "Verified",
+                    f"Checksums match across {backup['files']} file(s).",
+                    "success",
+                )
+            )
         elif backup.get("status") == "failed":
-            st.error("The newest backup failed verification.")
+            control_rows.append(
+                (
+                    "Local backup",
+                    "Failed",
+                    "The newest backup did not pass checksum verification.",
+                    "danger",
+                )
+            )
         else:
-            st.warning("No local backup is available.")
+            control_rows.append(
+                (
+                    "Local backup",
+                    "Unavailable",
+                    "No checksum-verified local backup is available.",
+                    "warning",
+                )
+            )
         if latest_universe_attestation is None:
-            st.warning("No automatic membership evidence review has run yet.")
+            control_rows.append(
+                (
+                    "Membership evidence",
+                    "Not reviewed",
+                    "No automatic membership evidence review has run yet.",
+                    "warning",
+                )
+            )
         elif latest_universe_attestation["status"] == "accepted_no_change":
-            st.success(
-                "The latest free-source membership check found no change through "
-                f"{display_date(latest_universe_attestation['requested_coverage_through'])}."
+            control_rows.append(
+                (
+                    "Membership evidence",
+                    "No change",
+                    "Reviewed through "
+                    f"{display_date(latest_universe_attestation['requested_coverage_through'])}.",
+                    "success",
+                )
             )
         else:
-            st.error(
-                "The latest membership check stopped for human review; no reference "
-                "dates were silently extended."
+            control_rows.append(
+                (
+                    "Membership evidence",
+                    "Review required",
+                    "The check stopped safely; no reference dates were extended.",
+                    "danger",
+                )
             )
+        render_control_list(control_rows)
+        st.caption(f"{len(warnings)} non-blocking readiness warning(s).")
+        if backup.get("status") == "verified":
+            with st.expander("Backup checksum"):
+                st.code(backup["manifest_sha256"])
+    with readiness_col:
+        section_header(
+            "Reviewed data coverage",
+            "Counts reconcile directly to the current fail-closed readiness report.",
+        )
+        _render_coverage_chart(report)
 
-    st.subheader("Source Freshness")
+    section_header(
+        "Source freshness",
+        "Provider dates are shown separately from the certified decision close.",
+    )
     source_clock = pd.DataFrame(
         [
             {
@@ -1530,17 +1725,15 @@ def _render_system_control(report: dict) -> None:
                 st.markdown(f"**{row['label']} — {row['observed']}**")
                 st.write(row["detail"])
 
-    st.subheader("Scheduler Runtime")
-    st.caption(
+    section_header(
+        "Automation & recovery",
         "Runtime status is queried with a strict timeout. If the user service bus is "
-        "unavailable, installation evidence is shown as unverified instead of guessed."
+        "unavailable, installation evidence is shown as unverified instead of guessed.",
     )
     if operations.get("linger_enabled") is True:
         st.success("Automatic updates remain active after desktop logout while the computer is on.")
     elif operations.get("linger_enabled") is False:
-        st.warning(
-            "Automatic updates pause after desktop logout and catch up at the next login."
-        )
+        st.warning("Automatic updates pause after desktop logout and catch up at the next login.")
     else:
         st.info("Keep-running-after-logout status could not be verified.")
     if operations.get("scheduler_error"):
@@ -1570,7 +1763,10 @@ def _render_system_control(report: dict) -> None:
     else:
         st.warning("No scheduler evidence is available.")
 
-    st.subheader("Recent Ingest Outcomes")
+    section_header(
+        "Data pipeline",
+        "Recent source outcomes stay visible so a failed or partial ingest cannot hide.",
+    )
     ingests = operations.get("ingests", [])
     if ingests:
         ingest_table = pd.DataFrame(ingests)
@@ -1603,10 +1799,10 @@ def _render_system_control(report: dict) -> None:
     else:
         st.info("No ingest outcomes have been recorded.")
 
-    st.subheader("Notifications & Incident History")
-    st.caption(
-        "System failures are written to an independent local incident ledger, so they remain "
-        "recordable even when the analytical DuckDB cannot be opened."
+    section_header(
+        "Incidents & alert delivery",
+        "Incidents are the authoritative local record. Channel-neutral alert copies are "
+        "stored separately and can never replace or hide that history.",
     )
     if operations.get("incident_error"):
         st.error("Local incident history could not be opened.")
@@ -1636,10 +1832,112 @@ def _render_system_control(report: dict) -> None:
         )
     else:
         st.success("No local operating incidents have been recorded.")
-    st.info(
-        "External delivery is not configured yet. The durable local ledger and systemd "
-        "failure capture are active; email or Slack remains the next transport milestone."
+
+    notification_summary = operations.get("notification_summary", {})
+    notifications = operations.get("notifications", [])
+    held_count = int(notification_summary.get("held", 0))
+    waiting_count = int(notification_summary.get("pending", 0)) + int(
+        notification_summary.get("leased", 0)
     )
+    dead_letter_count = int(notification_summary.get("dead_letter", 0))
+    notification_route = operations.get("notification_route")
+    email_enabled = notification_route is not None and notification_route.get("state") == "enabled"
+    email_config_matches = bool(operations.get("email_config_matches"))
+    email_scheduler = operations.get("email_scheduler", {})
+    email_worker_enabled = bool(email_scheduler.get("enabled"))
+    email_worker_verified = bool(email_scheduler.get("runtime_verified"))
+    alert_status, waiting_status = st.columns(2)
+    alert_status.metric(
+        "Email alerts",
+        (
+            "On"
+            if email_enabled
+            and email_config_matches
+            and email_worker_enabled
+            and email_worker_verified
+            else "Off"
+        ),
+    )
+    waiting_status.metric("Messages waiting", waiting_count)
+
+    if operations.get("notification_error"):
+        st.error("Alert-delivery history could not be opened. Incident history remains available.")
+        with st.expander("Technical detail"):
+            st.code(operations["notification_error"])
+    else:
+        if (
+            email_enabled
+            and email_config_matches
+            and email_worker_enabled
+            and email_worker_verified
+        ):
+            st.success(
+                "Email is enabled for new incident changes. Existing held messages "
+                f"remain local ({held_count} held)."
+            )
+        elif email_enabled and email_config_matches and not email_worker_enabled:
+            st.error(
+                "The email route is enabled, but its optional delivery timer is off. "
+                "No queued message will be sent automatically. Run `aios email-status`."
+            )
+        elif email_enabled and email_config_matches:
+            st.warning(
+                "Email is configured and enabled, but this dashboard could not verify "
+                "the delivery timer. Check `aios email-status` in a desktop terminal."
+            )
+        elif email_enabled:
+            st.error(
+                "Email is enabled, but the current local SMTP configuration no longer "
+                "matches the activated route. Delivery fails closed. Run `aios email-status`."
+            )
+        else:
+            st.info(
+                "External email is off. Incidents are still saved locally, and "
+                f"{held_count} alert copy/copies are deliberately held on this computer."
+            )
+        if waiting_count:
+            st.warning(
+                f"{waiting_count} message(s) are waiting to retry. Local incident history is safe."
+            )
+        if dead_letter_count:
+            st.error(
+                f"{dead_letter_count} message(s) could not be delivered after the "
+                "bounded retry policy. Run `aios notifications --needs-review`."
+            )
+        if notifications:
+            state_labels = {
+                "held": "Held locally",
+                "pending": "Waiting to retry",
+                "leased": "Sending now",
+                "delivered": "Sent",
+                "dead_letter": "Needs review",
+            }
+            notification_table = pd.DataFrame(
+                [
+                    {
+                        "Created": pd.to_datetime(row["created_at"], errors="coerce").strftime(
+                            "%b %d, %Y %H:%M UTC"
+                        ),
+                        "State": state_labels.get(row["state"], row["state"]),
+                        "Event": str(row["event_type"]).replace("_", " ").title(),
+                        "Severity": str(row["severity"]).title(),
+                        "Summary": row["title"],
+                        "Attempts": row["attempt_count"],
+                        "Notification ID": row["notification_id"],
+                    }
+                    for row in notifications
+                ]
+            )
+            st.dataframe(
+                notification_table,
+                hide_index=True,
+                width="stretch",
+                height=300,
+            )
+            st.caption(
+                "Inspect one message with `aios notification-show NOTIFICATION_REF`. "
+                "Sending and retry controls stay outside this read-only dashboard."
+            )
 
 
 # ----------------------------------------------------------------------
@@ -1671,11 +1969,21 @@ except (duckdb.IOException, FileNotFoundError):
         "safe; this page will be available again when the short database step finishes."
     )
     st.stop()
+except ValueError as exc:
+    st.sidebar.markdown(
+        '<span class="aios-chip danger">● Readiness evidence blocked</span>',
+        unsafe_allow_html=True,
+    )
+    st.error(
+        "AIOS could not validate the current readiness evidence. New decisions remain "
+        "blocked, and no local research or paper state was changed."
+    )
+    with st.expander("Technical detail"):
+        st.code(str(exc))
+    st.stop()
 certified_from = readiness["certified_research_from"]
 certified_through = readiness["certified_research_through"]
-certification_current, certification_detail = us_certification_freshness_message(
-    certified_through
-)
+certification_current, certification_detail = us_certification_freshness_message(certified_through)
 if readiness["ready"] and certification_current:
     sidebar_status = '<span class="aios-chip success">● Research gates passed</span>'
 elif readiness["ready"]:
@@ -1686,144 +1994,121 @@ else:
 st.sidebar.markdown(sidebar_status, unsafe_allow_html=True)
 st.sidebar.caption(f"Reviewed through {display_date(certified_through)}")
 st.sidebar.divider()
-view = st.sidebar.radio("Workspace", VIEW_OPTIONS, label_visibility="collapsed")
+st.sidebar.markdown('<div class="aios-nav-label">Navigate</div>', unsafe_allow_html=True)
+raw_view = _query_value("view")
+requested_view_slug = raw_view if raw_view in _VIEWS_BY_SLUG else "today"
+default_workspace = "research" if requested_view_slug == "company" else requested_view_slug
+workspace_marker = "_aios_workspace_route"
+if "workspace" not in st.session_state or st.session_state.get(workspace_marker) != raw_view:
+    st.session_state["workspace"] = default_workspace
+st.session_state[workspace_marker] = raw_view
+workspace_slug = st.sidebar.radio(
+    "Workspace",
+    tuple(_PRIMARY_NAVIGATION),
+    index=None,
+    format_func=_PRIMARY_NAVIGATION.__getitem__,
+    key="workspace",
+    label_visibility="collapsed",
+)
+workspace_slug = str(workspace_slug or default_workspace)
+if workspace_slug != default_workspace:
+    view_slug = workspace_slug
+    st.query_params["view"] = view_slug
+    st.session_state[workspace_marker] = view_slug
+else:
+    view_slug = requested_view_slug
+if _query_value("view") != view_slug:
+    st.query_params["view"] = view_slug
+view = _VIEWS_BY_SLUG[view_slug]
 default_as_of = certified_through or (date.today() - timedelta(days=1)).isoformat()
 as_of = default_as_of
 ranking_model = MODEL_QV_LABEL
-if view in {VIEW_RANKINGS, VIEW_DETAILS}:
-    if certified_from is None or certified_through is None:
-        st.error("No complete reviewed U.S. research window is available yet.")
-        st.stop()
-    selected_date = st.sidebar.date_input(
-        "Research date",
-        value=date.fromisoformat(default_as_of),
-        min_value=date.fromisoformat(certified_from),
-        max_value=date.fromisoformat(certified_through),
-        help="Scores use only information that was publicly available by this date.",
-    )
-    as_of = selected_date.isoformat()
-    st.sidebar.caption(
-        f"Reviewed range: {display_date(certified_from)}–{display_date(certified_through)}"
-    )
-
-    ranking_model = st.sidebar.radio(
-        "Scoring method",
-        MODEL_OPTIONS,
-        index=MODEL_OPTIONS.index(MODEL_QV_LABEL),
-        help=(
-            "Quality + Value is the baseline. The experimental method also considers "
-            "past price trend and price stability. Both are research scores, not forecasts."
-        ),
-    )
 
 st.sidebar.divider()
-st.sidebar.markdown("**Research Boundary**")
-st.sidebar.caption("Supervised analysis only. No personal recommendation or broker order.")
-with st.sidebar.expander("Data sources & freshness"):
-    prices_current, freshness_detail = us_eod_freshness_message(
-        readiness["raw_prices_through"]
-    )
-    st.markdown(
-        "The current U.S. reference build uses SEC EDGAR, yfinance/Tiingo/Stooq, "
-        "release-dated FRED data, and local DuckDB storage. Normal use does not "
-        "require database knowledge."
-    )
-    st.markdown(
-        f"Prices: {display_date(readiness['raw_prices_through'])}  \n"
-        f"Company filings: {display_date(readiness['fundamentals_through'])}  \n"
-        f"Economic releases: {display_date(readiness['macro_releases_through'])}  \n"
-        "These raw dates do not override the reviewed window."
-    )
-    if prices_current:
-        st.success(freshness_detail)
-    else:
-        st.warning(freshness_detail)
-    if certification_current:
-        st.success(certification_detail)
-    else:
-        st.warning(certification_detail)
-    st.caption(
-        "Because India is ahead of New York, a U.S. session dated today normally becomes "
-        "complete after midnight IST and is loaded by the following scheduled refresh."
-    )
 st.sidebar.markdown(
-    '<div class="aios-next-action"><strong>Local mode</strong><br>'
-    "DuckDB + checksum-protected paper state. No broker connection.</div>",
+    '<div class="aios-sidebar-footer">'
+    "<strong>Local simulation</strong>"
+    "<span>DuckDB · checksum protected</span>"
+    "<span>No broker connection</span>"
+    "</div>",
     unsafe_allow_html=True,
 )
 
 
-# ----------------------------------------------------------------------
-# Load factor data only for views that display stock scores
-# ----------------------------------------------------------------------
 df = pd.DataFrame()
-if view in {VIEW_RANKINGS, VIEW_DETAILS}:
-    try:
-        df = load_composite(as_of)
-    except Exception as e:
-        st.error(
-            "The research scores could not be calculated. Check the research date and data "
-            "refresh, then try again."
-        )
-        with st.expander("Technical error details"):
-            st.code(str(e))
-        st.stop()
 
 
 # ----------------------------------------------------------------------
-# VIEW 1: OPERATING OVERVIEW
+# VIEW 1: TODAY
 # ----------------------------------------------------------------------
 if view == VIEW_HOME:
-    _render_overview(readiness)
+    with st.container(key="overview_workspace"):
+        _render_overview(readiness)
 
 
 # ----------------------------------------------------------------------
-# VIEW 2: RESEARCH EXPLORER
+# VIEW 2: RESEARCH
 # ----------------------------------------------------------------------
 elif view == VIEW_RANKINGS:
+    _page_header(
+        "Research",
+        "Research Universe",
+        "Screen the reviewed market, compare factor trade-offs, and open a company "
+        "only when its evidence deserves deeper work.",
+        chips=[
+            (
+                f"Certified through {display_date(certified_through)}",
+                "success" if readiness.get("ready") else "danger",
+            ),
+            ("Research only · Not a forecast", "info"),
+        ],
+    )
+    if certified_from is None or certified_through is None:
+        st.error("No complete reviewed U.S. research window is available yet.")
+        st.stop()
+    as_of, ranking_model, company_search = _research_context_controls(
+        certified_from,
+        certified_through,
+    )
     use_qvml = model_key(ranking_model) == "qvml"
     rank_col = "QVML Rank" if use_qvml else "Rank"
     grade_col = "QVML Grade" if use_qvml else "Grade"
     score_col = "QVML Score" if use_qvml else "QV Score"
     model_name = "Four-factor" if use_qvml else "Quality + Value"
 
-    _page_header(
-        "Cross-sectional factor research",
-        "Research Explorer",
-        "Compare the reviewed universe, inspect factor trade-offs, and identify companies "
-        "for deeper research.",
-    )
-    st.caption(RESEARCH_ONLY_NOTICE)
+    try:
+        full_df = load_composite(as_of, include_market_factors=use_qvml)
+    except Exception as exc:
+        st.error(
+            "The research scores could not be calculated. Check the selected evidence "
+            "date and refresh state, then try again."
+        )
+        with st.expander("Technical error details"):
+            st.code(str(exc))
+        st.stop()
+    df = full_df
+    if company_search:
+        search_mask = df["Company"].fillna("").str.contains(
+            company_search, case=False, regex=False
+        ) | df["Ticker"].fillna("").str.contains(company_search, case=False, regex=False)
+        df = df[search_mask].copy()
+
     if df.empty:
         st.info(
-            "No stock scores are available for this date. Choose another research date "
-            "or refresh the underlying company and price information."
+            "No reviewed company matches the current scope. Clear the search or choose "
+            "another research date."
         )
         st.stop()
 
-    macro_regime = friendly_regime(df["Macro regime"].iloc[0])
-    quality_weight = df["Quality weight %"].iloc[0]
-    value_weight = df["Value weight %"].iloc[0]
-    macro_pit_ready = bool(df["Macro PIT ready"].iloc[0])
+    macro_regime = friendly_regime(full_df["Macro regime"].iloc[0])
+    quality_weight = full_df["Quality weight %"].iloc[0]
+    value_weight = full_df["Value weight %"].iloc[0]
+    macro_pit_ready = bool(full_df["Macro PIT ready"].iloc[0])
     if use_qvml:
-        st.caption(
-            f"Research date: {display_date(as_of)} • {len(df)} stocks checked • "
-            f"Economic backdrop: {macro_regime} • Score mix: business quality "
-            f"{df['QVML Quality weight %'].iloc[0]:.0f}%, relative value "
-            f"{df['QVML Value weight %'].iloc[0]:.0f}%, price trend "
-            f"{df['QVML Momentum weight %'].iloc[0]:.0f}%, price stability "
-            f"{df['QVML Low Volatility weight %'].iloc[0]:.0f}%"
-        )
         st.warning(
             "The four-factor method is experimental. It completed the engineering test, "
             "but performed worse than the simpler Quality + Value method in the short "
             "historical window. Do not treat it as a stronger buy signal."
-        )
-    else:
-        st.caption(
-            f"Research date: {display_date(as_of)} • {len(df)} stocks checked • "
-            f"Economic backdrop: {macro_regime} • Score mix: business quality "
-            f"{quality_weight:.0f}% and relative value {value_weight:.0f}%"
         )
     if not macro_pit_ready:
         st.warning(
@@ -1831,11 +2116,14 @@ elif view == VIEW_RANKINGS:
             "standard 60% business-quality and 40% relative-value mix."
         )
 
+    full_ranked_df = full_df[full_df[score_col].notna()].sort_values(
+        [score_col, "Ticker"], ascending=[False, True]
+    )
     ranked_df = df[df[score_col].notna()].sort_values(
         [score_col, "Ticker"], ascending=[False, True]
     )
     action_unverified = int(
-        df["Missing inputs"]
+        full_df["Missing inputs"]
         .apply(lambda values: "market:corporate_actions_unverified" in values)
         .sum()
     )
@@ -1845,57 +2133,124 @@ elif view == VIEW_RANKINGS:
             "history. Their four-factor scores are hidden instead of being guessed."
         )
 
-    # Top metrics row
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Stocks checked", len(df), help="All stocks examined for the selected date.")
-    c2.metric(
-        "Complete scores",
-        len(ranked_df),
-        help="Stocks with enough verified information for the selected scoring method.",
+    complete_count = len(full_ranked_df)
+    withheld_count = len(full_df) - complete_count
+    coverage_pct = complete_count / len(full_df) * 100
+    _render_kpi_grid(
+        [
+            (
+                "Reviewed universe",
+                str(len(full_df)),
+                f"{len(df)} shown in the current scope",
+                "info",
+            ),
+            (
+                "Complete scores",
+                str(complete_count),
+                "Names with every required input",
+                "success" if complete_count else "danger",
+            ),
+            (
+                "Score coverage",
+                f"{coverage_pct:.1f}%",
+                f"{complete_count} of {len(full_df)} reviewed names",
+                "success" if coverage_pct >= 95 else "warning",
+            ),
+            (
+                "Withheld",
+                str(withheld_count),
+                "Missing or unverified evidence",
+                "warning" if withheld_count else "success",
+            ),
+        ]
     )
-    average_score = ranked_df[score_col].mean()
-    c3.metric(
-        "Average complete score",
-        f"{average_score:.1f} / 100" if pd.notna(average_score) else "N/A",
-        help="A relative comparison score, not an expected investment return.",
-    )
-    c4.metric(
-        "Incomplete scores",
-        len(df) - len(ranked_df),
-        help="Stocks withheld because required information was missing or unverified.",
+    if use_qvml:
+        weight_copy = (
+            f"quality {full_df['QVML Quality weight %'].iloc[0]:.0f}% · "
+            f"value {full_df['QVML Value weight %'].iloc[0]:.0f}% · "
+            f"trend {full_df['QVML Momentum weight %'].iloc[0]:.0f}% · "
+            f"stability {full_df['QVML Low Volatility weight %'].iloc[0]:.0f}%"
+        )
+    else:
+        weight_copy = f"quality {quality_weight:.0f}% · value {value_weight:.0f}%"
+    st.markdown(
+        '<div class="aios-context-strip">'
+        "<strong>Economic backdrop</strong>"
+        f"<span>{escape(macro_regime.title())}</span>"
+        f"<span>{escape(display_date(as_of))} evidence close</span>"
+        f"<span>{escape(weight_copy)}</span>"
+        "</div>",
+        unsafe_allow_html=True,
     )
 
-    map_tab, ranking_tab, coverage_tab = st.tabs(
-        ["Opportunity Map", "Ranked Universe", "Coverage Review"]
-    )
-    with map_tab:
-        _render_opportunity_map(df, score_col, model_name)
-    with ranking_tab:
-        _render_ranked_universe(
+    research_surface = _research_surface_selector()
+    if research_surface == "Opportunity Map":
+        _render_opportunity_map(
             df,
-            rank_col=rank_col,
-            grade_col=grade_col,
-            score_col=score_col,
+            score_col,
+            model_name,
+            show_market_factors=use_qvml,
         )
-    with coverage_tab:
+    elif research_surface == "Data Coverage":
         _render_research_coverage(
             df,
             ranked_df,
             grade_col=grade_col,
             score_col=score_col,
         )
+    else:
+        _render_ranked_universe(
+            df,
+            rank_col=rank_col,
+            grade_col=grade_col,
+            score_col=score_col,
+            show_market_factors=use_qvml,
+        )
 
 # ----------------------------------------------------------------------
-# VIEW 2: COMPANY DETAILS
+# VIEW 3: COMPANY DETAIL
 # ----------------------------------------------------------------------
 elif view == VIEW_DETAILS:
     _page_header(
-        "Security-level evidence",
-        "Company Lens",
-        "Trace one stock from its relative score to the underlying quality, valuation, "
-        "trend, stability, and missing-evidence checks.",
+        "Research / Company evidence",
+        "Company Detail",
+        "Trace one company from its relative score to the evidence and explicit gaps "
+        "behind that result.",
+        chips=[
+            (
+                f"Certified through {display_date(certified_through)}",
+                "success" if readiness.get("ready") else "danger",
+            ),
+            ("Contextual research detail", "info"),
+        ],
     )
-    st.caption(RESEARCH_ONLY_NOTICE)
+    if certified_from is None or certified_through is None:
+        st.error("No complete reviewed U.S. research window is available yet.")
+        st.stop()
+    as_of, ranking_model, _ = _research_context_controls(
+        certified_from,
+        certified_through,
+        include_search=False,
+        compact=True,
+    )
+    try:
+        df = load_composite(as_of, include_market_factors=True)
+    except Exception as exc:
+        st.error(
+            "Company evidence could not be calculated for this research date. "
+            "Choose another reviewed date or inspect the refresh state."
+        )
+        with st.expander("Technical error details"):
+            st.code(str(exc))
+        st.stop()
+    st.link_button(
+        "← Back to research universe",
+        (
+            f"?view=research&date={as_of}&model="
+            f"{_MODEL_SLUGS.get(ranking_model, 'qv')}&surface=ranked"
+        ),
+        type="secondary",
+    )
 
     label_to_ticker = (
         dict(
@@ -1914,12 +2269,21 @@ elif view == VIEW_DETAILS:
         )
         st.stop()
 
-    selected_company = st.selectbox(
+    ticker_to_label = {str(ticker).upper(): label for label, ticker in label_to_ticker.items()}
+    company_tickers = sorted(ticker_to_label, key=ticker_to_label.__getitem__)
+    raw_company = _query_value("company").strip().upper()
+    default_company = raw_company if raw_company in ticker_to_label else company_tickers[0]
+    _hydrate_widget_from_url("company", default_company)
+    ticker = st.selectbox(
         "Choose a company",
-        list(label_to_ticker),
+        company_tickers,
+        index=None,
+        format_func=ticker_to_label.__getitem__,
+        key="company",
         help="Each company is shown with its market symbol, such as Apple Inc. (AAPL).",
     )
-    ticker = label_to_ticker[selected_company]
+    ticker = str(ticker or default_company)
+    _persist_widget_query("company", ticker)
     row = df[df["Ticker"] == ticker].iloc[0]
     use_qvml = model_key(ranking_model) == "qvml"
     score_col = "QVML Score" if use_qvml else "QV Score"
@@ -1928,150 +2292,172 @@ elif view == VIEW_DETAILS:
     displayed_score = row[score_col]
     displayed_grade = row[grade_col]
 
-    # Header card
     score_text = f"{displayed_score:.1f}" if pd.notna(displayed_score) else "N/A"
     grade_text = str(displayed_grade) if pd.notna(displayed_grade) else "N/A"
     st.markdown(
-        f"### {row['Company + Symbol']} — research grade {grade_text} — "
-        f"score {score_text} / 100"
-    )
-    st.caption(
-        f"Research date: {display_date(as_of)} • {model_name} method • The grade compares "
-        "this stock "
-        "with other covered stocks; it is not a buy, hold, or sell rating."
+        f'<section class="aios-company-hero">'
+        f'<div class="aios-company-name">{escape(str(row["Company + Symbol"]))}</div>'
+        f'<div class="aios-company-context">{escape(model_name)} research evidence · '
+        f"{escape(display_date(as_of))}</div>"
+        "</section>",
+        unsafe_allow_html=True,
     )
     economic_backdrop = friendly_regime(row["Macro regime"])
     if use_qvml:
-        st.caption(
-            f"Economic backdrop: {economic_backdrop} • Score mix: business quality "
+        score_mix_copy = (
+            f"business quality "
             f"{row['QVML Quality weight %']:.0f}%, relative value "
             f"{row['QVML Value weight %']:.0f}%, price trend "
             f"{row['QVML Momentum weight %']:.0f}%, price stability "
-            f"{row['QVML Low Volatility weight %']:.0f}% • Experimental"
+            f"{row['QVML Low Volatility weight %']:.0f}% · experimental"
         )
     else:
-        st.caption(
-            f"Economic backdrop: {economic_backdrop} • Score mix: business quality "
+        score_mix_copy = (
+            f"business quality "
             f"{row['Quality weight %']:.0f}% and relative value "
-            f"{row['Value weight %']:.0f}% • Economic information complete: "
+            f"{row['Value weight %']:.0f}% · economic information complete: "
             f"{'yes' if row['Macro PIT ready'] else 'no; standard mix used'}"
         )
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric(
-        "Business quality",
-        f"{row['Quality']:.1f} / 100" if pd.notna(row["Quality"]) else "N/A",
-        help="Higher means stronger profitability and financial health versus covered stocks.",
-    )
-    col2.metric(
-        "Relative value",
-        f"{row['Value']:.1f} / 100" if pd.notna(row["Value"]) else "N/A",
-        help="Higher means the stock looks less expensive on several valuation measures.",
-    )
-    col3.metric(
-        "Price trend",
-        f"{row['Momentum']:.1f} / 100" if pd.notna(row["Momentum"]) else "N/A",
-        help="Higher means a stronger past price trend, excluding the most recent month.",
-    )
-    col4.metric(
-        "Price stability",
-        f"{row['Low Volatility']:.1f} / 100" if pd.notna(row["Low Volatility"]) else "N/A",
-        help="Higher means the stock price moved more steadily than other covered stocks.",
+    st.markdown(
+        '<div class="aios-context-strip">'
+        "<strong>Relative research grade · not buy/sell</strong>"
+        f"<span>{escape(economic_backdrop.title())} backdrop</span>"
+        f"<span>{escape(score_mix_copy)}</span>"
+        "</div>",
+        unsafe_allow_html=True,
     )
 
-    mc1, mc2, mc3, mc4 = st.columns(4)
-    mc1.metric(
-        "Past 12-to-1 month return",
-        f"{row['12-1 Momentum %']:.1f}%" if pd.notna(row["12-1 Momentum %"]) else "N/A",
-        help="Return over roughly one year, leaving out the most recent month.",
-    )
-    mc2.metric(
-        "Past price volatility",
-        f"{row['Annualized Volatility %']:.1f}%"
-        if pd.notna(row["Annualized Volatility %"])
-        else "N/A",
-        help="How widely daily returns varied, expressed as a yearly rate. Lower is steadier.",
-    )
-    mc3.metric("Share price", f"${row['Price']}" if pd.notna(row["Price"]) else "N/A")
-    mc4.metric(
-        "Company market value",
-        f"${row['Market Cap ($B)']} billion" if pd.notna(row["Market Cap ($B)"]) else "N/A",
-    )
-
-    # Quality breakdown
-    st.subheader("Business strength details")
-    st.caption(
-        "These measures describe profitability, cash generation, margins, and financial health."
-    )
-    qc1, qc2, qc3, qc4 = st.columns(4)
-    qc1.metric(
-        "Return on invested capital",
-        f"{row['ROIC %']}%" if pd.notna(row["ROIC %"]) else "N/A",
-        help="How efficiently the company turns invested money into operating profit.",
-    )
-    qc2.metric(
-        "Free-cash-flow margin",
-        f"{row['FCF Margin %']}%" if pd.notna(row["FCF Margin %"]) else "N/A",
-        help="Free cash generated for every dollar of revenue.",
-    )
-    qc3.metric(
-        "Gross margin",
-        f"{row['Gross Margin %']}%" if pd.notna(row["Gross Margin %"]) else "N/A",
-        help="Revenue left after the direct cost of products or services.",
-    )
-    qc4.metric(
-        "Financial-health checks",
-        f"{row['Piotroski F']}/9" if pd.notna(row["Piotroski F"]) else "N/A",
-        help="Number of available Piotroski financial-health checks passed.",
+    _render_kpi_grid(
+        [
+            (
+                "Overall Score",
+                f"{score_text} / 100" if score_text != "N/A" else "N/A",
+                f"{model_name} cross-sectional score.",
+                "",
+            ),
+            (
+                "Research Grade",
+                grade_text,
+                "Relative grade within the covered universe.",
+                "",
+            ),
+            (
+                "Business Quality",
+                f"{row['Quality']:.1f} / 100" if pd.notna(row["Quality"]) else "N/A",
+                "Profitability and financial health versus covered peers.",
+                "",
+            ),
+            (
+                "Relative Value",
+                f"{row['Value']:.1f} / 100" if pd.notna(row["Value"]) else "N/A",
+                "Valuation relative to other covered companies.",
+                "",
+            ),
+        ]
     )
 
-    # Value breakdown
-    st.subheader("Price and valuation details")
-    st.caption(
-        "These ratios compare the market price with company earnings, cash flow, sales, "
-        "and assets. "
-        "Lower ratios often mean cheaper, but can also reflect genuine business risk."
-    )
-    vc1, vc2, vc3, vc4, vc5 = st.columns(5)
-    vc1.metric(
-        "Price / earnings",
-        f"{row['P/E']}" if pd.notna(row["P/E"]) else "N/A",
-        help="Share price divided by earnings per share.",
-    )
-    vc2.metric(
-        "Business value / operating profit",
-        f"{row['EV/EBITDA']}" if pd.notna(row["EV/EBITDA"]) else "N/A",
-        help="Enterprise value divided by EBITDA, a rough operating-profit measure.",
-    )
-    vc3.metric(
-        "Price / free cash flow",
-        f"{row['P/FCF']}" if pd.notna(row["P/FCF"]) else "N/A",
-        help="Share price compared with cash left after operating and capital spending.",
-    )
-    vc4.metric(
-        "Business value / sales",
-        f"{row['EV/Sales']}" if pd.notna(row["EV/Sales"]) else "N/A",
-        help="Enterprise value divided by annual sales.",
-    )
-    vc5.metric(
-        "Price / book value",
-        f"{row['P/B']}" if pd.notna(row["P/B"]) else "N/A",
-        help="Share price compared with accounting net assets per share.",
-    )
+    evidence_left, evidence_right = st.columns(2, gap="medium", border=True)
+    with evidence_left:
+        st.markdown("### Business Evidence")
+        st.caption("Profitability, cash generation, margins, and financial health.")
+        st.markdown(
+            _source_list(
+                [
+                    (
+                        "Return on invested capital",
+                        f"{row['ROIC %']}%" if pd.notna(row["ROIC %"]) else "N/A",
+                    ),
+                    (
+                        "Free-cash-flow margin",
+                        f"{row['FCF Margin %']}%" if pd.notna(row["FCF Margin %"]) else "N/A",
+                    ),
+                    (
+                        "Gross margin",
+                        f"{row['Gross Margin %']}%" if pd.notna(row["Gross Margin %"]) else "N/A",
+                    ),
+                    (
+                        "Financial-health checks",
+                        f"{row['Piotroski F']}/9" if pd.notna(row["Piotroski F"]) else "N/A",
+                    ),
+                ]
+            ),
+            unsafe_allow_html=True,
+        )
+    with evidence_right:
+        st.markdown("### Valuation Evidence")
+        st.caption("Lower multiples can mean cheaper—or reflect genuine business risk.")
+        st.markdown(
+            _source_list(
+                [
+                    ("Price / earnings", row["P/E"] if pd.notna(row["P/E"]) else "N/A"),
+                    (
+                        "Enterprise value / EBITDA",
+                        row["EV/EBITDA"] if pd.notna(row["EV/EBITDA"]) else "N/A",
+                    ),
+                    (
+                        "Price / free cash flow",
+                        row["P/FCF"] if pd.notna(row["P/FCF"]) else "N/A",
+                    ),
+                    (
+                        "Enterprise value / sales",
+                        row["EV/Sales"] if pd.notna(row["EV/Sales"]) else "N/A",
+                    ),
+                    ("Price / book value", row["P/B"] if pd.notna(row["P/B"]) else "N/A"),
+                ]
+            ),
+            unsafe_allow_html=True,
+        )
+
+    with st.container(border=True, key="company_market_context"):
+        section_header(
+            "Market context",
+            "Price and size context is visible for interpretation; it is not a forecast.",
+        )
+        st.markdown(
+            _source_list(
+                [
+                    (
+                        "Past 12-to-1 month return",
+                        f"{row['12-1 Momentum %']:.1f}%"
+                        if pd.notna(row["12-1 Momentum %"])
+                        else "N/A",
+                    ),
+                    (
+                        "Annualized price volatility",
+                        f"{row['Annualized Volatility %']:.1f}%"
+                        if pd.notna(row["Annualized Volatility %"])
+                        else "N/A",
+                    ),
+                    ("Share price", f"${row['Price']}" if pd.notna(row["Price"]) else "N/A"),
+                    (
+                        "Market value",
+                        f"${row['Market Cap ($B)']} billion"
+                        if pd.notna(row["Market Cap ($B)"])
+                        else "N/A",
+                    ),
+                ]
+            ),
+            unsafe_allow_html=True,
+        )
 
     # The row already contains universe-relative scores. Reusing it avoids the
     # former five full-universe recomputations on every ticker selection.
     factor_profile = [
         ("Business quality", row["Quality"]),
         ("Relative value", row["Value"]),
-        ("Price trend", row["Momentum"]),
-        ("Price stability", row["Low Volatility"]),
     ]
+    if use_qvml:
+        factor_profile.extend(
+            [
+                ("Price trend", row["Momentum"]),
+                ("Price stability", row["Low Volatility"]),
+            ]
+        )
     available_profile = [
         (label, float(value)) for label, value in factor_profile if pd.notna(value)
     ]
     if available_profile:
-        st.subheader("Factor Profile")
+        st.subheader("Selected Model Profile")
         st.caption(
             "A score above 50 is above the covered-universe midpoint. These are relative "
             "research measures, not forecasts."
@@ -2085,9 +2471,9 @@ elif view == VIEW_DETAILS:
             text="Score",
             range_x=[0, 100],
             color="Score",
-            color_continuous_scale=["#164E63", "#2DD4BF", "#60A5FA"],
+            color_continuous_scale=["#D6E4F6", "#7196C5", "#3266AD"],
         )
-        fig2.add_vline(x=50, line_dash="dot", line_color="#6F849B")
+        fig2.add_vline(x=50, line_dash="dot", line_color="#73726C")
         fig2.update_traces(texttemplate="%{text:.1f}", textposition="outside")
         fig2.update_layout(
             coloraxis_showscale=False,
@@ -2100,7 +2486,11 @@ elif view == VIEW_DETAILS:
     missing_inputs = row["Missing inputs"]
     if missing_inputs:
         friendly_reasons = row["Missing data details"]
-        with st.expander(f"Missing or unverified information ({len(friendly_reasons)})"):
+        with st.container(border=True, key="company_evidence_gaps"):
+            section_header(
+                f"Missing or unverified information ({len(friendly_reasons)})",
+                "The affected score is withheld rather than filled with an estimate.",
+            )
             for reason in friendly_reasons:
                 st.markdown(f"- {reason}")
     else:
@@ -2108,18 +2498,22 @@ elif view == VIEW_DETAILS:
 
 
 # ----------------------------------------------------------------------
-# VIEW 3: PAPER MONITOR
+# VIEW 4: PAPER TRIAL
 # ----------------------------------------------------------------------
 elif view == VIEW_PAPER:
     _page_header(
         "Simulation-only portfolio",
-        "Portfolio Monitor",
+        "Paper Trial",
         "Follow the governed proposal, holdings, modeled costs, and daily account value "
         "without connecting to a broker.",
+        chips=[
+            ("Simulation only", ""),
+            ("No broker connection", ""),
+        ],
     )
-    st.warning(
-        "Simulation only — no broker is connected and this page cannot place an order. "
-        "It tracks what the rules would have done using reviewed closing prices."
+    st.caption(
+        "Read-only dashboard. A local record is possible only through the separately "
+        "confirmed CLI workflow after every prospective governance check passes."
     )
     try:
         monitor = load_paper_monitor()
@@ -2141,11 +2535,38 @@ elif view == VIEW_PAPER:
 
     summary = monitor["summary"]
     identity_labels = load_identity_labels(readiness["certified_research_through"])
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Simulated account value", f"${summary['equity']:,.2f}")
-    c2.metric("Simulated cash", f"${summary['cash']:,.2f}")
-    c3.metric("Stocks currently simulated", len(summary["holdings"]))
-    c4.metric("Change from highest value", f"{summary['drawdown']:.2%}")
+    paper_model = build_paper_view_model(monitor)
+    _render_paper_workflow(paper_model)
+
+    st.subheader("Account Snapshot")
+    _render_kpi_grid(
+        [
+            (
+                "Simulated Account Value",
+                f"${summary['equity']:,.2f}",
+                "Cash plus checksum-verified local holdings.",
+                "",
+            ),
+            (
+                "Simulated Cash",
+                f"${summary['cash']:,.2f}",
+                "Unallocated cash in the local paper account.",
+                "",
+            ),
+            (
+                "Simulated Holdings",
+                str(len(summary["holdings"])),
+                "Positions recorded after prospective review.",
+                "",
+            ),
+            (
+                "Drawdown From Peak",
+                f"{summary['drawdown']:.2%}",
+                "Change from the account's highest recorded value.",
+                "",
+            ),
+        ]
+    )
     st.caption(
         f"Last reviewed market date: {summary['last_market_date'] or 'not invested yet'} • "
         f"Recorded rebalances: {summary['execution_count']} • "
@@ -2153,24 +2574,36 @@ elif view == VIEW_PAPER:
     )
 
     forward = monitor["forward"]
-    if forward is None:
-        st.warning(
-            "The untouched forward-test baseline has not been frozen yet. Historical and "
-            "paper features still work, but new observations cannot yet prove that the "
-            "research policy stayed unchanged."
+    with st.container(border=True, key="paper_safeguards"):
+        section_header(
+            "Safeguards",
+            "These conditions remain visible because they govern whether any local "
+            "simulation can proceed.",
         )
-    elif forward["ready"]:
-        st.success(
-            "Forward-test baseline unchanged. Factor, risk, cost, tax, calendar, and "
-            f"paper rules match the freeze; {forward['registered_proposals']} proposal(s) "
-            "are recorded."
-        )
-    else:
-        st.error(
-            "Forward-test policy drift detected. Do not count newer observations until "
-            "the changes are reviewed and a new trial is deliberately started."
-        )
-        with st.expander("What changed"):
+        if forward is None:
+            st.warning(
+                "The untouched forward-test baseline has not been frozen. Recording a "
+                "simulated fill stays blocked until a reviewed trial is frozen and the "
+                "proposal is registered."
+            )
+            st.code("aios forward-status", language="bash")
+        elif forward["ready"]:
+            st.success(
+                "The frozen factor, risk, cost, tax, calendar, and paper rules are unchanged. "
+                f"{forward['registered_proposals']} proposal(s) are registered."
+            )
+        else:
+            st.error(
+                "Forward-policy drift detected. Do not count newer observations until the "
+                "changes are reviewed and a new trial is deliberately started."
+            )
+            st.code(
+                "aios forward-status\n"
+                "# After a later reviewed decision close:\n"
+                "aios forward-restart --confirm-restart",
+                language="bash",
+            )
+            st.markdown("**Detected changes**")
             for issue in forward["issues"]:
                 st.write(f"- {issue}")
 
@@ -2190,10 +2623,26 @@ elif view == VIEW_PAPER:
         if proposal.get("already_simulated"):
             st.success(f"Recorded in the simulation on {proposal['scheduled_simulation_date']}.")
         elif proposal["status"] == "approved_for_supervised_simulation":
-            st.info(
-                f"{proposal_status}. It is waiting for reviewed closing prices from "
-                f"{proposal['scheduled_simulation_date']} and explicit human confirmation."
-            )
+            timing = proposal.get("timing", {})
+            if forward is None or not forward.get("ready"):
+                st.error(
+                    "This proposal cannot be recorded because the forward-policy evidence "
+                    "is missing or drifted. Start a reviewed prospective trial first."
+                )
+            elif not proposal.get("registered_in_forward"):
+                st.error(
+                    "This proposal is not registered in the active forward trial and cannot "
+                    "be recorded."
+                )
+            elif timing.get("status") in {"expired", "invalid"}:
+                st.error(str(timing.get("detail", "The proposal timing check failed.")))
+            elif timing.get("status") == "execution_window_open":
+                st.warning(
+                    f"{proposal_status}. {timing['detail']} This must happen before "
+                    "the next U.S. session opens."
+                )
+            else:
+                st.info(f"{proposal_status}. {timing.get('detail', '')}")
         else:
             st.error(proposal_status + ". Nothing can be recorded until the blocker is fixed.")
         st.caption(
@@ -2221,6 +2670,47 @@ elif view == VIEW_PAPER:
                 "This is a model portfolio for engineering and forward monitoring. It is "
                 "not tailored to your finances and is not a personal action list."
             )
+
+    stress_report: dict | None = None
+    stress_error: str | None = None
+    stress_availability = build_stress_review_view_model(None, monitor)
+    if stress_availability.availability_reason == "report_absent":
+        try:
+            cache_inputs = {
+                "account_path": monitor.get("account_path"),
+                "account_payload_sha256": monitor.get("account_payload_sha256"),
+                "proposal_path": monitor.get("proposal_path"),
+                "proposal_payload_sha256": monitor.get("proposal_payload_sha256"),
+                "trial_path": monitor.get("trial_path"),
+                "trial_payload_sha256": monitor.get("trial_payload_sha256"),
+            }
+            if any(
+                not isinstance(value, str) or not value
+                for value in cache_inputs.values()
+            ):
+                raise ValueError("governed stress-review source identities are incomplete")
+            scenario_bundle_sha256 = load_scenario_bundle().payload_sha256
+            source_bundle_sha256 = build_stress_source_identity(
+                settings.project_root
+            )["source_bundle_sha256"]
+            stress_report = load_proposal_stress_review(
+                **cache_inputs,
+                scenario_bundle_sha256=scenario_bundle_sha256,
+                source_bundle_sha256=source_bundle_sha256,
+            )
+        except Exception as exc:
+            stress_error = str(exc)
+    stress_model = build_stress_review_view_model(
+        stress_report,
+        monitor,
+        review_error=stress_error,
+    )
+    _render_stress_review(
+        stress_model,
+        report=stress_report,
+        proposal_path=monitor.get("proposal_path"),
+        review_error=stress_error,
+    )
 
     if summary["holdings"]:
         st.subheader("Current simulated holdings")
@@ -2251,12 +2741,16 @@ elif view == VIEW_PAPER:
             y="equity",
             labels={"date": "Market date", "equity": "Simulated account value ($)"},
         )
-        figure.update_traces(line=dict(color="#2DD4BF", width=2.2))
+        figure.update_traces(line=dict(color="#3266AD", width=2.4))
         figure.update_layout(margin=dict(l=25, r=20, t=12, b=28))
         _style_figure(figure, height=370, show_legend=False)
         st.plotly_chart(figure, width="stretch")
 
-    with st.expander("Assumptions and operator steps"):
+    with st.container(border=True, key="paper_assumptions"):
+        section_header(
+            "Simulation assumptions",
+            "Modeled costs and tax boundaries applied to the engineering account.",
+        )
         costs = summary["transaction_cost_policy"]
         taxes = summary["tax_policy"]
         st.markdown(
@@ -2268,19 +2762,29 @@ elif view == VIEW_PAPER:
             "- Tax rates are zero because jurisdiction and account type have not been set. "
             "Reported values are therefore pre-tax engineering results."
         )
-        if proposal is not None and not proposal.get("already_simulated"):
+    timing = proposal.get("timing", {}) if proposal is not None else {}
+    if (
+        proposal is not None
+        and not proposal.get("already_simulated")
+        and proposal.get("status") == "approved_for_supervised_simulation"
+        and proposal.get("registered_in_forward")
+        and forward is not None
+        and forward.get("ready")
+        and timing.get("status") == "execution_window_open"
+    ):
+        with st.expander("Technical operator command"):
             st.code(
-                f"aios paper-execute --proposal {monitor['proposal_path']} --confirm-simulated",
+                f"aios paper-review --proposal {monitor['proposal_path']}",
                 language="bash",
             )
             st.caption(
-                "That command still refuses to proceed if reviewed next-session prices, "
-                "readiness, risk checks, or the saved evidence do not match."
+                "This command does not change the account. Only if it reports ready should "
+                "you run paper-execute with explicit simulated confirmation."
             )
 
 
 # ----------------------------------------------------------------------
-# VIEW 5: SYSTEM CONTROL
+# VIEW 5: SYSTEM HEALTH
 # ----------------------------------------------------------------------
 elif view == VIEW_SYSTEM:
     _render_system_control(readiness)
@@ -2291,13 +2795,15 @@ elif view == VIEW_SYSTEM:
 # ----------------------------------------------------------------------
 elif view == VIEW_METHOD:
     _page_header(
-        "Research governance",
-        "Methodology & Data",
+        "How AIOS Works",
+        "Methodology & Sources",
         "Understand the scoring model, point-in-time protections, source boundaries, and "
         "current operating limits.",
+        chips=[("Plain-language guide", "info"), ("Research only", "warning")],
     )
     st.caption(RESEARCH_ONLY_NOTICE)
-    st.markdown("""
+    method_body = st.container(key="reading_width")
+    method_body.markdown("""
 ### What this page answers
 
 The dashboard compares stocks using the same rules and shows which companies
@@ -2350,9 +2856,21 @@ method can beat the market. Real-money use still requires an untouched forward
 test, clean scheduled refresh and backup observations, current-news and event
 review, and your account, tax, broker, and final risk rules. India remains the
 next market-integration phase after those U.S. operating gates are closed.
+
+### Evidence sources
+
+- **Company identity and filings:** SEC EDGAR submissions and reviewed filing
+  facts with publication dates.
+- **Market prices and corporate actions:** locally stored, reviewed histories
+  from the configured yfinance, Tiingo, or Stooq source path.
+- **Economic context:** FRED observations with release or vintage dates.
+- **Membership and provenance:** dated local universe records and source
+  attestations; provider freshness alone never changes the certified close.
+- **Storage and audit:** local DuckDB tables plus checksum-protected paper and
+  forward-trial documents.
 """)
 
-    with st.expander("Technical methodology and audit details"):
+    with method_body.expander("Technical methodology and audit details"):
         st.markdown("""
 **Point-in-time rules.** Fundamentals use SEC filing dates; macro data uses
 public release/vintage dates; historical membership stores separate public
@@ -2388,7 +2906,7 @@ Language models are optional explanation tools and never provide numeric or
 provenance evidence.
 """)
 
-    st.info(
+    method_body.info(
         "For the complete audit trail, read ARCHITECTURE.md and "
         "SP500_DATA_PROVENANCE.md in the project folder."
     )

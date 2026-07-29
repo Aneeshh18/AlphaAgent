@@ -45,6 +45,12 @@ SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 SUBMISSIONS_FILE_URL = "https://data.sec.gov/submissions/{name}"
 FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 COMPANYFACTS_BULK_URL = "https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip"
+COMPANYFACTS_CAPTURE_PARSER_VERSION = "sec-companyfacts-capture-v1"
+COMPANYFACTS_PARSER_VERSION = "sec-companyfacts-v2"
+SUBMISSIONS_CAPTURE_PARSER_VERSION = "sec-submissions-capture-v1"
+SUBMISSIONS_PARSER_VERSION = "sec-submissions-v2"
+COMPANY_TICKERS_CAPTURE_PARSER_VERSION = "sec-company-tickers-capture-v1"
+COMPANY_TICKERS_PARSER_VERSION = "sec-company-tickers-v2"
 
 # The SEC's current ticker file maps XOM to ExxonMobil Holdings Corp, which has
 # no public-company XBRL facts. The listed issuer is Exxon Mobil Corp (CIK
@@ -116,6 +122,7 @@ def load_ticker_cik_map(
     *,
     store: Store | None = None,
     ingest_run_id: str | None = None,
+    project_root: Path | None = None,
 ) -> dict[str, int]:
     """Fetch SEC's master ticker→CIK map. Returns {TICKER_UPPER: cik}."""
     raw: dict[str, Any] = _get_sec_json(
@@ -125,17 +132,107 @@ def load_ticker_cik_map(
             ingest_run_id,
             dataset="company-tickers",
             role="ticker-map",
-            parser_version="sec-company-tickers-v1",
+            parser_version=COMPANY_TICKERS_CAPTURE_PARSER_VERSION,
+            project_root=project_root,
         ),
     )
+    rows = _canonical_company_ticker_rows(raw)
+    if store is not None and ingest_run_id is not None:
+        from aios.raw_snapshots import attach_parsed_rows_evidence
+
+        attach_parsed_rows_evidence(
+            store=store,
+            ingest_run_id=ingest_run_id,
+            role="ticker-map",
+            capture_parser_version=COMPANY_TICKERS_CAPTURE_PARSER_VERSION,
+            parser_version=COMPANY_TICKERS_PARSER_VERSION,
+            parsed_rows=rows,
+        )
     out: dict[str, int] = {}
-    # Format: {"0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}, ...}
-    for entry in raw.values():
-        ticker = str(entry["ticker"]).upper()
-        out[ticker] = int(entry["cik_str"])
+    for row in rows:
+        ticker = str(row["ticker"])
+        cik = int(row["cik"])
+        existing = out.get(ticker)
+        if existing is not None and existing != cik:
+            raise ValueError(f"SEC ticker map is ambiguous for {ticker}")
+        out[ticker] = cik
     out.update(CIK_OVERRIDES)
     log.info("edgar.ticker_map_loaded", count=len(out))
     return out
+
+
+def fetch_company_ticker_records(
+    *,
+    store: Store | None = None,
+    ingest_run_id: str | None = None,
+    project_root: Path | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return all SEC ticker records without discarding duplicate symbols."""
+    raw: dict[str, Any] = _get_sec_json(
+        TICKER_MAP_URL,
+        snapshot=_sec_snapshot(
+            store,
+            ingest_run_id,
+            dataset="company-tickers",
+            role="ticker-map",
+            parser_version=COMPANY_TICKERS_CAPTURE_PARSER_VERSION,
+            project_root=project_root,
+        ),
+    )
+    rows = _canonical_company_ticker_rows(raw)
+    if store is not None and ingest_run_id is not None:
+        from aios.raw_snapshots import attach_parsed_rows_evidence
+
+        attach_parsed_rows_evidence(
+            store=store,
+            ingest_run_id=ingest_run_id,
+            role="ticker-map",
+            capture_parser_version=COMPANY_TICKERS_CAPTURE_PARSER_VERSION,
+            parser_version=COMPANY_TICKERS_PARSER_VERSION,
+            parsed_rows=rows,
+        )
+    output: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        output.setdefault(str(row["ticker"]), []).append(dict(row))
+    return output
+
+
+def parse_sec_company_tickers_response(payload: bytes) -> list[dict[str, Any]]:
+    """Replay the exact SEC company-ticker map into canonical identity rows."""
+    try:
+        raw = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("SEC company ticker response is not valid JSON") from exc
+    return _canonical_company_ticker_rows(raw)
+
+
+def _canonical_company_ticker_rows(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, dict):
+        raise ValueError("SEC company ticker response is not an object")
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, str]] = set()
+    for key, entry in raw.items():
+        if not isinstance(entry, dict):
+            raise ValueError(f"SEC company ticker entry {key!r} is not an object")
+        ticker = str(entry.get("ticker") or "").strip().upper()
+        title = str(entry.get("title") or "").strip()
+        cik_value = entry.get("cik_str")
+        if not ticker or not title or cik_value is None:
+            raise ValueError(f"SEC company ticker entry {key!r} lacks identity fields")
+        try:
+            cik = int(cik_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"SEC company ticker entry {key!r} has an invalid CIK"
+            ) from exc
+        if cik <= 0:
+            raise ValueError(f"SEC company ticker entry {key!r} has an invalid CIK")
+        identity = (ticker, cik, title)
+        if identity in seen:
+            raise ValueError(f"SEC company ticker response duplicates {ticker}/{cik}")
+        seen.add(identity)
+        rows.append({"ticker": ticker, "title": title, "cik": cik})
+    return sorted(rows, key=lambda row: (row["ticker"], row["cik"], row["title"]))
 
 
 def fetch_submissions(
@@ -143,6 +240,7 @@ def fetch_submissions(
     *,
     store: Store | None = None,
     ingest_run_id: str | None = None,
+    project_root: Path | None = None,
 ) -> dict[str, Any]:
     """Fetch the submissions index (filings list + metadata) for a CIK."""
     url = SUBMISSIONS_URL.format(cik=_cik_zero_padded(cik))
@@ -153,7 +251,8 @@ def fetch_submissions(
             ingest_run_id,
             dataset="submissions",
             role="submissions",
-            parser_version="sec-submissions-v1",
+            parser_version=SUBMISSIONS_CAPTURE_PARSER_VERSION,
+            project_root=project_root,
         ),
     )
 
@@ -184,6 +283,7 @@ def fetch_facts(
     *,
     store: Store | None = None,
     ingest_run_id: str | None = None,
+    project_root: Path | None = None,
 ) -> dict[str, Any]:
     """Fetch the full XBRL Company Facts blob for a CIK."""
     url = FACTS_URL.format(cik=_cik_zero_padded(cik))
@@ -194,7 +294,8 @@ def fetch_facts(
             ingest_run_id,
             dataset="companyfacts",
             role="companyfacts",
-            parser_version="sec-companyfacts-v1",
+            parser_version=COMPANYFACTS_CAPTURE_PARSER_VERSION,
+            project_root=project_root,
         ),
     )
 
@@ -218,6 +319,7 @@ def _sec_snapshot(
     dataset: str,
     role: str,
     parser_version: str,
+    project_root: Path | None = None,
 ) -> RawSnapshotContext | None:
     if store is None:
         return None
@@ -230,6 +332,7 @@ def _sec_snapshot(
         adapter_name="aios-sec-http",
         adapter_version="1",
         parser_version=parser_version,
+        project_root=project_root,
     )
 
 
@@ -320,6 +423,75 @@ def _validate_companyfacts_payload(payload: Any, cik: int) -> dict[str, Any]:
     if not isinstance(payload.get("facts"), dict):
         raise ValueError("Company Facts payload has no facts object")
     return dict(payload)
+
+
+def _validate_submissions_payload(payload: Any, cik: int) -> dict[str, Any]:
+    """Reject malformed or cross-issuer SEC Submissions metadata."""
+    if not isinstance(payload, dict):
+        raise ValueError("SEC Submissions payload is not an object")
+    try:
+        payload_cik = int(payload["cik"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("SEC Submissions payload has no valid CIK") from exc
+    if payload_cik != cik:
+        raise ValueError(
+            f"SEC Submissions payload CIK {payload_cik:010d} does not match "
+            f"reviewed CIK {cik:010d}"
+        )
+    exchanges = payload.get("exchanges")
+    if exchanges is not None and not isinstance(exchanges, list):
+        raise ValueError("SEC Submissions exchanges field is not a list")
+    return dict(payload)
+
+
+def _decode_json_object(payload: bytes, label: str) -> dict[str, Any]:
+    """Decode one archived JSON response without accepting scalar roots."""
+    try:
+        decoded = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"{label} response is invalid JSON") from exc
+    if not isinstance(decoded, dict):
+        raise ValueError(f"{label} response is not an object")
+    return decoded
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _submissions_provider_rows(
+    payload: Any,
+    cik: int,
+) -> list[dict[str, Any]]:
+    """Return the canonical provider metadata consumed by issuer ingestion."""
+    submissions = _validate_submissions_payload(payload, cik)
+    exchanges = [
+        normalized
+        for value in submissions.get("exchanges") or []
+        if (normalized := _optional_text(value)) is not None
+    ]
+    return [
+        {
+            "cik": _cik_zero_padded(cik),
+            "name": _optional_text(submissions.get("name")),
+            "sic": _optional_text(submissions.get("sic")),
+            "sic_description": _optional_text(submissions.get("sicDescription")),
+            "exchanges": exchanges,
+        }
+    ]
+
+
+def parse_sec_submissions_response(payload: bytes) -> list[dict[str, Any]]:
+    """Replay the reviewed canonical rows from exact SEC Submissions bytes."""
+    decoded = _decode_json_object(payload, "SEC Submissions")
+    try:
+        cik = int(decoded["cik"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("SEC Submissions payload has no valid CIK") from exc
+    return _submissions_provider_rows(decoded, cik)
 
 
 def _filing_dates_by_period(submissions: dict[str, Any]) -> dict[str, date]:
@@ -472,6 +644,84 @@ def _single_period_value(raw_rows: list[dict[str, Any]]) -> dict[int, float | No
     return out
 
 
+def _companyfacts_provider_rows(
+    payload: Any,
+    cik: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Parse the identity-neutral, PIT-safe rows consumed from Company Facts."""
+    facts = _validate_companyfacts_payload(payload, cik)
+    us_gaap = facts.get("facts", {}).get("us-gaap", {})
+    if not isinstance(us_gaap, dict):
+        raise ValueError("Company Facts us-gaap namespace is not an object")
+    rows: list[dict[str, Any]] = []
+    rejected_future_periods = 0
+
+    for metric, concepts in METRIC_CONCEPTS.items():
+        _concept, raw_rows = _merge_concepts(us_gaap, concepts)
+        if not raw_rows:
+            continue
+
+        qmap: dict[int, float | None] = {}
+        if metric in FLOW_METRICS:
+            qmap = _single_period_value(raw_rows)
+
+        for raw_row in raw_rows:
+            end = raw_row.get("end")
+            value = raw_row.get("val")
+            filed = raw_row.get("filed")
+            fiscal_period_code = raw_row.get("fp")
+            fiscal_year = raw_row.get("fy")
+            if value is None or end is None or filed is None:
+                continue
+
+            period_end = date.fromisoformat(end)
+            as_of = date.fromisoformat(filed)
+            if period_end > as_of:
+                rejected_future_periods += 1
+                continue
+
+            if fiscal_period_code == "FY" and fiscal_year:
+                fiscal_period = f"FY{fiscal_year}"
+            elif fiscal_period_code and fiscal_year:
+                fiscal_period = f"{fiscal_period_code}_{fiscal_year}"
+            elif fiscal_period_code:
+                fiscal_period = fiscal_period_code
+            else:
+                fiscal_period = "INST"
+
+            quarter_value = qmap.get(id(raw_row))
+            if quarter_value is None and metric not in FLOW_METRICS:
+                quarter_value = float(value)
+
+            rows.append(
+                {
+                    "cik": _cik_zero_padded(cik),
+                    "period_end": period_end.isoformat(),
+                    "as_of_date": as_of.isoformat(),
+                    "fiscal_period": fiscal_period,
+                    "statement": _statement_for(metric),
+                    "metric": metric,
+                    "value": float(value),
+                    "quarter_value": quarter_value,
+                    "unit": raw_row.get("unit", "USD"),
+                    "source": "edgar",
+                }
+            )
+
+    return rows, rejected_future_periods
+
+
+def parse_sec_companyfacts_response(payload: bytes) -> list[dict[str, Any]]:
+    """Replay canonical fundamentals from exact SEC Company Facts bytes."""
+    decoded = _decode_json_object(payload, "SEC Company Facts")
+    try:
+        cik = int(decoded["cik"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Company Facts payload has no valid CIK") from exc
+    rows, _rejected_future_periods = _companyfacts_provider_rows(decoded, cik)
+    return rows
+
+
 def extract_fundamentals(
     ticker: str,
     cik: int,
@@ -481,6 +731,7 @@ def extract_fundamentals(
     facts_payload: dict[str, Any] | None = None,
     snapshot_store: Store | None = None,
     ingest_run_id: str | None = None,
+    snapshot_project_root: Path | None = None,
 ) -> tuple[list[dict], dict[str, Any]]:
     """Full extract: return a list of fundamental row dicts (PIT-tagged).
 
@@ -497,96 +748,83 @@ def extract_fundamentals(
                     shortest-span row within a filing for a given period-end;
                     instant/EPS metrics: equals value).
     """
+    fetched_facts = facts_payload is None
     facts = _validate_companyfacts_payload(
         (
             fetch_facts(
                 cik,
                 store=snapshot_store,
                 ingest_run_id=ingest_run_id,
+                project_root=snapshot_project_root,
             )
-            if facts_payload is None
+            if fetched_facts
             else facts_payload
         ),
         cik,
     )
-    us_gaap = facts.get("facts", {}).get("us-gaap", {})
-    rows: list[dict] = []
-    rejected_future_periods = 0
+    provider_rows, rejected_future_periods = _companyfacts_provider_rows(facts, cik)
+    if fetched_facts and snapshot_store is not None and ingest_run_id is not None:
+        from aios.raw_snapshots import attach_parsed_rows_evidence
 
-    # Fetch submissions for company metadata (name, SIC, exchange) — cached so
-    # the single-filing-date path doesn't refetch. Stash on facts for _extract_company_meta.
+        attach_parsed_rows_evidence(
+            store=snapshot_store,
+            ingest_run_id=ingest_run_id,
+            role="companyfacts",
+            capture_parser_version=COMPANYFACTS_CAPTURE_PARSER_VERSION,
+            parser_version=COMPANYFACTS_PARSER_VERSION,
+            parsed_rows=provider_rows,
+        )
+
+    # Fetch Submissions for company metadata and attach its independently
+    # replayable canonical row only after the identity validation succeeds.
+    submissions_rows: list[dict[str, Any]] | None = None
     try:
         submissions = fetch_submissions(
             cik,
             store=snapshot_store,
             ingest_run_id=ingest_run_id,
+            project_root=snapshot_project_root,
         )
-        facts["_meta"] = {
-            "name": submissions.get("name"),
-            "sic": submissions.get("sic"),
-            "sicDescription": submissions.get("sicDescription"),
-            "exchanges": submissions.get("exchanges"),
-        }
-    except Exception as e:
-        log.warning("edgar.submissions_fetch_failed", ticker=ticker, error=str(e))
+        submissions_rows = _submissions_provider_rows(submissions, cik)
+    except Exception as exc:
+        log.warning("edgar.submissions_fetch_failed", ticker=ticker, error=str(exc))
+    else:
+        if snapshot_store is not None and ingest_run_id is not None:
+            from aios.raw_snapshots import attach_parsed_rows_evidence
 
-    for metric, concepts in METRIC_CONCEPTS.items():
-        _concept, raw_rows = _merge_concepts(us_gaap, concepts)
-        if not raw_rows:
-            continue
-
-        # Map each raw row → its single-period value (flow metrics only).
-        qmap: dict[int, float | None] = {}
-        if metric in FLOW_METRICS:
-            qmap = _single_period_value(raw_rows)
-
-        for r in raw_rows:
-            end = r.get("end")
-            val = r.get("val")
-            filed = r.get("filed")  # per-row filing date — THE pit key
-            fp = r.get("fp")  # 'FY','Q1'... or None for instant concepts
-            fy = r.get("fy")
-
-            if val is None or end is None or filed is None:
-                continue
-
-            period_end = date.fromisoformat(end)
-            as_of = date.fromisoformat(filed)
-            if period_end > as_of:
-                rejected_future_periods += 1
-                continue
-
-            # Fiscal period label.
-            if fp == "FY" and fy:
-                fiscal_period = f"FY{fy}"
-            elif fp and fy:
-                fiscal_period = f"{fp}_{fy}"
-            elif fp:
-                fiscal_period = fp
-            else:
-                fiscal_period = "INST"
-
-            # quarter_value: span-selected for flows, equals value for instant/EPS.
-            quarter_value = qmap.get(id(r))
-            if quarter_value is None and metric not in FLOW_METRICS:
-                quarter_value = float(val)
-
-            rows.append(
-                {
-                    "ticker": ticker,
-                    "issuer_id": issuer_id,
-                    "security_id": security_id,
-                    "period_end": period_end.isoformat(),
-                    "as_of_date": as_of.isoformat(),
-                    "fiscal_period": fiscal_period,
-                    "statement": _statement_for(metric),
-                    "metric": metric,
-                    "value": float(val),
-                    "quarter_value": quarter_value,
-                    "unit": r.get("unit", "USD"),
-                    "source": "edgar",
-                }
+            attach_parsed_rows_evidence(
+                store=snapshot_store,
+                ingest_run_id=ingest_run_id,
+                role="submissions",
+                capture_parser_version=SUBMISSIONS_CAPTURE_PARSER_VERSION,
+                parser_version=SUBMISSIONS_PARSER_VERSION,
+                parsed_rows=submissions_rows,
             )
+        submissions_meta = submissions_rows[0]
+        facts["_meta"] = {
+            "name": submissions_meta["name"],
+            "sic": submissions_meta["sic"],
+            "sicDescription": submissions_meta["sic_description"],
+            "exchanges": submissions_meta["exchanges"],
+        }
+
+    rows: list[dict] = [
+        {
+            "ticker": ticker,
+            "issuer_id": issuer_id,
+            "security_id": security_id,
+            "period_end": row["period_end"],
+            "as_of_date": row["as_of_date"],
+            "fiscal_period": row["fiscal_period"],
+            "statement": row["statement"],
+            "metric": row["metric"],
+            "value": row["value"],
+            "quarter_value": row["quarter_value"],
+            "unit": row["unit"],
+            "source": row["source"],
+        }
+        for row in provider_rows
+    ]
 
     meta = _extract_company_meta(facts, ticker)
     meta["rows_rejected_future_period"] = rejected_future_periods

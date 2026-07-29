@@ -37,6 +37,19 @@ class RestoreResult:
     files: int
 
 
+@dataclass(frozen=True)
+class RestoreDrillResult:
+    """Evidence that a backup restored and validated outside the live project."""
+
+    source: Path
+    files: int
+    bytes: int
+    manifest_sha256: str
+    raw_payloads: int
+    replayed_snapshots: int
+    hard_failures: int
+
+
 def create_local_backup(
     project_root: Path,
     database_path: Path,
@@ -322,6 +335,76 @@ def restore_local_backup(
         safety_backup=safety.path,
         files=source_result.files,
     )
+
+
+def drill_local_backup(
+    backup: Path,
+    *,
+    application_version: str,
+    scratch_parent: Path | None = None,
+) -> RestoreDrillResult:
+    """Exercise the real restore path in an isolated disposable project.
+
+    The live database, paper state, incident ledger, and raw directory are
+    never opened for writing. The drill verifies the source manifest, performs
+    the confirmed restore (including its safety-backup branch), opens the
+    restored DuckDB, runs every hard data-quality check, and replays all
+    immutable provider evidence before deleting the scratch project.
+    """
+    source = verify_local_backup(backup)
+    manifest = json.loads((source.path / "manifest.json").read_text(encoding="utf-8"))
+    database_relative = _safe_relative_path(manifest["database_file"])
+    parent = Path(scratch_parent).resolve() if scratch_parent is not None else None
+    if parent is not None and (parent.is_symlink() or not parent.is_dir()):
+        raise ValueError(f"restore drill parent is unsafe: {parent}")
+
+    with tempfile.TemporaryDirectory(
+        prefix="aios-restore-drill-",
+        dir=str(parent) if parent is not None else None,
+    ) as temporary:
+        scratch = Path(temporary).resolve()
+        database_target = scratch / "data" / database_relative.name
+        database_target.parent.mkdir(parents=True, exist_ok=True)
+        # Seed only the analytical database so the actual restore function can
+        # exercise its mandatory pre-restore safety-backup path.
+        shutil.copy2(source.path / database_relative, database_target)
+        restore_local_backup(
+            source.path,
+            scratch,
+            Path("data") / database_relative.name,
+            application_version=application_version,
+            confirm=True,
+        )
+
+        from aios.raw_snapshots import verify_raw_snapshots
+        from aios.storage.store import Store
+
+        store = Store(database_target, read_only=True)
+        try:
+            hard_failures = [
+                row for row in store.data_quality_report() if row["status"] == "fail"
+            ]
+            raw = verify_raw_snapshots(
+                store=store,
+                project_root=scratch,
+            )
+        finally:
+            store.close()
+        if hard_failures:
+            names = ", ".join(str(row["check"]) for row in hard_failures[:5])
+            raise ValueError(
+                f"restored database has {len(hard_failures)} hard validation "
+                f"failure(s): {names}"
+            )
+        return RestoreDrillResult(
+            source=source.path,
+            files=source.files,
+            bytes=source.bytes,
+            manifest_sha256=source.manifest_sha256,
+            raw_payloads=raw.payloads,
+            replayed_snapshots=raw.replayed_snapshots,
+            hard_failures=0,
+        )
 
 
 def _resolve_under_root(project_root: Path, path: Path) -> Path:

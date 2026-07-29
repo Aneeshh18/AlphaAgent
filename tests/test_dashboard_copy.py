@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -27,7 +28,16 @@ from aios.dashboard_copy import (
 
 def test_dashboard_includes_plain_language_paper_monitor() -> None:
     assert VIEW_PAPER in VIEW_OPTIONS
-    assert "Portfolio Monitor" in VIEW_PAPER
+    assert VIEW_PAPER == "Paper Trial"
+
+
+def test_dashboard_routes_pending_proposals_through_read_only_review() -> None:
+    dashboard = Path("src/aios/dashboard.py").read_text(encoding="utf-8")
+
+    assert "registered_in_forward" in dashboard
+    assert "aios paper-review --proposal" in dashboard
+    assert "aios paper-execute --proposal" not in dashboard
+    assert '{"expired", "invalid"}' in dashboard
 
 
 def test_dashboard_has_a_separate_system_control_workspace() -> None:
@@ -36,7 +46,7 @@ def test_dashboard_has_a_separate_system_control_workspace() -> None:
 
 
 def test_dashboard_opens_on_clean_operating_overview() -> None:
-    assert VIEW_OPTIONS[0] == VIEW_HOME == "Overview"
+    assert VIEW_OPTIONS[0] == VIEW_HOME == "Today"
     assert all(not label.startswith(("📈", "🔎", "🧪", "📖")) for label in VIEW_OPTIONS)
 
 
@@ -63,9 +73,10 @@ def test_dashboard_readiness_uses_latest_certified_decision_close() -> None:
     dashboard = Path("src/aios/dashboard.py").read_text(encoding="utf-8")
 
     assert "decision_date = latest_paper_decision_date(store)" in dashboard
-    assert "assess_us_readiness(decision_date, purpose=\"paper\", store=store)" in dashboard
+    assert 'assess_us_readiness(decision_date, purpose="paper", store=store)' in dashboard
     assert "Certified decision close" in dashboard
-    assert "found no change through" in dashboard
+    assert '"Membership evidence"' in dashboard
+    assert "latest_universe_attestation['requested_coverage_through']" in dashboard
 
 
 def test_dashboard_releases_duckdb_between_cached_reads() -> None:
@@ -112,28 +123,141 @@ def test_dashboard_separates_safe_certification_from_raw_source_freshness() -> N
 def test_dashboard_overview_is_source_backed_and_not_presented_as_live_trading() -> None:
     dashboard = Path("src/aios/dashboard.py").read_text(encoding="utf-8")
 
-    assert "Executive Research Dashboard" in dashboard
-    assert "Proposed Research Basket" in dashboard
-    assert "Proposal composition only" in dashboard
-    assert "Company Filings (PIT)" in dashboard
-    assert "Simulation only" in dashboard
+    assert "AIOS Home" in dashboard
+    assert "Investment Command Center" in dashboard
+    assert "Research readiness" in dashboard
+    assert "Paper-trial progress" in dashboard
+    assert "Current proposal targets" in dashboard
+    assert "Open incidents" in dashboard
+    assert "Simulation only · No broker" in dashboard
+    assert "build_home_view_model(report, monitor, operations)" in dashboard
+    assert "load_operating_summary()" in dashboard
 
 
-def test_dashboard_uses_dark_institutional_theme() -> None:
+def test_dashboard_home_uses_progressive_disclosure_and_one_safe_action() -> None:
+    dashboard = Path("src/aios/dashboard.py").read_text(encoding="utf-8")
+    components = Path("src/aios/dashboard_components.py").read_text(encoding="utf-8")
+
+    assert 'label="Priority action"' in dashboard
+    assert "render_action_notice(" in dashboard
+    assert 'key=f"{key}_cta"' in components
+    assert 'type="primary"' in components
+    assert 'with st.expander(f"View proposal targets' not in dashboard
+    assert 'with st.expander("View data health' not in dashboard
+    assert "paper-execute --proposal" not in dashboard
+
+
+def test_dashboard_research_renders_only_the_selected_surface() -> None:
+    dashboard = Path("src/aios/dashboard.py").read_text(encoding="utf-8")
+
+    assert "def _research_surface_selector()" in dashboard
+    assert "st.segmented_control(" in dashboard
+    assert "default=None" in dashboard
+    assert 'key="surface"' in dashboard
+    assert 'research_surface == "Opportunity Map"' in dashboard
+    assert 'research_surface == "Data Coverage"' in dashboard
+    assert "st.tabs(" not in dashboard
+    assert "show_market_factors=use_qvml" in dashboard
+    assert "if show_market_factors:" in dashboard
+
+
+def test_dashboard_preserves_debuggable_workspace_state_in_the_url() -> None:
+    dashboard = Path("src/aios/dashboard.py").read_text(encoding="utf-8")
+
+    assert "st.query_params" in dashboard
+    assert "def _hydrate_widget_from_url(" in dashboard
+    assert "def _persist_widget_query(" in dashboard
+    assert 'requested_view_slug = raw_view if raw_view in _VIEWS_BY_SLUG else "today"' in dashboard
+    assert 'st.query_params["view"] = view_slug' in dashboard
+    for key in ("date", "model", "surface", "company"):
+        assert f'_hydrate_widget_from_url("{key}"' in dashboard
+        assert f'_persist_widget_query("{key}"' in dashboard
+    assert '_hydrate_widget_from_url("q"' in dashboard
+    assert '_persist_widget_query("q"' in dashboard
+    assert "_aios_url_seen_" in dashboard
+
+
+def test_dashboard_uses_warm_institutional_theme_with_light_navigation() -> None:
     config = Path(".streamlit/config.toml").read_text(encoding="utf-8")
 
-    assert 'base = "dark"' in config
-    assert 'backgroundColor = "#07111F"' in config
-    assert 'primaryColor = "#2DD4BF"' in config
+    assert 'base = "light"' in config
+    assert 'backgroundColor = "#FAF9F5"' in config
+    assert 'primaryColor = "#A84F30"' in config
+    assert "baseFontSize = 17" in config
+    assert "[theme.sidebar]" in config
+    assert 'backgroundColor = "#F5F4ED"' in config
+    assert 'borderColor = "#D9D6CC"' in config
+
+
+def test_dashboard_visual_system_keeps_columns_symmetric_and_status_colors_semantic() -> None:
+    dashboard = Path("src/aios/dashboard.py").read_text(encoding="utf-8")
+    components = Path("src/aios/dashboard_components.py").read_text(encoding="utf-8")
+    stylesheet = Path("src/aios/dashboard.css").read_text(encoding="utf-8")
+
+    assert "@media (max-width: 1280px)" not in dashboard
+    assert "apply_design_system()" in dashboard
+    assert 'Path(__file__).with_name("dashboard.css")' in components
+    assert "--aios-canvas: #faf9f5" in stylesheet
+    assert "--aios-clay: #c96442" in stylesheet
+    assert "--aios-success: #265b19" in stylesheet
+    assert "html {\n    font-size: 17px" in stylesheet
+    assert "linear-gradient(" not in stylesheet
+    assert "radial-gradient(" not in stylesheet
+    assert "transition: all" not in stylesheet
+
+
+def test_dashboard_visual_system_has_no_sub_14px_interface_text() -> None:
+    stylesheet = Path("src/aios/dashboard.css").read_text(encoding="utf-8")
+    rem_sizes = [float(value) for value in re.findall(r"font-size:\s*([0-9.]+)rem", stylesheet)]
+    pixel_sizes = [float(value) for value in re.findall(r"font-size:\s*([0-9.]+)px", stylesheet)]
+
+    # The mobile root is 16px, so 0.875rem is exactly 14px.
+    assert rem_sizes and min(rem_sizes) >= 0.875
+    assert not pixel_sizes or min(pixel_sizes) >= 14
+
+
+def test_dashboard_hides_stale_workspace_content_while_new_results_load() -> None:
+    dashboard = Path("src/aios/dashboard.py").read_text(encoding="utf-8")
+    stylesheet = Path("src/aios/dashboard.css").read_text(encoding="utf-8")
+
+    assert 'key="overview_workspace"' in dashboard
+    assert '[data-stale="true"]' in stylesheet
+    assert "visibility: hidden !important" in stylesheet
+    assert "pointer-events: none !important" in stylesheet
+    assert '[data-testid="stStatusWidget"]' in stylesheet
+
+
+def test_dashboard_overview_uses_independent_vertical_panel_stacks() -> None:
+    dashboard = Path("src/aios/dashboard.py").read_text(encoding="utf-8")
+    stylesheet = Path("src/aios/dashboard.css").read_text(encoding="utf-8")
+
+    assert 'key="home_layout"' in dashboard
+    assert "target_col, incident_col = st.columns" not in dashboard
+    assert ".st-key-home_paper .aios-step-copy > p" in stylesheet
+    assert "Recorded simulations" not in dashboard
+
+
+def test_dashboard_dependency_matches_the_tested_streamlit_contract() -> None:
+    pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
+
+    assert '"streamlit>=1.58.0,<2.0"' in pyproject
 
 
 def test_system_control_reads_real_independent_incident_history() -> None:
     dashboard = Path("src/aios/dashboard.py").read_text(encoding="utf-8")
 
-    assert "incident_store = get_alert_store()" in dashboard
-    assert '"Unresolved incidents"' in dashboard
-    assert "System failures are written to an independent local incident ledger" in dashboard
+    assert "load_operations_evidence_read_only(operations_path)" in dashboard
+    assert "get_alert_store" not in dashboard
+    assert '"Open incidents"' in dashboard
+    assert 'state["incident_summary"] = operations["incident_summary"]' in dashboard
+    assert 'state["notification_summary"] = operations["notification_summary"]' in dashboard
+    assert "External email is off. Incidents are still saved locally" in dashboard
+    assert '"Email alerts"' in dashboard
+    assert "email_worker_enabled" in dashboard
+    assert "Incidents & alert delivery" in dashboard
     assert "aios alert-show INCIDENT_REF" in dashboard
+    assert "aios notification-show NOTIFICATION_REF" in dashboard
+    assert "sqlite3.Error" in dashboard
 
 
 def test_dashboard_model_labels_map_to_internal_keys() -> None:

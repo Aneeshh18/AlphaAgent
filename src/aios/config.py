@@ -10,8 +10,31 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, computed_field
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _looks_like_project_root(candidate: Path) -> bool:
+    return (candidate / "pyproject.toml").is_file() and (
+        (candidate / "src" / "aios").is_dir() or (candidate / "data").is_dir()
+    )
+
+
+def _discover_project_root() -> Path:
+    """Find a checkout root without binding an installed wheel to site-packages."""
+    working_directory = Path.cwd().resolve()
+    for candidate in (working_directory, *working_directory.parents):
+        if _looks_like_project_root(candidate):
+            return candidate
+
+    source_checkout = Path(__file__).resolve().parents[2]
+    if _looks_like_project_root(source_checkout):
+        return source_checkout
+
+    raise ValueError(
+        "AIOS project root could not be discovered; run from the AIOS workspace "
+        "or set AIOS_PROJECT_ROOT to its existing directory"
+    )
 
 
 class Settings(BaseSettings):
@@ -40,7 +63,23 @@ class Settings(BaseSettings):
     anthropic_api_key: str = Field(default="")
     zai_api_key: str = Field(default="")
 
+    # --- External email alerts (optional; disabled until explicitly activated) ---
+    smtp_host: str = Field(default="")
+    # Keep optional email numerics as raw strings so a typo cannot break core
+    # research/health commands; the email boundary validates them on use.
+    smtp_port: str = Field(default="587")
+    smtp_security: str = Field(default="starttls")
+    smtp_username: str = Field(default="")
+    smtp_password: SecretStr = Field(default=SecretStr(""))
+    alert_email_from: str = Field(default="")
+    alert_email_to: str = Field(default="")
+    smtp_timeout_seconds: str = Field(default="15")
+
     # --- Paths ---
+    project_root: Path = Field(
+        default_factory=_discover_project_root,
+        validation_alias="AIOS_PROJECT_ROOT",
+    )
     duckdb_path: Path = Field(default=Path("data/aios.duckdb"))
     operations_db_path: Path = Field(default=Path("data/operations/alerts.sqlite3"))
     raw_data_dir: Path = Field(default=Path("data/raw"))
@@ -59,12 +98,16 @@ class Settings(BaseSettings):
         description="Bounded wait when another local AIOS process briefly owns DuckDB.",
     )
 
-    @computed_field  # type: ignore[prop-defined]
-    @property
-    def project_root(self) -> Path:
-        """Resolve project root as the parent of the `src/` directory."""
-        # This file lives at src/aios/config.py → root is two parents up.
-        return Path(__file__).resolve().parents[2]
+    @field_validator("project_root")
+    @classmethod
+    def _resolve_project_root(cls, value: Path) -> Path:
+        root = Path(value).expanduser()
+        if not root.is_absolute():
+            root = Path.cwd() / root
+        root = root.resolve()
+        if not root.is_dir():
+            raise ValueError(f"AIOS_PROJECT_ROOT is not an existing directory: {root}")
+        return root
 
     def ensure_dirs(self) -> None:
         """Create data/log directories if missing. Call at startup."""

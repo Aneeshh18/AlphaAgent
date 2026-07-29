@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from subprocess import CompletedProcess
 
 from typer.testing import CliRunner
@@ -25,6 +26,7 @@ def test_dashboard_command_wraps_streamlit_for_local_or_deployed_use(monkeypatch
     assert result.exit_code == 0
     command = captured["command"]
     assert command[:4] == [cli.sys.executable, "-m", "streamlit", "run"]
+    assert command[4] == str(Path(cli.__file__).resolve().with_name("dashboard.py"))
     assert command[command.index("--server.address") + 1] == "0.0.0.0"
     assert command[command.index("--server.port") + 1] == "9000"
     assert command[command.index("--server.headless") + 1] == "true"

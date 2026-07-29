@@ -50,7 +50,10 @@ user-token Tiingo for explicitly reviewed symbols; Stooq (no-key CSV download)
 as the final fallback.
 **Why:**
 - `yfinance` is free, keyless, covers US + international, gives adjusted OHLCV + dividends + splits. It is the de-facto free choice. Its only weakness is reliability (unofficial scraping endpoint) — which is why we *must* have a fallback.
-- **Stooq** offers free, no-API-key, downloadable CSV historical data — a genuine independent fallback when yfinance fails. Coverage skews US/Europe.
+- **Stooq** offers free, no-API-key CSV history and remains a possible
+  independent fallback. Its downloader currently returns a JavaScript
+  verification page in this environment, so the adapter validates content and
+  fails closed; no HTML response can become a successful price ingest.
 - **Tiingo** is provider-neutral optional plumbing, not an active dependency.
   Its token is sent in an authorization header. A symbol is usable only after
   the same bounded identity review as Yahoo/Stooq. A locally configured token
@@ -68,9 +71,11 @@ as the final fallback.
 - FRED aggregates CPI, PCE, GDP, unemployment, Fed Funds rate, all Treasury yields, yield-curve spreads, credit spreads, money supply, etc. — one free API key, one consistent interface, decades of history.
 - `fredapi` Python library makes it trivial.
 - Fallbacks: US Treasury daily yield curve (free CSV, no key), BLS public API (free, key-recommended) for employment/inflation detail.
-- Operational note (2026-07-16): Treasury's automated CSV currently returns
-  HTTP 403 in this environment. FRED yield histories are complete; replacing
-  or repairing that fallback remains follow-up work, not a PIT blocker.
+- Operational proof (2026-07-25): the official year-bounded Treasury CSV
+  succeeds in this environment. Its exact bytes are retained before parsing,
+  its Date/2 Yr/10 Yr/30 Yr schema and yields are strictly validated, and 423
+  rows through 2026-07-24 replay from the stored response. The latest common
+  DGS2/DGS10/DGS30 observation exactly matched FRED.
 **Cost:** $0.
 **Keys needed:** Free FRED API key (one signup, takes 2 minutes).
 
@@ -78,7 +83,10 @@ as the final fallback.
 **Decision:** The LLM is used *only* as the synthesis/reporting layer. It never makes the numeric decision. Claude primary, GLM-5.2 fallback.
 **Why:**
 - This corrects the single biggest flaw in the original prompt: the LLM cannot run Monte Carlo, compute VaR, rank 8000 stocks by factor score, or maintain state across sessions. Those are deterministic Python jobs.
-- The LLM's job is narrow and high-value: take a JSON packet of factor scores + fundamentals + macro regime + news → produce the human-readable research report, explain a recommendation, narrate a portfolio review. This is what LLMs are actually good at.
+- The LLM's job is narrow and high-value: take a JSON packet of factor scores +
+  fundamentals + macro regime + news, then produce a human-readable research
+  report, explain a deterministic model ranking, and narrate a portfolio review.
+  It does not create personal buy/sell recommendations.
 - **No multi-agent "committee" theater.** If we later run multiple "agents," they will be agents running *different computations* (factor agent = numeric model, valuation agent = DCF code, news agent = NLP), and the LLM synthesizes their *outputs*. Never personas sharing one model.
 - For the MVP/foundation phase (now), the LLM is not even wired in yet — we build the data pipeline first. The LLM slot is reserved but empty until the data layer is proven.
 **Cost:** $0 in this phase. Later: pay-per-token, controllable.
@@ -158,16 +166,107 @@ exact ticker-set equality, and reviewed CIK lineage, then extends all bounded
 reference domains atomically only on a no-change result. Real constituent
 changes remain a manual provenance gate.
 
+`aios preflight` is the canonical read-only operator contract. It resolves the
+active proposal from the checksum-protected forward-trial registry, selects the
+latest certified decision close, opens DuckDB read-only, and reads the
+operations ledger without initializing or migrating it. Its versioned,
+checksum-protected JSON keeps research, proposal creation, stress review, paper
+recording, unattended operations, and real-capital execution as independent
+capabilities and emits exactly one safe next action. The default uses the
+lightweight timing gate; `--review-paper` runs the full governed review but
+still stops at an explicit human decision and deliberately emits no
+state-changing command. Repeated `--require` options turn independent
+capabilities into a machine-readable exit gate. The Overview consumes the same
+pure action router.
+
+Every supported CLI command that can change backup-covered DuckDB, immutable
+raw-snapshot, paper-account, proposal, or forward-trial state acquires one
+non-blocking project maintenance lease before opening or changing that state.
+This includes backup/restore, paper/forward workflows, universe review,
+refresh, ingest, import, repair, and cleanup commands; contention fails visibly
+instead of allowing two supported mutations to overlap. Operations-only
+incident and notification mutations remain transactional in SQLite, whose
+online backup API captures a consistent snapshot. The lease is cooperative and
+does not serialize direct Python API calls or unrelated external writers. The
+active forward policy file remains frozen, so its remaining direct-library
+persistence boundary is not retrofitted mid-trial. A next policy version must
+add the final forward trial/proposal compare-and-set checks before this
+cooperative lock can be described as universal transaction safety.
+
+Caller-selected generated outputs pass a separate artifact boundary before
+work begins. Project-local artifacts must stay under `data/` while remaining
+outside DuckDB, operations, maintenance, raw, paper, and backup state; symlink
+ancestors and hard-linked mutable workspaces are refused. Readiness, refresh,
+coverage, backtest, universe, identity, and reference-batch files publish
+atomically without replacing an existing target. Paper proposals are the sole
+exception to the general paper-directory exclusion: they must stay under
+`data/paper/proposals`, and an explicit replacement first validates the
+existing document kind, paper account, and decision date. Direct library calls
+remain outside this CLI path policy.
+
+The incident-history, incident-detail, notification-history,
+notification-detail, and email-status commands apply the same fail-closed
+principle to SQLite. They require the current schema and a checkpointed ledger,
+then open it with `mode=ro`, `immutable=1`, and `query_only`. Inspection never
+runs schema DDL, changes journal mode, or updates the database merely to show
+status.
+
+Runtime root resolution is distribution-safe. A source or installed CLI first
+discovers the AIOS workspace from the current directory and its parents; an
+explicit existing `AIOS_PROJECT_ROOT` is required when launched elsewhere. It
+never treats the wheel or `site-packages` directory as the data root. The
+Streamlit launcher uses the dashboard module shipped beside the installed CLI
+while keeping its working directory and governed data paths at the resolved
+workspace.
+
+The local UI deliberately remains Streamlit. The 2026-07-28 product review used
+the [CopyUI component catalog](https://copyui.com/components) for component
+examples, the official Claude interface and reusable-design-system guidance,
+and the Carbon, Cloudscape, and Atlassian systems for institutional spacing,
+table, dashboard, and grid conventions. It did not copy a React/Tailwind
+runtime or add a frontend dependency. Native Streamlit theming
+defines a warm ivory canvas, flat white surfaces, a light navigation rail,
+near-black primary actions, a restrained clay identity accent, semantic status
+colors, eight-pixel radii, a 17px base type scale, and a bounded wide content
+grid. The token and component CSS lives in `aios/dashboard.css`; reusable
+Streamlit renderers live in `aios.dashboard_components` rather than being
+redeclared inside each page.
+
+The Overview answers three separate questions: whether research is usable,
+where the paper trial stands, and whether local operations need attention. One
+safe next action and one symmetric primary CTA follow those scoped states.
+Proposal targets, current readiness, paper progress, and open incidents remain
+visible; only raw commands, hashes, and long technical history use progressive
+disclosure. Global navigation contains Overview, Research, Paper Trial, and
+Operations, plus Methodology & Sources as a utility. Company Detail remains a
+deep-linkable contextual Research destination. Research date, model, and search
+controls are visible in the page toolbar. Paper Trial exposes a fixed Proposal
+→ Forward Trial → Timing Review → Local Record sequence without weakening its
+fail-closed rules. Pure presentation logic lives in `aios.dashboard_ui`, while
+every loader remains read-only and every numeric decision remains in the
+existing deterministic engine. Workspace, research date, model, research
+surface, company, and search selections are mirrored in URL query parameters
+with origin-aware synchronization, so widget changes and external same-session
+URL edits preserve exact debugging state. A separate web frontend is justified
+only after a versioned application API and a real need for multi-user
+authentication, roles, mobile-first workflows, or rich real-time interaction
+exist.
+The optional dashboard dependency declares the tested Streamlit
+`>=1.58,<2.0` runtime; stable widget keys and URL query parameters jointly
+preserve state across consecutive workspace and research-surface changes.
+
 Confirmed systemd-user installation adds one New-York-clocked recoverable daily
 timer after every U.S. weekday plus weekly filing and verified-backup timers.
+It installs, but does not enable, a separate optional SMTP worker timer.
 The daily service uses `Restart=on-failure`; its timer also runs an idempotent
 check three minutes after the user manager starts. Linux linger is explicitly
 enabled so the user manager remains active after desktop logout while the
 computer is on. Each job writes running/success/failed/interrupted lifecycle
 state to the permission-restricted SQLite operations ledger, not analytical
 DuckDB. A killed process therefore leaves durable evidence that the next startup
-can recover. Every managed service also has an `OnFailure=` handler plus a
-post-success recovery marker. Structured incidents and lifecycle events remain
+can recover. Core data and backup services have an `OnFailure=` handler plus a
+post-success recovery marker. The email worker deliberately has neither, because
+its own durable delivery state must not recursively create more email. Structured incidents and lifecycle events remain
 available even when DuckDB cannot be opened. The ledger
 stores bounded systemd result properties rather than raw journals or process
 environments. It is included as audit evidence in verified backups but is never
@@ -176,7 +275,13 @@ after the older backup. Generated units pass `systemd-analyze verify` and are
 not installed implicitly. The owner explicitly installed them on 2026-07-21; real manual
 first runs of backup and filings passed. The replacement daily workflow passed
 a live 503-member July 23 catch-up, exact-date readiness, and an immediate
-no-download startup run. Raw refresh may use the
+no-download startup run. On July 25, simultaneous persistent startup catch-up
+exposed that the unit exported `AIOS_DUCKDB_LOCK_WAIT_SECONDS` while the settings
+field actually reads `DUCKDB_LOCK_WAIT_SECONDS`. The corrected units use the
+real 300-second setting and serialize every scheduled writer and health check
+through a shared 30-minute `flock` queue. The reinstalled units passed native
+verification, a 503-member July 24 recovery, and a no-download systemd service
+run; failure incidents resolved through normal success hooks. Raw refresh may use the
 newest reviewed membership snapshot up to seven days old for collection while
 showing the exact snapshot date; readiness still refuses to treat it as a
 current membership decision. A reviewed issuer with no accepted Company Facts
@@ -185,19 +290,107 @@ a hard failure. The benchmark-first daily dependency chain ensures dated
 identity windows are available before the member-price refresh. Streamlit uses
 short-lived read-only Store scopes instead of a process-global writable
 connection, and managed writers have a bounded five-minute lock wait. This
-preserves DuckDB's single-writer constraint without requiring the dashboard to
-be closed for normal scheduled updates. Restore still requires the dashboard
-to be closed. EOD adapters cap accepted rows at the latest completed New York
-session rather than the host's local date, preventing an India-after-midnight
-catch-up from accepting a still-open U.S. daily bar. Container/hosted packaging,
+secondary database wait protects brief reader overlap after scheduled writers
+have already queued, preserving DuckDB's single-writer constraint without
+requiring the dashboard to be closed for normal scheduled updates. Restore
+still requires the dashboard to be closed. `aios restore-drill` exercises the
+confirmed restore path inside a disposable project, opens and validates the
+recovered DuckDB, and replays every registered raw snapshot without changing
+the live database, paper state, operations ledger, or raw archive. The July 25
+drill passed against a non-empty 1,542-file backup. EOD adapters cap accepted
+rows at the latest completed New York session plus a conservative 30-minute
+free-provider finalization delay rather than the host's local date, preventing
+an India-after-midnight or just-after-close catch-up from accepting a partial
+U.S. daily bar. Container/hosted packaging,
 authentication, HTTPS,
-external alert delivery, multi-user storage, and India market adapters remain future exit
-conditions—not capabilities to assume today.
+live external-alert activation, multi-user storage, and India market adapters
+remain future exit conditions—not capabilities to assume today. The SMTP
+adapter exists, but no external-delivery claim is valid before a real receipt
+test and explicit route/timer activation.
+
+The operations ledger is schema v4. It contains a channel-neutral
+`notification_outbox` and append-only `notification_deliveries` beside incident
+truth. An actionable incident transition and its message copy commit in one
+SQLite transaction, linked by the incident event ID; repeated observations
+without escalation do not create message noise. Claims use exclusive bounded
+five-minute leases, and delivery outcomes distinguish success, pre-send
+temporary failure, permanent failure, and ambiguous provider state. Only
+temporary failures known to occur before acceptance retry deterministically up
+to five attempts. A post-send disconnect or expired worker lease has an unknown
+outcome and becomes operator-visible immediately instead of risking a duplicate.
+Stored provider metadata is allow-listed and redacted rather than preserving
+arbitrary responses.
+
+External delivery remains fail-closed. Without an enabled route,
+incident-generated messages enter `held`, which no worker can claim. Every
+routable message records an immutable activation ID; claim, route alias,
+configuration fingerprint, dependency, and activation are checked in one
+transaction. Reconfiguration quarantines old pending messages instead of
+retargeting them. A recovery message directly depends on the delivered active
+message from the same incident cycle and activation. Historical migrations
+create no backlog, and a channel never releases old or already-recovered events.
+`aios notification-test` alone creates an eligible
+test message and dispatches it to a deterministic local receiver with no
+network access.
+
+The selected external adapter is one-recipient SMTP over STARTTLS or implicit
+TLS, with TLS 1.2 minimum, certificate/hostname verification, disabled TLS key
+logging, a 30-second maximum per-operation timeout, deterministic Message-ID,
+safe error classes, and no raw provider text or destination values in delivery
+history. SMTP secrets stay only in environment configuration. The optional
+worker exits before reading credentials or opening a network connection while
+the route is disabled. Live activation still requires local credentials, one
+exact-configuration test, owner-confirmed receipt, and explicit enablement.
+The 2026-07-27 live v3-to-v4 migration retained 11 incidents, 50 incident
+events, five job records, three outbox rows, and one local-test delivery with no
+configured route; SQLite integrity and foreign-key checks passed. The installed
+optional worker is disabled, while all three core timers remain enabled.
 
 `FUTURE_BUILD_PLAN.md` is the sequencing and acceptance companion to this
 architecture. It prioritizes immutable provider snapshots, external notification
-delivery on top of the implemented local incident ledger, and deterministic
-stress testing before India ingestion or any additional model complexity.
+delivery on top of the implemented local incident ledger, and the next
+governance milestones after the implemented Proposal Stress Review v1.
+
+### Reconstructable provider-evidence contract
+
+Transport evidence must say what it actually preserves. Direct HTTP adapters
+store the exact response bytes before parsing. A library adapter that does not
+expose those bytes may store only an explicitly labeled
+`normalized_provider_export`; it must never claim exact vendor reconstruction.
+Every normalized export needs a secret-free request fingerprint, adapter/parser
+version, ingest link, parsed-row count and hash, plus a deterministic replay
+parser that the raw verifier executes.
+
+Exact SEC issuer responses use a two-stage form of the same contract. The HTTP
+boundary first registers Company Facts or Submissions as a capture-only parser
+version, preserving bytes even when JSON, CIK, or row validation fails. After
+the downstream parser succeeds, one transaction locates exactly one
+run-and-role link, upgrades it to the reviewed replay parser version, and
+attaches the canonical row count and SHA-256. Repeating identical evidence is
+idempotent; missing, partial, multiply linked, or conflicting evidence fails.
+The verifier re-runs those parsers directly from the compressed exact bytes.
+
+Production yfinance price ingests now follow this weaker-but-honest contract:
+the canonical export preserves the library-returned OHLC, adjusted close,
+volume, dividends, splits, requested window, and completed-session boundary.
+The same reviewed parser both supplies live normalized rows and replays stored
+exports. The bounded live AAPL proof retained three rows and reproduced their
+parsed hash.
+
+FRED follows the normalized-export contract because `fredapi` also hides original response
+bytes. Its canonical export preserves the requested realtime window, selected
+vintage dates, observation dates, public release dates, values, and units. The
+first live incremental GDP proof replayed 318 rows exactly. The July 24
+full-universe recovery expanded coverage to 505 yfinance exports; the current
+archive also replays 23 FRED exports.
+
+Direct HTTP routes now apply the stronger exact-response contract to two SEC
+Company Facts responses, two SEC Submissions responses, the 10,429-row SEC
+company-ticker map, a four-session reviewed Tiingo sample, and 423 official
+Treasury yield-curve rows. The verifier checks 1,535 unique payloads and
+executes 535 parsed replays in total. These artifacts prove deterministic
+reconstruction of what was preserved; normalized exports do not claim to be
+original Yahoo or FRED HTTP bodies.
 
 ### Untouched forward-policy contract
 
@@ -220,6 +413,65 @@ vintages, and reviewed membership must continue to advance under their existing
 PIT/provenance contracts. A deliberate policy change starts a new trial rather
 than rewriting the old baseline.
 
+Paper execution also has a wall-clock provenance boundary. A proposal must be
+generated before the 9:30 a.m. New York open of its scheduled simulation
+session, preventing an operator from observing that session before deciding
+whether to participate. `paper-review` applies the same account checksum,
+forward registration, readiness, factor-evidence, risk, and price checks
+without persisting a fill. Confirmed simulation is allowed only after that
+session's conservative 4:00 p.m. close and before the next U.S. session opens.
+Missing prices wait; an expired window is never converted into a retrospective
+fill. The calendar remains conservative on early-close days: waiting until
+4:00 p.m. reduces availability but cannot introduce look-ahead. The wall clock
+is checked again after expensive evidence work and immediately before atomic
+replacement. A cross-process document lock plus checksum compare-and-swap
+prevents concurrent account/proposal writers from silently losing an update.
+Every paper-account mutation also holds a non-blocking per-account operating
+system file lock and rechecks the account checksum immediately before atomic
+replacement. A second writer fails visibly, and an out-of-band edit made while
+evidence is recomputed cannot be silently overwritten.
+
+### Governed proposal stress-review contract
+
+Stress review is an advisory read model over a registered paper proposal, not a
+new approval or execution gate. `aios stress-review` delegates to one production
+service shared with the Paper Trial dashboard panel. The service validates the
+active forward trial and proposal registration before opening DuckDB, opens
+DuckDB read-only, and binds the account, proposal, exact PIT security identity,
+action-safe price history, row-level liquidity window, release-aware revenue
+fact, scenario policy, and calculation sources by SHA-256. It then repeats the
+trial/account/proposal/scenario/source compare-and-swap identity closure before
+returning. The scenario bundle is reloaded after calculation and again at the
+final boundary, so a concurrent policy edit refuses the result instead of
+publishing an older in-memory policy. Default use writes nothing. An explicit
+`--output` uses a write-once, checksum-protected artifact and repeats the final
+closure immediately before publication and again afterward. If that last
+identity check detects drift, AIOS removes only the exact matching artifact it
+just created; if exact rollback cannot be proven, it fails with a quarantine
+instruction rather than deleting an ambiguous file.
+
+Scenario coefficients live in an immutable versioned policy bundle with
+per-assumption provenance and no probabilities. Deterministic mark shocks may
+produce modeled proposal-target values, proposal-portfolio drawdown, post-shock
+concentration, and exit-capacity comparisons. If a scenario's required evidence
+is missing or mismatched, its numerical result is withheld; independent
+calculations may remain visible only in a report explicitly marked partial. The
+volatility/correlation calculation is a separate statistical loss proxy with
+Euler risk contributions; those contributions must never be converted into
+invented position returns, stressed holdings, drawdown, concentration, or
+liquidation outcomes. Historical and supervisory labels calibrate magnitude
+only. In particular, the 2026 Federal Reserve severely adverse scenario supplies
+an [approximately 58% hypothetical equity-price
+decline](https://www.federalreserve.gov/publications/2026-stress-test-scenarios.htm),
+not a forecast. Generic sandbox-limit comparisons remain human-readable
+advisory findings and cannot approve, reject, alter, or execute a proposal.
+
+The dashboard renders this same governed result immediately below pending
+proposal targets. It does not create another Paper Trial stage and does not
+recast targets as current holdings. Recorded-holdings stress, multifactor and
+Monte Carlo risk models, and owner-authored scenarios remain separate future
+contracts.
+
 ### U.S. operational readiness and generic risk contract
 
 Raw recency and certified readiness are separate states. `aios readiness`
@@ -234,11 +486,15 @@ inside an older bounded window without claiming that it is current.
 universe. This prevents one newer SPY row from turning one missing universe edge
 into several misleading downstream 0/0 failures.
 
-As of 2026-07-24, the reviewed current decision close is 2026-07-23. It has 503
+As of the 2026-07-29 engineering check, the reviewed current decision close is
+2026-07-27. It has 503
 dated members and stable identities, 500/503 PIT filing coverage, 503/503
 identity-safe/action-safe price coverage, SPY through the same close, and macro
-releases through 2026-07-23. Current supervised paper readiness passes with zero
-hard database failures and three visible historical-audit warnings.
+releases through 2026-07-27. Research-data readiness passes with zero hard
+database failures and three visible historical-audit warnings. Active trial
+`us-qv-forward-72c4560a442d` has one registered proposal, zero executions, and
+intact forward-policy evidence; recording remains timing-gated and explicitly
+supervised.
 
 `aios.risk.policy` is a deterministic, jurisdiction-neutral pre-trade contract.
 It rejects malformed or duplicate targets, short/leverage exposure, too few or
@@ -335,9 +591,14 @@ only when the snapshot is PIT-ready for the same decision date. Otherwise it
 uses the baseline 60/40 weights and marks the result
 `macro_regime_pit_unavailable`. These starting tilts are policy hypotheses,
 not backtest-validated alpha. The release-aware refresh and audit completed on
-2026-07-16. Treasury's daily CSV does not expose a separate release timestamp, so its fallback rows use the
-observation date under the system's after-close/next-session decision
-convention.
+2026-07-16. Treasury's daily CSV does not expose a separate release timestamp,
+so its fallback rows use the observation date under the system's
+after-close/next-session decision convention. FRED observations normally
+receive a later vintage date. Macro selection therefore ranks the greatest
+public release date first and uses FRED precedence only when release dates tie;
+this lets the official Treasury close fill a current yield without backdating
+knowledge. A same-observation-date FRED/Treasury difference above five basis
+points is a visible data-quality warning.
 
 ### Historical universe and membership PIT contract
 
@@ -531,16 +792,19 @@ new CIKs without historical continuity, and thin provider histories fail closed
 and require an exception manifest.
 
 The provider fingerprint is a review-time drift detector, not a claim that a
-free provider is immutable or that adjusted-price vintages are archived. A
-later ingest may observe provider corrections; exact price-payload versioning
-remains separate future work and is required for fully reproducible vendor-data
-reconstruction. The immutable snapshot layer now retains exact SEC Company
-Facts/Submissions bytes with request/response timestamps, secret-free request
-fingerprints, content hashes, adapter/parser versions, and ingest-run links;
-the Treasury fallback uses the same opt-in HTTP boundary. Parsed-row replay,
-FRED-library capture, yfinance normalized exports, and remaining transports are
-still incomplete. A normalized provider export must always be labeled as such
-and must never be presented as the original vendor response.
+free provider never changes. A later ingest may observe provider corrections.
+The immutable snapshot layer retains exact SEC Company Facts, Submissions,
+company-ticker-map, Treasury and Tiingo bytes with request/response timestamps,
+secret-free request fingerprints, content hashes, adapter/parser versions, and
+ingest-run links. Reviewed parsers attach and replay canonical row hashes only
+after a successful identity-safe parse. yfinance and FRED normalized replay are
+also live and are never presented as original vendor HTTP bodies. Stooq's
+capture-before-parse path is tested to retain an HTML verification response as
+capture-only evidence during an ingest and never promote it.
+Historical GitHub/S&P reference captures created before replay parsers remain
+byte-verifiable but honestly labeled as non-replayable legacy evidence. Every
+future production adapter, including NSE transports, must add its own
+capture/replay contract before crossing the corresponding readiness gate.
 
 Large reviewed batches may optionally read fundamentals from a local official
 SEC `companyfacts.zip` via `ingest-reference-batch --companyfacts-zip`. The ZIP
@@ -582,6 +846,29 @@ returning:
   classification without changing their public APIs; and
 - a new factor call after an ingest creates a fresh scope, so revised filings
   become visible without manual cache invalidation.
+
+The interactive Research path adds a storage optimization underneath this
+unchanged factor contract. `DecisionScopedFactorStore` exposes the same scalar
+methods to `FactorDataCache`, but serves them from set-based Store reads for the
+requested universe:
+
+- fundamental history is batched separately for each requested decision date,
+  including the prior-year dates used by Quality;
+- latest prices and QVML price histories preserve dated security identity,
+  reviewed owner/provider gaps, source priority, and deterministic tie order;
+- every batch must return exactly the normalized requested ticker set before it
+  can be reused;
+- an exception or malformed result falls back to the existing scalar method;
+  ambiguity is never converted into empty evidence; and
+- the facade exists only inside one dashboard loader call and never persists a
+  score, filing, route, or price window.
+
+The active forward trial hashes `factors/common.py` and `factors/composite.py`.
+This optimization deliberately leaves both files unchanged: it changes how the
+interactive read-only Store contract is fulfilled, not the scoring policy.
+Fresh-process parity checks on the certified 2026-07-27 universe produced
+identical 503-row QV and QVML payloads. QV calculation time fell from 25.5 to
+2.9 seconds, and QVML from 28.5 to 3.4 seconds.
 
 The 2023-09-29 503-member profile dropped from 42,235 DuckDB queries and 174.1
 seconds to 3,874 queries and 17.4 seconds. The first optimized five-decision
@@ -794,10 +1081,11 @@ The implementation borrows contracts and ideas, not copied code:
 - No broker API integration or live trading. The local paper account changes
   only through an explicitly confirmed simulated next-session close.
 - No multi-agent committee. Numeric models only; LLM synthesizes.
-- The current UI is a local Streamlit research control room: readiness and
-  governed paper workflow first, followed by factor-universe, company, and
-  methodology drill-downs. It is read-only and does not place trades. A richer
-  multi-user web product remains out of scope.
+- The current UI is a local Streamlit research control room: `Overview`
+  separates research, paper-trial, and operating status before one next action;
+  `Research`, contextual `Company Detail`, `Paper Trial`, `Operations`, and
+  `Methodology & Sources` provide deliberate drill-downs. It is read-only and
+  does not place trades. A richer multi-user web product remains out of scope.
 - No paid data feeds in the active build. Norgate Platinum/Diamond is the first
   reviewed upgrade candidate for delisted prices and effective membership, but
   adoption requires explicit user authorization, a Windows pilot, and parity

@@ -16,12 +16,12 @@ from aios.market_calendar import (
     us_equity_sessions,
 )
 
-VIEW_OVERVIEW = "Overview"
-VIEW_STOCK_RANKINGS = "Research Explorer"
-VIEW_COMPANY_DETAILS = "Company Lens"
-VIEW_PAPER_MONITOR = "Portfolio Monitor"
-VIEW_SYSTEM_CONTROL = "System Control"
-VIEW_HOW_IT_WORKS = "Methodology & Data"
+VIEW_OVERVIEW = "Today"
+VIEW_STOCK_RANKINGS = "Research"
+VIEW_COMPANY_DETAILS = "Company Detail"
+VIEW_PAPER_MONITOR = "Paper Trial"
+VIEW_SYSTEM_CONTROL = "System Health"
+VIEW_HOW_IT_WORKS = "How It Works"
 VIEW_OPTIONS = (
     VIEW_OVERVIEW,
     VIEW_STOCK_RANKINGS,

@@ -191,8 +191,12 @@ def test_daily_cycle_recovers_interrupted_run_and_skips_only_after_prior_success
     assert skipped.member_count == 503
 
 
-def test_daily_cycle_cli_reports_exact_certified_session(monkeypatch) -> None:
+def test_daily_cycle_cli_reports_exact_certified_session(
+    monkeypatch,
+    tmp_path,
+) -> None:
     recovered: list[str] = []
+    monkeypatch.setattr(cli, "settings", SimpleNamespace(project_root=tmp_path))
     result = USDailyCycleResult(
         run_id="job-test",
         status="completed",

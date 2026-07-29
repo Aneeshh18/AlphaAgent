@@ -13,21 +13,24 @@ can rewrite both the payload and its checksum.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac
 import json
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from math import floor
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from aios.backtest.costs import TaxPolicy, TransactionCostPolicy
-from aios.backtest.portfolio import PortfolioBook
+from aios.backtest.portfolio import PortfolioBook, PortfolioPeriodResult
 from aios.factors.composite import compute_composite
 from aios.market_calendar import us_equity_sessions
 from aios.readiness import USReadinessPolicy, assess_us_readiness
@@ -44,6 +47,9 @@ DEFAULT_PROPOSAL_DIRECTORY = Path("data/paper/proposals")
 SIMULATION_MODE = "simulation_only"
 SECTOR_CLASSIFICATION = "SEC SIC division"
 _MINIMUM_LIQUIDITY_OBSERVATIONS = 20
+_NEW_YORK = ZoneInfo("America/New_York")
+_CONSERVATIVE_REGULAR_CLOSE = time(16, 0)
+_REGULAR_OPEN = time(9, 30)
 
 
 @dataclass(frozen=True)
@@ -54,6 +60,53 @@ class PaperDocument:
     kind: str
     payload: dict[str, Any]
     payload_sha256: str
+
+
+class PaperExecutionTimingError(ValueError):
+    """A valid proposal that is not currently inside its simulation window."""
+
+    def __init__(
+        self,
+        status: str,
+        detail: str,
+        *,
+        decision_date: date,
+        execution_date: date,
+        executable_after: datetime,
+        expires_at: datetime,
+    ) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
+        self.decision_date = decision_date
+        self.execution_date = execution_date
+        self.executable_after = executable_after
+        self.expires_at = expires_at
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ready": False,
+            "status": self.status,
+            "detail": self.detail,
+            "decision_date": self.decision_date.isoformat(),
+            "execution_date": self.execution_date.isoformat(),
+            "executable_after": _utc_timestamp(self.executable_after),
+            "expires_at": _utc_timestamp(self.expires_at),
+            "missing": [],
+            "missing_count": 0,
+        }
+
+
+@dataclass(frozen=True)
+class _PaperExecutionPreparation:
+    account: PaperDocument
+    proposal: PaperDocument
+    book: PortfolioBook
+    decision_date: date
+    entry_date: date
+    executable_after: datetime
+    expires_at: datetime
+    result: PortfolioPeriodResult
 
 
 def canonical_payload_sha256(payload: dict[str, Any]) -> str:
@@ -142,12 +195,15 @@ def initialize_paper_account(
             }
         ],
     }
-    return _write_paper_document(
-        destination,
-        kind=ACCOUNT_DOCUMENT_KIND,
-        payload=payload,
-        replace=False,
-    )
+    with _paper_account_write_lock(destination):
+        if destination.exists():
+            raise ValueError(f"paper account already exists: {destination}")
+        return _write_paper_document(
+            destination,
+            kind=ACCOUNT_DOCUMENT_KIND,
+            payload=payload,
+            replace=False,
+        )
 
 
 def default_proposal_path(project_root: Path, as_of: date) -> Path:
@@ -250,6 +306,7 @@ def create_paper_proposal(
     risk_policy: PortfolioRiskPolicy | None = None,
     replace: bool = False,
     now: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
     readiness_assessor: Callable[..., Any] = assess_us_readiness,
     composite_computer: Callable[..., Any] = compute_composite,
 ) -> PaperDocument:
@@ -271,9 +328,12 @@ def create_paper_proposal(
     if target_weight > rules.maximum_position_weight + 1e-12:
         raise ValueError("top_n would breach the single-position risk limit")
 
-    generated_at = _utc_timestamp(now)
-    readiness = readiness_assessor(as_of, purpose="paper", store=store)
     next_session = _next_us_session(as_of)
+    generation_deadline = _proposal_generation_deadline(next_session)
+    generated_moment = _current_moment(now, clock)
+    _require_prospective_generation(generated_moment, generation_deadline)
+    generated_at = _utc_timestamp(generated_moment)
+    readiness = readiness_assessor(as_of, purpose="paper", store=store)
     payload: dict[str, Any] = {
         "proposal_schema_version": PROPOSAL_SCHEMA_VERSION,
         "proposal_id": f"paper-{as_of.isoformat()}-{uuid4().hex[:12]}",
@@ -317,12 +377,25 @@ def create_paper_proposal(
             if evidence["risk_assessment"]["approved"]
             else "blocked_risk"
         )
-    return _write_paper_document(
-        Path(proposal_path),
-        kind=PROPOSAL_DOCUMENT_KIND,
-        payload=payload,
-        replace=replace,
-    )
+    completed_moment = _current_moment(now, clock)
+    _require_prospective_generation(completed_moment, generation_deadline)
+    payload["generated_at"] = _utc_timestamp(completed_moment)
+
+    def proposal_write_guard() -> None:
+        _require_prospective_generation(
+            _current_moment(now, clock),
+            generation_deadline,
+        )
+        _require_document_unchanged(account)
+
+    with _paper_document_write_lock(proposal_path):
+        return _write_paper_document(
+            Path(proposal_path),
+            kind=PROPOSAL_DOCUMENT_KIND,
+            payload=payload,
+            replace=replace,
+            before_replace=proposal_write_guard,
+        )
 
 
 def execute_paper_proposal(
@@ -332,59 +405,64 @@ def execute_paper_proposal(
     *,
     confirm_simulated: bool,
     now: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
     readiness_assessor: Callable[..., Any] = assess_us_readiness,
     composite_computer: Callable[..., Any] = compute_composite,
 ) -> dict[str, Any]:
     """Apply an approved proposal after its next-session close is available."""
     if not confirm_simulated:
         raise ValueError("explicit --confirm-simulated approval is required")
-    account = read_paper_document(account_path, expected_kind=ACCOUNT_DOCUMENT_KIND)
-    proposal = read_paper_document(proposal_path, expected_kind=PROPOSAL_DOCUMENT_KIND)
-    _validate_account_payload(account.payload)
-    _validate_proposal_payload(proposal.payload)
-    if proposal.payload["mode"] != SIMULATION_MODE or account.payload["mode"] != SIMULATION_MODE:
-        raise ValueError("only simulation-only paper documents are supported")
-    if proposal.payload["status"] != "approved_for_supervised_simulation":
-        raise ValueError(f"proposal is not approved: {proposal.payload['status']}")
-    if proposal.payload["account_id"] != account.payload["account_id"]:
-        raise ValueError("proposal belongs to a different paper account")
-    if proposal.payload["account_payload_sha256"] != account.payload_sha256:
-        raise ValueError("paper account changed after proposal; create a new proposal")
-    proposal_id = str(proposal.payload["proposal_id"])
-    if any(row.get("proposal_id") == proposal_id for row in account.payload["executions"]):
-        raise ValueError("this proposal was already simulated")
+    with _paper_account_write_lock(account_path):
+        return _execute_paper_proposal_locked(
+            account_path,
+            proposal_path,
+            store,
+            now=now,
+            clock=clock,
+            readiness_assessor=readiness_assessor,
+            composite_computer=composite_computer,
+        )
 
-    decision_date = date.fromisoformat(str(proposal.payload["decision_date"]))
-    entry_date = date.fromisoformat(str(proposal.payload["scheduled_simulation_date"]))
-    if entry_date != _next_us_session(decision_date):
-        raise ValueError("proposal execution date is not the next U.S. market session")
-    readiness = readiness_assessor(decision_date, purpose="paper", store=store)
-    if not readiness.ready:
-        blockers = ", ".join(check.check for check in readiness.blockers)
-        raise ValueError(f"current readiness recheck blocked simulation: {blockers}")
 
-    book = PortfolioBook.from_state(store, account.payload["portfolio"])
-    rules = PortfolioRiskPolicy(**proposal.payload["risk_policy"])
-    rebuilt = _build_decision_evidence(
-        decision_date,
+def _execute_paper_proposal_locked(
+    account_path: Path,
+    proposal_path: Path,
+    store: Store,
+    *,
+    now: datetime | None,
+    clock: Callable[[], datetime] | None,
+    readiness_assessor: Callable[..., Any],
+    composite_computer: Callable[..., Any],
+) -> dict[str, Any]:
+    """Execute while the caller holds the account's cross-process write lock."""
+    prepared = _prepare_paper_execution(
+        account_path,
+        proposal_path,
         store,
-        book,
-        top_n=len(proposal.payload["targets"]),
-        risk_policy=rules,
+        now=now,
+        clock=clock,
+        readiness_assessor=readiness_assessor,
         composite_computer=composite_computer,
     )
-    if rebuilt["decision_evidence_sha256"] != proposal.payload["decision_evidence_sha256"]:
-        raise ValueError("decision evidence changed after proposal; create and review a new one")
-    if not rebuilt["risk_assessment"]["approved"]:
-        raise ValueError("risk recheck rejected the proposal")
-
-    target_tickers = tuple(str(row["ticker"]) for row in proposal.payload["targets"])
-    result = book.advance_period(target_tickers, decision_date, entry_date, entry_date)
+    account = prepared.account
+    proposal = prepared.proposal
+    book = prepared.book
+    decision_date = prepared.decision_date
+    entry_date = prepared.entry_date
+    result = prepared.result
     if result.ending_equity is None or result.missing:
-        detail = ", ".join(result.missing) or "unknown execution evidence failure"
+        detail = _summarize_missing_execution_evidence(result.missing)
         raise ValueError(f"simulated execution refused: {detail}")
 
-    executed_at = _utc_timestamp(now)
+    proposal_id = str(proposal.payload["proposal_id"])
+    executed_moment = _current_moment(now, clock)
+    _validate_execution_timing(
+        proposal.payload,
+        decision_date=decision_date,
+        entry_date=entry_date,
+        now=executed_moment,
+    )
+    executed_at = _utc_timestamp(executed_moment)
     execution = {
         "proposal_id": proposal_id,
         "proposal_payload_sha256": proposal.payload_sha256,
@@ -413,13 +491,280 @@ def execute_paper_proposal(
             "execution_date": entry_date.isoformat(),
         },
     ]
+
+    def execution_write_guard() -> None:
+        _validate_execution_timing(
+            proposal.payload,
+            decision_date=decision_date,
+            entry_date=entry_date,
+            now=_current_moment(now, clock),
+        )
+        _require_document_unchanged(account)
+        _require_document_unchanged(proposal)
+
     updated_document = _write_paper_document(
         Path(account_path),
         kind=ACCOUNT_DOCUMENT_KIND,
         payload=updated,
         replace=True,
+        before_replace=execution_write_guard,
     )
     return {"account": updated_document, "execution": execution}
+
+
+def review_paper_proposal_execution(
+    account_path: Path,
+    proposal_path: Path,
+    store: Store,
+    *,
+    now: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
+    readiness_assessor: Callable[..., Any] = assess_us_readiness,
+    composite_computer: Callable[..., Any] = compute_composite,
+) -> dict[str, Any]:
+    """Preflight one proposal without writing the account or simulating a fill."""
+    try:
+        prepared = _prepare_paper_execution(
+            account_path,
+            proposal_path,
+            store,
+            now=now,
+            clock=clock,
+            readiness_assessor=readiness_assessor,
+            composite_computer=composite_computer,
+        )
+    except PaperExecutionTimingError as exc:
+        return exc.to_dict()
+
+    result = prepared.result
+    common = {
+        "decision_date": prepared.decision_date.isoformat(),
+        "execution_date": prepared.entry_date.isoformat(),
+        "executable_after": _utc_timestamp(prepared.executable_after),
+        "expires_at": _utc_timestamp(prepared.expires_at),
+        "proposal_id": str(prepared.proposal.payload["proposal_id"]),
+        "proposal_payload_sha256": prepared.proposal.payload_sha256,
+        "account_payload_sha256": prepared.account.payload_sha256,
+    }
+    if result.ending_equity is None or result.missing:
+        return {
+            **common,
+            "ready": False,
+            "status": "waiting_for_execution_data",
+            "detail": _summarize_missing_execution_evidence(result.missing),
+            "missing": list(result.missing),
+            "missing_count": len(result.missing),
+        }
+    return {
+        **common,
+        "ready": True,
+        "status": "ready_for_confirmed_simulation",
+        "detail": (
+            "All checks and reviewed close-price evidence pass. Explicit simulated "
+            "confirmation is still required."
+        ),
+        "missing": [],
+        "missing_count": 0,
+        "projected_trade_count": len(result.trades),
+        "projected_transaction_costs": result.transaction_costs,
+        "projected_ending_equity": result.ending_equity,
+    }
+
+
+def paper_proposal_timing_status(
+    proposal: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> dict[str, str]:
+    """Return a lightweight plain-language timing state without using market data."""
+    decision_date = date.fromisoformat(str(proposal["decision_date"]))
+    entry_date = date.fromisoformat(str(proposal["scheduled_simulation_date"]))
+    if entry_date != _next_us_session(decision_date):
+        raise ValueError("proposal execution date is not the next U.S. market session")
+    executable_after, expires_at = _proposal_execution_window(entry_date)
+    generation_deadline = _proposal_generation_deadline(entry_date)
+    generated_at = _parse_utc_timestamp(proposal.get("generated_at"))
+    if generated_at >= generation_deadline:
+        raise ValueError(
+            "proposal was not created prospectively before its scheduled simulation "
+            "session opened; create a new proposal from a newer reviewed decision close"
+        )
+
+    current = _as_utc_datetime(now)
+    if current < executable_after:
+        status = "waiting_for_scheduled_close"
+        detail = (
+            "Waiting for the scheduled U.S. close. The proposal cannot be simulated yet."
+        )
+    elif current >= expires_at:
+        status = "expired"
+        detail = (
+            "The simulation window expired when the following U.S. session opened. "
+            "Retrospective fills are blocked."
+        )
+    else:
+        status = "execution_window_open"
+        detail = (
+            "The scheduled close has passed. Run the read-only paper review before "
+            "explicitly recording the local simulation."
+        )
+    return {
+        "status": status,
+        "detail": detail,
+        "decision_date": decision_date.isoformat(),
+        "execution_date": entry_date.isoformat(),
+        "must_be_generated_before": _utc_timestamp(generation_deadline),
+        "executable_after": _utc_timestamp(executable_after),
+        "expires_at": _utc_timestamp(expires_at),
+    }
+
+
+def _prepare_paper_execution(
+    account_path: Path,
+    proposal_path: Path,
+    store: Store,
+    *,
+    now: datetime | None,
+    clock: Callable[[], datetime] | None,
+    readiness_assessor: Callable[..., Any],
+    composite_computer: Callable[..., Any],
+) -> _PaperExecutionPreparation:
+    account = read_paper_document(account_path, expected_kind=ACCOUNT_DOCUMENT_KIND)
+    proposal = read_paper_document(proposal_path, expected_kind=PROPOSAL_DOCUMENT_KIND)
+    _validate_account_payload(account.payload)
+    _validate_proposal_payload(proposal.payload)
+    if proposal.payload["mode"] != SIMULATION_MODE or account.payload["mode"] != SIMULATION_MODE:
+        raise ValueError("only simulation-only paper documents are supported")
+    if proposal.payload["status"] != "approved_for_supervised_simulation":
+        raise ValueError(f"proposal is not approved: {proposal.payload['status']}")
+    if proposal.payload["account_id"] != account.payload["account_id"]:
+        raise ValueError("proposal belongs to a different paper account")
+    if proposal.payload["account_payload_sha256"] != account.payload_sha256:
+        raise ValueError("paper account changed after proposal; create a new proposal")
+    proposal_id = str(proposal.payload["proposal_id"])
+    if any(row.get("proposal_id") == proposal_id for row in account.payload["executions"]):
+        raise ValueError("this proposal was already simulated")
+
+    decision_date = date.fromisoformat(str(proposal.payload["decision_date"]))
+    entry_date = date.fromisoformat(str(proposal.payload["scheduled_simulation_date"]))
+    if entry_date != _next_us_session(decision_date):
+        raise ValueError("proposal execution date is not the next U.S. market session")
+    executable_after, expires_at = _validate_execution_timing(
+        proposal.payload,
+        decision_date=decision_date,
+        entry_date=entry_date,
+        now=_current_moment(now, clock),
+    )
+
+    readiness = readiness_assessor(decision_date, purpose="paper", store=store)
+    if not readiness.ready:
+        blockers = ", ".join(check.check for check in readiness.blockers)
+        raise ValueError(f"current readiness recheck blocked simulation: {blockers}")
+
+    book = PortfolioBook.from_state(store, account.payload["portfolio"])
+    rules = PortfolioRiskPolicy(**proposal.payload["risk_policy"])
+    rebuilt = _build_decision_evidence(
+        decision_date,
+        store,
+        book,
+        top_n=len(proposal.payload["targets"]),
+        risk_policy=rules,
+        composite_computer=composite_computer,
+    )
+    if rebuilt["decision_evidence_sha256"] != proposal.payload["decision_evidence_sha256"]:
+        raise ValueError("decision evidence changed after proposal; create and review a new one")
+    if not rebuilt["risk_assessment"]["approved"]:
+        raise ValueError("risk recheck rejected the proposal")
+
+    target_tickers = tuple(str(row["ticker"]) for row in proposal.payload["targets"])
+    result = book.advance_period(target_tickers, decision_date, entry_date, entry_date)
+    executable_after, expires_at = _validate_execution_timing(
+        proposal.payload,
+        decision_date=decision_date,
+        entry_date=entry_date,
+        now=_current_moment(now, clock),
+    )
+    _require_document_unchanged(account)
+    _require_document_unchanged(proposal)
+    return _PaperExecutionPreparation(
+        account=account,
+        proposal=proposal,
+        book=book,
+        decision_date=decision_date,
+        entry_date=entry_date,
+        executable_after=executable_after,
+        expires_at=expires_at,
+        result=result,
+    )
+
+
+def _validate_execution_timing(
+    proposal: dict[str, Any],
+    *,
+    decision_date: date,
+    entry_date: date,
+    now: datetime | None,
+) -> tuple[datetime, datetime]:
+    timing = paper_proposal_timing_status(proposal, now=now)
+    executable_after = _parse_utc_timestamp(timing["executable_after"])
+    expires_at = _parse_utc_timestamp(timing["expires_at"])
+    if timing["status"] == "waiting_for_scheduled_close":
+        raise PaperExecutionTimingError(
+            "waiting_for_scheduled_close",
+            (
+                "The scheduled U.S. session has not reached the conservative 4:00 p.m. "
+                "New York close. No simulation can be recorded yet."
+            ),
+            decision_date=decision_date,
+            execution_date=entry_date,
+            executable_after=executable_after,
+            expires_at=expires_at,
+        )
+    if timing["status"] == "expired":
+        raise PaperExecutionTimingError(
+            "expired",
+            (
+                "The proposal simulation window expired when the following U.S. "
+                "session opened. Create a new prospective proposal; retrospective "
+                "fills are refused."
+            ),
+            decision_date=decision_date,
+            execution_date=entry_date,
+            executable_after=executable_after,
+            expires_at=expires_at,
+        )
+    return executable_after, expires_at
+
+
+def _proposal_execution_window(entry_date: date) -> tuple[datetime, datetime]:
+    """Return a conservative close-to-next-open supervised simulation window."""
+    executable_after = datetime.combine(
+        entry_date,
+        _CONSERVATIVE_REGULAR_CLOSE,
+        tzinfo=_NEW_YORK,
+    )
+    next_session = _next_us_session(entry_date)
+    expires_at = datetime.combine(next_session, _REGULAR_OPEN, tzinfo=_NEW_YORK)
+    return executable_after, expires_at
+
+
+def _proposal_generation_deadline(entry_date: date) -> datetime:
+    """Freeze target selection before any regular-session movement is observable."""
+    return datetime.combine(entry_date, _REGULAR_OPEN, tzinfo=_NEW_YORK)
+
+
+def _summarize_missing_execution_evidence(
+    missing: tuple[str, ...],
+    *,
+    limit: int = 6,
+) -> str:
+    if not missing:
+        return "unknown execution evidence failure"
+    visible = ", ".join(missing[:limit])
+    remainder = len(missing) - limit
+    if remainder > 0:
+        return f"{visible} (+{remainder} more)"
+    return visible
 
 
 def mark_paper_account(
@@ -430,6 +775,18 @@ def mark_paper_account(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Advance an invested simulation through one reviewed market close."""
+    with _paper_account_write_lock(account_path):
+        return _mark_paper_account_locked(account_path, through, store, now=now)
+
+
+def _mark_paper_account_locked(
+    account_path: Path,
+    through: date,
+    store: Store,
+    *,
+    now: datetime | None,
+) -> dict[str, Any]:
+    """Mark holdings while the caller owns the account write lock."""
     account = read_paper_document(account_path, expected_kind=ACCOUNT_DOCUMENT_KIND)
     _validate_account_payload(account.payload)
     book = PortfolioBook.from_state(store, account.payload["portfolio"])
@@ -454,6 +811,7 @@ def mark_paper_account(
         kind=ACCOUNT_DOCUMENT_KIND,
         payload=updated,
         replace=True,
+        before_replace=lambda: _require_document_unchanged(account),
     )
     return {"account": document, "points": [point.to_dict() for point in points]}
 
@@ -746,12 +1104,45 @@ def _validate_proposal_payload(payload: dict[str, Any]) -> None:
         raise ValueError("paper proposal payload is incomplete")
 
 
+def _require_document_unchanged(expected: PaperDocument) -> None:
+    current = read_paper_document(expected.path, expected_kind=expected.kind)
+    if not hmac.compare_digest(current.payload_sha256, expected.payload_sha256):
+        label = "paper account" if expected.kind == ACCOUNT_DOCUMENT_KIND else "paper proposal"
+        raise ValueError(f"{label} changed while checks were running; retry from fresh evidence")
+
+
+@contextmanager
+def _paper_document_write_lock(document_path: Path) -> Iterator[None]:
+    """Refuse concurrent document mutations instead of losing one update."""
+    lock_path = Path(f"{Path(document_path)}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError(
+                "another paper-document update is already in progress; wait for it to finish"
+            ) from None
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _paper_account_write_lock(account_path: Path) -> Iterator[None]:
+    """Use the common document lock for account state transitions."""
+    with _paper_document_write_lock(account_path):
+        yield
+
+
 def _write_paper_document(
     path: Path,
     *,
     kind: str,
     payload: dict[str, Any],
     replace: bool,
+    before_replace: Callable[[], None] | None = None,
 ) -> PaperDocument:
     destination = Path(path)
     if destination.exists() and not replace:
@@ -771,6 +1162,10 @@ def _write_paper_document(
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        if before_replace is not None:
+            before_replace()
+        if destination.exists() and not replace:
+            raise ValueError(f"paper document already exists: {destination}")
         os.replace(temporary, destination)
     finally:
         if temporary.exists():
@@ -779,7 +1174,45 @@ def _write_paper_document(
 
 
 def _utc_timestamp(value: datetime | None) -> str:
+    current = _as_utc_datetime(value)
+    return current.isoformat().replace("+00:00", "Z")
+
+
+def _as_utc_datetime(value: datetime | None) -> datetime:
     current = value or datetime.now(UTC)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=UTC)
-    return current.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("paper workflow timestamps must include an explicit timezone")
+    return current.astimezone(UTC)
+
+
+def _current_moment(
+    now: datetime | None,
+    clock: Callable[[], datetime] | None,
+) -> datetime:
+    if now is not None:
+        return _as_utc_datetime(now)
+    return _as_utc_datetime(clock() if clock is not None else None)
+
+
+def _require_prospective_generation(
+    current: datetime,
+    generation_deadline: datetime,
+) -> None:
+    if current >= generation_deadline:
+        raise ValueError(
+            "paper proposal is no longer prospective: its scheduled simulation "
+            f"session opened at {_utc_timestamp(generation_deadline)}; create a proposal "
+            "from a newer reviewed decision close"
+        )
+
+
+def _parse_utc_timestamp(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("paper proposal is missing its generated timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("paper proposal generated timestamp is invalid") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("paper proposal generated timestamp must include a timezone")
+    return parsed.astimezone(UTC)

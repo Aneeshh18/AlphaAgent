@@ -15,6 +15,7 @@ adjustment reconciliation is a downstream concern, not an ingest one.
 from __future__ import annotations
 
 import json
+import math
 import time
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -26,9 +27,10 @@ import pandas as pd
 from structlog import get_logger
 
 from aios.config import settings
-from aios.ingest.http_client import get_http
+from aios.ingest.http_client import RawSnapshotContext, get_http
 from aios.market_calendar import latest_completed_us_equity_session
 from aios.raw_snapshots import (
+    attach_parsed_rows_evidence,
     canonical_request_fingerprint,
     capture_raw_snapshot,
 )
@@ -39,7 +41,11 @@ log = get_logger(__name__)
 STOOQ_URL = "https://stooq.com/q/d/l/"
 TIINGO_EOD_URL = "https://api.tiingo.com/tiingo/daily/{symbol}/prices"
 YFINANCE_EXPORT_SCHEMA_VERSION = 1
-YFINANCE_PARSER_VERSION = "yfinance-normalized-v1"
+YFINANCE_PARSER_VERSION = "yfinance-normalized-v2"
+STOOQ_CAPTURE_PARSER_VERSION = "stooq-daily-csv-capture-v1"
+STOOQ_PARSER_VERSION = "stooq-daily-csv-v1"
+TIINGO_CAPTURE_PARSER_VERSION = "tiingo-eod-json-capture-v1"
+TIINGO_PARSER_VERSION = "tiingo-eod-json-v1"
 
 
 # ----------------------------------------------------------------------
@@ -178,6 +184,8 @@ def fetch_yfinance(
                     "symbol": ticker.upper(),
                     "start": period_start,
                     "end": normalization_end.isoformat(),
+                    "requested_end_exclusive": requested_end.isoformat(),
+                    "completed_session": latest_completed.isoformat(),
                     "actions": True,
                     "auto_adjust": False,
                 }
@@ -192,6 +200,8 @@ def fetch_yfinance(
             store=store,
             project_root=project_root,
         )
+    _validate_yfinance_storage_rows(bounded)
+    _validate_yfinance_provider_actions(export_rows, ticker)
     log.info(
         "prices.yfinance_fetched",
         ticker=ticker,
@@ -202,7 +212,27 @@ def fetch_yfinance(
 
 
 def parse_yfinance_normalized_export(payload: bytes) -> list[dict[str, Any]]:
-    """Replay one canonical yfinance library export into AIOS price rows."""
+    """Replay a v2 yfinance export, retaining malformed actions for audit."""
+    return _parse_yfinance_normalized_export(
+        payload,
+        reject_nonpositive_splits=False,
+    )
+
+
+def parse_yfinance_normalized_export_v1(payload: bytes) -> list[dict[str, Any]]:
+    """Replay legacy v1 evidence with its original split validation."""
+    return _parse_yfinance_normalized_export(
+        payload,
+        reject_nonpositive_splits=True,
+    )
+
+
+def _parse_yfinance_normalized_export(
+    payload: bytes,
+    *,
+    reject_nonpositive_splits: bool,
+) -> list[dict[str, Any]]:
+    """Decode one canonical yfinance library export into provider rows."""
     try:
         export = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -266,7 +296,7 @@ def parse_yfinance_normalized_export(payload: bytes) -> list[dict[str, Any]]:
     for row in reversed(rows):
         row["split_normalization_factor"] = cumulative_later_splits
         split_ratio = float(row["split_ratio"])
-        if split_ratio <= 0:
+        if reject_nonpositive_splits and split_ratio <= 0:
             raise ValueError(f"invalid yfinance split ratio for {ticker}: {split_ratio}")
         cumulative_later_splits *= split_ratio
 
@@ -285,19 +315,26 @@ def parse_yfinance_normalized_export(payload: bytes) -> list[dict[str, Any]]:
 # Stooq (fallback)
 # ----------------------------------------------------------------------
 def _stooq_symbol(ticker: str) -> str:
-    """Map a US ticker to Stooq's symbol convention (US tickers → lowercase)."""
-    t = ticker.upper().replace(".", "-")
-    return t.lower()
+    """Map a US market ticker to Stooq's ``symbol.us`` convention."""
+    normalized = ticker.strip().upper()
+    if normalized.endswith(".US"):
+        normalized = normalized[:-3]
+    return f"{normalized.replace('.', '-').lower()}.us"
 
 
 def fetch_stooq(
     ticker: str,
     start: str | None = None,
     end: str | None = None,
+    *,
+    store: Store | None = None,
+    ingest_run_id: str | None = None,
+    project_root: Path | None = None,
 ) -> list[dict]:
-    """Fetch EOD prices via Stooq CSV download (no key). Returns row dicts."""
+    """Fetch EOD prices via Stooq while preserving the exact CSV response."""
     sym = _stooq_symbol(ticker)
     safe_exclusive_end = latest_completed_us_equity_session() + timedelta(days=1)
+    requested_start = date.fromisoformat(start) if start else None
     requested_end = date.fromisoformat(end) if end else safe_exclusive_end
     completed_end = min(requested_end, safe_exclusive_end)
     params = {"s": sym, "i": "d"}
@@ -305,32 +342,59 @@ def fetch_stooq(
         params["d1"] = start.replace("-", "")
     params["d2"] = completed_end.isoformat().replace("-", "")
     url = f"{STOOQ_URL}?{urlencode(params)}"
-    csv_text = get_http().get_text(url)
-    if not csv_text or "No data" in csv_text:
+    role = _exact_price_role("stooq", ticker, start, end)
+    snapshot = (
+        RawSnapshotContext(
+            provider="stooq",
+            dataset="daily-prices",
+            store=store,
+            ingest_run_id=ingest_run_id,
+            role=role,
+            adapter_name="aios-stooq-http",
+            adapter_version="1",
+            parser_version=STOOQ_CAPTURE_PARSER_VERSION,
+            project_root=project_root,
+        )
+        if store is not None
+        else None
+    )
+    http = get_http()
+    payload = (
+        http.get_bytes(url, raw_snapshot=snapshot)
+        if snapshot is not None
+        else http.get_bytes(url)
+    )
+    provider_rows = parse_stooq_daily_csv(payload)
+    if store is not None and ingest_run_id is not None:
+        attach_parsed_rows_evidence(
+            store=store,
+            ingest_run_id=ingest_run_id,
+            role=role,
+            capture_parser_version=STOOQ_CAPTURE_PARSER_VERSION,
+            parser_version=STOOQ_PARSER_VERSION,
+            parsed_rows=provider_rows,
+        )
+    if not provider_rows:
         log.warning("prices.stooq_empty", ticker=ticker)
         return []
 
-    import io
-
-    df = pd.read_csv(io.StringIO(csv_text))
-    if df.empty or "Close" not in df.columns:
-        return []
-
     rows: list[dict] = []
-    for _, r in df.iterrows():
-        row_date = date.fromisoformat(str(r["Date"])[:10])
-        if row_date >= completed_end:
+    for provider_row in provider_rows:
+        row_date = date.fromisoformat(str(provider_row["date"]))
+        if row_date >= completed_end or (
+            requested_start is not None and row_date < requested_start
+        ):
             continue
         rows.append(
             {
                 "ticker": ticker.upper(),
                 "date": row_date.isoformat(),
-                "open": _f(r.get("Open")),
-                "high": _f(r.get("High")),
-                "low": _f(r.get("Low")),
-                "close": _f(r.get("Close")),
+                "open": provider_row["open"],
+                "high": provider_row["high"],
+                "low": provider_row["low"],
+                "close": provider_row["close"],
                 "adj_close": None,  # Stooq is unadjusted; mark None
-                "volume": int(r["Volume"]) if pd.notna(r.get("Volume")) else None,
+                "volume": provider_row["volume"],
                 "dividends": 0.0,
                 "split_ratio": 1.0,
                 "actions_complete": False,
@@ -344,6 +408,65 @@ def fetch_stooq(
     return rows
 
 
+def parse_stooq_daily_csv(payload: bytes) -> list[dict[str, Any]]:
+    """Replay one exact Stooq CSV into provider-native daily rows."""
+    import csv
+    import io
+
+    try:
+        text = payload.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Stooq daily response is not UTF-8") from exc
+    if not text.strip() or text.strip().casefold().startswith("no data"):
+        return []
+    reader = csv.DictReader(io.StringIO(text, newline=""))
+    if reader.fieldnames is None:
+        raise ValueError("Stooq daily CSV has no header")
+    fields = {
+        str(field).strip().lstrip("\ufeff"): field
+        for field in reader.fieldnames
+        if field is not None
+    }
+    required = {"Date", "Open", "High", "Low", "Close"}
+    missing = sorted(required - fields.keys())
+    if missing:
+        raise ValueError("Stooq daily CSV is missing columns: " + ", ".join(missing))
+
+    rows_by_date: dict[str, dict[str, Any]] = {}
+    for row_number, raw in enumerate(reader, start=2):
+        if None in raw:
+            raise ValueError(f"Stooq daily CSV row {row_number} has extra columns")
+        row_date = date.fromisoformat(str(raw[fields["Date"]]).strip()).isoformat()
+        if row_date in rows_by_date:
+            raise ValueError(f"Stooq daily CSV contains duplicate date {row_date}")
+        row_label = f"Stooq row {row_number}"
+        open_value = _strict_positive_float(raw[fields["Open"]], f"{row_label} Open")
+        high_value = _strict_positive_float(raw[fields["High"]], f"{row_label} High")
+        low_value = _strict_positive_float(raw[fields["Low"]], f"{row_label} Low")
+        close_value = _strict_positive_float(raw[fields["Close"]], f"{row_label} Close")
+        _validate_ohlc(
+            open_value,
+            high_value,
+            low_value,
+            close_value,
+            row_label,
+        )
+        volume = (
+            _strict_optional_int(raw[fields["Volume"]], f"{row_label} Volume")
+            if "Volume" in fields
+            else None
+        )
+        rows_by_date[row_date] = {
+            "date": row_date,
+            "open": open_value,
+            "high": high_value,
+            "low": low_value,
+            "close": close_value,
+            "volume": volume,
+        }
+    return [rows_by_date[row_date] for row_date in sorted(rows_by_date)]
+
+
 # ----------------------------------------------------------------------
 # Tiingo EOD (optional user-token provider)
 # ----------------------------------------------------------------------
@@ -351,8 +474,12 @@ def fetch_tiingo(
     ticker: str,
     start: str | None = None,
     end: str | None = None,
+    *,
+    store: Store | None = None,
+    ingest_run_id: str | None = None,
+    project_root: Path | None = None,
 ) -> list[dict]:
-    """Fetch explicit Tiingo EOD history without placing the token in the URL."""
+    """Fetch Tiingo EOD history without placing its token in evidence metadata."""
     token = settings.tiingo_api_key.strip()
     if not token:
         raise ValueError("TIINGO_API_KEY is required for the Tiingo provider")
@@ -363,35 +490,62 @@ def fetch_tiingo(
         params["endDate"] = end
     query = f"?{urlencode(params)}" if params else ""
     url = TIINGO_EOD_URL.format(symbol=quote(ticker.upper(), safe="-")) + query
-    payload = get_http().get_json(
+    role = _exact_price_role("tiingo", ticker, start, end)
+    snapshot = (
+        RawSnapshotContext(
+            provider="tiingo",
+            dataset="daily-prices",
+            store=store,
+            ingest_run_id=ingest_run_id,
+            role=role,
+            adapter_name="aios-tiingo-http",
+            adapter_version="1",
+            parser_version=TIINGO_CAPTURE_PARSER_VERSION,
+            project_root=project_root,
+        )
+        if store is not None
+        else None
+    )
+    http = get_http()
+    payload = http.get_bytes(
         url,
         headers={"Authorization": f"Token {token}"},
+        **({"raw_snapshot": snapshot} if snapshot is not None else {}),
     )
-    if not isinstance(payload, list):
-        raise ValueError("Tiingo EOD response is not a row array")
+    provider_rows = parse_tiingo_eod_response(payload)
+    if store is not None and ingest_run_id is not None:
+        attach_parsed_rows_evidence(
+            store=store,
+            ingest_run_id=ingest_run_id,
+            role=role,
+            capture_parser_version=TIINGO_CAPTURE_PARSER_VERSION,
+            parser_version=TIINGO_PARSER_VERSION,
+            parsed_rows=provider_rows,
+        )
 
     safe_exclusive_end = latest_completed_us_equity_session() + timedelta(days=1)
+    requested_start = date.fromisoformat(start) if start else None
     requested_end = date.fromisoformat(end) if end else safe_exclusive_end
     end_date = min(requested_end, safe_exclusive_end)
     rows: list[dict] = []
-    for raw in payload:
-        if not isinstance(raw, dict) or not raw.get("date"):
-            continue
-        row_date = date.fromisoformat(str(raw["date"])[:10])
-        if end_date is not None and row_date >= end_date:
+    for provider_row in provider_rows:
+        row_date = date.fromisoformat(str(provider_row["date"]))
+        if row_date >= end_date or (
+            requested_start is not None and row_date < requested_start
+        ):
             continue
         rows.append(
             {
                 "ticker": ticker.upper(),
                 "date": row_date.isoformat(),
-                "open": _f(raw.get("open")),
-                "high": _f(raw.get("high")),
-                "low": _f(raw.get("low")),
-                "close": _f(raw.get("close")),
-                "adj_close": _f(raw.get("adjClose")),
-                "volume": (int(raw["volume"]) if raw.get("volume") is not None else None),
-                "dividends": _f(raw.get("divCash")) or 0.0,
-                "split_ratio": _f(raw.get("splitFactor")) or 1.0,
+                "open": provider_row["open"],
+                "high": provider_row["high"],
+                "low": provider_row["low"],
+                "close": provider_row["close"],
+                "adj_close": provider_row["adj_close"],
+                "volume": provider_row["volume"],
+                "dividends": provider_row["dividends"],
+                "split_ratio": provider_row["split_ratio"],
                 "actions_complete": True,
                 "close_split_adjusted": False,
                 "split_normalization_factor": 1.0,
@@ -401,6 +555,64 @@ def fetch_tiingo(
         )
     log.info("prices.tiingo_fetched", ticker=ticker, rows=len(rows))
     return rows
+
+
+def parse_tiingo_eod_response(payload: bytes) -> list[dict[str, Any]]:
+    """Replay one exact Tiingo EOD response into provider-native daily rows."""
+    try:
+        decoded = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Tiingo EOD response is not valid JSON") from exc
+    if not isinstance(decoded, list):
+        raise ValueError("Tiingo EOD response is not a row array")
+    rows_by_date: dict[str, dict[str, Any]] = {}
+    for row_number, raw in enumerate(decoded, start=1):
+        if not isinstance(raw, dict) or not raw.get("date"):
+            raise ValueError(f"Tiingo EOD row {row_number} lacks a date")
+        row_date = date.fromisoformat(str(raw["date"])[:10]).isoformat()
+        if row_date in rows_by_date:
+            raise ValueError(f"Tiingo EOD response contains duplicate date {row_date}")
+        row_label = f"Tiingo row {row_number}"
+        if raw.get("splitFactor") is None:
+            raise ValueError(f"{row_label} splitFactor is required")
+        if raw.get("divCash") is None:
+            raise ValueError(f"{row_label} divCash is required")
+        open_value = _strict_positive_float(raw.get("open"), f"{row_label} open")
+        high_value = _strict_positive_float(raw.get("high"), f"{row_label} high")
+        low_value = _strict_positive_float(raw.get("low"), f"{row_label} low")
+        close_value = _strict_positive_float(raw.get("close"), f"{row_label} close")
+        adjusted_close = _strict_positive_float(
+            raw.get("adjClose"),
+            f"{row_label} adjClose",
+        )
+        _validate_ohlc(
+            open_value,
+            high_value,
+            low_value,
+            close_value,
+            row_label,
+        )
+        split_ratio = _strict_positive_float(
+            raw.get("splitFactor"),
+            f"{row_label} splitFactor",
+        )
+        dividends = _strict_optional_float(raw.get("divCash"), f"{row_label} divCash")
+        if dividends is None or dividends < 0:
+            raise ValueError(f"{row_label} divCash must be non-negative")
+        rows_by_date[row_date] = {
+            "date": row_date,
+            "open": open_value,
+            "high": high_value,
+            "low": low_value,
+            "close": close_value,
+            "adj_close": adjusted_close,
+            "volume": _strict_optional_int(
+                raw.get("volume"), f"{row_label} volume"
+            ),
+            "dividends": dividends,
+            "split_ratio": split_ratio,
+        }
+    return [rows_by_date[row_date] for row_date in sorted(rows_by_date)]
 
 
 # ----------------------------------------------------------------------
@@ -413,6 +625,7 @@ def fetch_prices(
     *,
     store: Store | None = None,
     ingest_run_id: str | None = None,
+    project_root: Path | None = None,
 ) -> list[dict]:
     """Try yfinance, configured Tiingo, then Stooq on empty/failure."""
     try:
@@ -422,6 +635,7 @@ def fetch_prices(
             end=end,
             store=store,
             ingest_run_id=ingest_run_id,
+            project_root=project_root,
         )
     except Exception as e:
         log.warning("prices.yfinance_failed", ticker=ticker, error=str(e))
@@ -431,7 +645,14 @@ def fetch_prices(
     if settings.tiingo_api_key.strip():
         log.warning("prices.fallback_to_tiingo", ticker=ticker)
         try:
-            rows = fetch_tiingo(ticker, start=start, end=end)
+            rows = fetch_tiingo(
+                ticker,
+                start=start,
+                end=end,
+                store=store,
+                ingest_run_id=ingest_run_id,
+                project_root=project_root,
+            )
         except Exception as e:
             log.warning("prices.tiingo_failed", ticker=ticker, error=str(e))
             rows = []
@@ -439,7 +660,14 @@ def fetch_prices(
             return rows
     log.warning("prices.fallback_to_stooq", ticker=ticker)
     try:
-        return fetch_stooq(ticker, start=start, end=end)
+        return fetch_stooq(
+            ticker,
+            start=start,
+            end=end,
+            store=store,
+            ingest_run_id=ingest_run_id,
+            project_root=project_root,
+        )
     except Exception as e:  # pragma: no cover
         log.error("prices.stooq_failed", ticker=ticker, error=str(e))
         return []
@@ -453,6 +681,7 @@ def fetch_provider_prices(
     *,
     store: Store | None = None,
     ingest_run_id: str | None = None,
+    project_root: Path | None = None,
 ) -> list[dict]:
     """Fetch one explicitly reviewed provider mapping without cross-provider fallback."""
     provider = provider.lower()
@@ -463,11 +692,26 @@ def fetch_provider_prices(
             end=end,
             store=store,
             ingest_run_id=ingest_run_id,
+            project_root=project_root,
         )
     if provider == "stooq":
-        return fetch_stooq(provider_symbol, start=start, end=end)
+        return fetch_stooq(
+            provider_symbol,
+            start=start,
+            end=end,
+            store=store,
+            ingest_run_id=ingest_run_id,
+            project_root=project_root,
+        )
     if provider == "tiingo":
-        return fetch_tiingo(provider_symbol, start=start, end=end)
+        return fetch_tiingo(
+            provider_symbol,
+            start=start,
+            end=end,
+            store=store,
+            ingest_run_id=ingest_run_id,
+            project_root=project_root,
+        )
     raise ValueError(f"unsupported price provider {provider!r}")
 
 
@@ -654,6 +898,8 @@ def ingest_prices(
             table_name="prices",
             rows_inserted=n,
             started_at=started_at,
+            status="success" if n else "warning",
+            error=None if n else "provider returned no usable price rows",
         )
         log.info("prices.ingest_done", ticker=ticker, rows=n, run_id=run_id)
         return n
@@ -678,9 +924,107 @@ def _f(x: Any) -> float | None:
     except (TypeError, ValueError):
         pass
     try:
-        return float(x)
+        parsed = float(x)
     except (TypeError, ValueError):
         return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _validate_yfinance_storage_rows(rows: list[dict[str, Any]]) -> None:
+    """Reject unusable requested rows only after their evidence is captured.
+
+    The replay parser intentionally retains malformed provider fields for
+    evidence. This separate eligibility gate ensures unusable completed-session
+    rows can be audited and replayed but can never reach the storage layer.
+    """
+    for row in rows:
+        row_label = f"yfinance {row['ticker']} {row['date']}"
+        open_value = _strict_positive_float(row.get("open"), f"{row_label} Open")
+        high_value = _strict_positive_float(row.get("high"), f"{row_label} High")
+        low_value = _strict_positive_float(row.get("low"), f"{row_label} Low")
+        close_value = _strict_positive_float(row.get("close"), f"{row_label} Close")
+        _strict_positive_float(row.get("adj_close"), f"{row_label} Adj Close")
+        _validate_ohlc(
+            open_value,
+            high_value,
+            low_value,
+            close_value,
+            row_label,
+        )
+
+
+def _validate_yfinance_provider_actions(
+    provider_rows: list[dict[str, Any]],
+    ticker: str,
+) -> None:
+    """Require explicit finite action fields before marking Yahoo rows complete."""
+    for row in provider_rows:
+        row_label = f"yfinance {ticker.upper()} {row['date']}"
+        dividends = _strict_optional_float(
+            row.get("dividends"),
+            f"{row_label} Dividends",
+        )
+        if dividends is None or dividends < 0:
+            raise ValueError(f"{row_label} Dividends must be non-negative")
+        stock_splits = _strict_optional_float(
+            row.get("stock_splits"),
+            f"{row_label} Stock Splits",
+        )
+        if stock_splits is None or stock_splits < 0:
+            raise ValueError(f"{row_label} Stock Splits must be non-negative")
+
+
+def _strict_optional_float(value: Any, label: str) -> float | None:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} is not numeric") from exc
+    if not pd.notna(parsed) or parsed in (float("inf"), float("-inf")):
+        raise ValueError(f"{label} is not finite")
+    return parsed
+
+
+def _strict_optional_int(value: Any, label: str) -> int | None:
+    parsed = _strict_optional_float(value, label)
+    if parsed is None:
+        return None
+    if parsed < 0 or not parsed.is_integer():
+        raise ValueError(f"{label} is not a non-negative integer")
+    return int(parsed)
+
+
+def _strict_positive_float(value: Any, label: str) -> float:
+    parsed = _strict_optional_float(value, label)
+    if parsed is None or parsed <= 0:
+        raise ValueError(f"{label} must be positive")
+    return parsed
+
+
+def _validate_ohlc(
+    open_value: float,
+    high_value: float,
+    low_value: float,
+    close_value: float,
+    label: str,
+) -> None:
+    if high_value < max(open_value, low_value, close_value):
+        raise ValueError(f"{label} High is below another OHLC value")
+    if low_value > min(open_value, high_value, close_value):
+        raise ValueError(f"{label} Low is above another OHLC value")
+
+
+def _exact_price_role(
+    provider: str,
+    ticker: str,
+    start: str | None,
+    end: str | None,
+) -> str:
+    return (
+        f"prices:{provider}:{ticker.upper()}:"
+        f"{start or 'default'}:{end or 'default'}"
+    )
 
 
 def _as_date(value: date | str) -> date:

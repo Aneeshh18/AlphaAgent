@@ -6,6 +6,7 @@ through here. Designed to be wired to systemd/cron later.
 Commands
 --------
   aios doctor        — verify env, deps, DB, connectivity
+  aios preflight     — one read-only operator status and safest next command
   aios readiness     — fail-closed U.S. data/readiness report
   aios health        — one plain-language operating check
   aios backup        — checksum-verified local data/paper backup
@@ -21,12 +22,22 @@ Commands
   aios alert-test    — verify the local incident lifecycle
   aios alert-ack     — acknowledge one unresolved incident
   aios alert-resolve — explicitly resolve one incident
+  aios notifications — inspect the channel-neutral alert outbox
+  aios notification-show — inspect one message and its delivery attempts
+  aios notification-test — certify the local no-network delivery lifecycle
+  aios email-status   — inspect secret-safe SMTP readiness and durable opt-in
+  aios email-test     — explicitly send one external receipt test
+  aios email-enable   — enable email only for future incident transitions
+  aios email-disable  — stop future email delivery and hold unsent messages
+  aios email-deliver  — run one bounded retry-safe SMTP delivery pass
   aios dashboard     — open the local research dashboard
   aios paper-init    — create a local simulation-only portfolio
   aios forward-freeze — freeze policy/configuration for untouched monitoring
   aios forward-restart — prospectively replace and archive a drifted trial
   aios forward-status — verify the active forward policy has not drifted
   aios paper-propose — build a reviewed QV simulation proposal
+  aios stress-review — run advisory deterministic stress tests on one proposal
+  aios paper-review  — preflight one proposal without changing the account
   aios paper-execute — explicitly simulate an approved proposal
   aios paper-mark    — update simulated holdings through a reviewed close
   aios paper-status  — show local simulation state in plain language
@@ -67,11 +78,14 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import platform
+import shlex
 import subprocess
 import sys
 from contextlib import suppress
 from datetime import UTC, date, datetime
+from functools import wraps
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import uuid4
@@ -82,9 +96,10 @@ from rich.console import Console
 from rich.table import Table
 
 from aios import __version__
+from aios.artifacts import publish_text_write_once
 from aios.config import settings
 from aios.readiness import assess_us_readiness
-from aios.storage.store import get_store
+from aios.storage.store import get_store, store_scope
 
 app = typer.Typer(
     name="aios",
@@ -104,11 +119,209 @@ SECURITY_CONVERSION_FILE_ARGUMENT = typer.Argument(
 LIQUIDATION_EXTENSION_FILE_ARGUMENT = typer.Argument(
     ..., help="Reviewed post-membership ticker/provider extension CSV."
 )
+READINESS_REPORT_DIRECTORY = Path("data/reports/readiness")
+PAPER_PROPOSAL_DIRECTORY = Path("data/paper/proposals")
+
+
+def _exclusive_project_operation(operation: str):
+    """Serialize supported workflows that mutate cross-store governed state."""
+
+    def decorate(command):
+        @wraps(command)
+        def guarded(*args, **kwargs):
+            from aios.maintenance import (
+                MaintenanceLockBusyError,
+                MaintenanceLockError,
+                project_maintenance_lock,
+            )
+
+            try:
+                with project_maintenance_lock(
+                    settings.project_root,
+                    operation=operation,
+                ):
+                    return command(*args, **kwargs)
+            except MaintenanceLockBusyError as exc:
+                console.print(
+                    "[yellow]Another AIOS mutation workflow is already running.[/yellow] "
+                    f"{exc}"
+                )
+                raise typer.Exit(code=75) from exc
+            except MaintenanceLockError as exc:
+                console.print(f"[red]AIOS could not establish its mutation lock:[/red] {exc}")
+                raise typer.Exit(code=1) from exc
+
+        return guarded
+
+    return decorate
 
 
 def _project_path(path: Path) -> Path:
     """Resolve a CLI data path consistently when invoked outside the repo."""
     return path if path.is_absolute() else settings.project_root / path
+
+
+def _absolute_without_symlink_resolution(path: Path) -> Path:
+    return Path(os.path.abspath(Path(path).expanduser()))
+
+
+def _is_within(path: Path, directory: Path) -> bool:
+    try:
+        path.relative_to(directory)
+    except ValueError:
+        return False
+    return True
+
+
+def _reject_output_symlink_ancestors(path: Path, *, label: str) -> None:
+    for candidate in (path, *path.parents):
+        if candidate.is_symlink():
+            raise ValueError(f"{label} path cannot contain symlinks: {path}")
+
+
+def _validate_generated_output_location(path: Path, *, label: str) -> Path:
+    """Keep generated artifacts away from code and governed runtime state."""
+
+    root = Path(settings.project_root).expanduser().resolve()
+    candidate = _absolute_without_symlink_resolution(_project_path(path))
+    _reject_output_symlink_ancestors(candidate, label=label)
+    if candidate.resolve(strict=False) != candidate:
+        raise ValueError(f"{label} path cannot resolve through a symlink: {candidate}")
+
+    if _is_within(candidate, root) and not _is_within(candidate, root / "data"):
+        raise ValueError(
+            f"{label} inside the project must stay under the data directory"
+        )
+
+    protected_directories = (
+        root / "data" / "raw",
+        root / "data" / "paper",
+        root / "data" / "operations",
+        root / "data" / "backups",
+        root / "backups",
+    )
+    for protected in protected_directories:
+        if candidate == protected or _is_within(candidate, protected):
+            raise ValueError(
+                f"{label} cannot target governed AIOS state: {candidate}"
+            )
+
+    duckdb_setting = Path(getattr(settings, "duckdb_path", "data/aios.duckdb"))
+    operations_setting = Path(
+        getattr(settings, "operations_db_path", "data/operations/alerts.sqlite3")
+    )
+    database_files = (
+        _absolute_without_symlink_resolution(_project_path(duckdb_setting)),
+        _absolute_without_symlink_resolution(_project_path(operations_setting)),
+    )
+    protected_files = {
+        *database_files,
+        root / "data" / "operations" / "maintenance.lock",
+    }
+    protected_files.update(
+        Path(f"{database}{suffix}")
+        for database in database_files
+        for suffix in ("-wal", "-shm")
+    )
+    if candidate in protected_files:
+        raise ValueError(f"{label} cannot target governed AIOS state: {candidate}")
+    return candidate
+
+
+def _resolve_generated_output_path(
+    path: Path,
+    *,
+    label: str,
+    suffix: str | None = None,
+) -> Path:
+    """Resolve one generated file as an immutable, write-once artifact."""
+
+    destination = _validate_generated_output_location(path, label=label)
+    if suffix is not None and destination.suffix.lower() != suffix.lower():
+        raise ValueError(f"{label} must use a {suffix} file")
+    if destination.exists() or destination.is_symlink():
+        raise ValueError(f"{label} already exists: {destination}")
+    return destination
+
+
+def _resolve_generated_output_directory(path: Path, *, label: str) -> Path:
+    """Resolve a mutable artifact workspace without aliases to governed files."""
+
+    destination = _validate_generated_output_location(path, label=label)
+    if destination.exists() and not destination.is_dir():
+        raise ValueError(f"{label} must be a directory: {destination}")
+    if destination.exists():
+        for entry in destination.rglob("*"):
+            if entry.is_symlink():
+                raise ValueError(f"{label} cannot contain symlinks: {entry}")
+            if entry.is_file() and entry.stat().st_nlink != 1:
+                raise ValueError(f"{label} cannot contain hard-linked files: {entry}")
+    return destination
+
+
+def _resolve_paper_proposal_output_path(path: Path) -> Path:
+    """Constrain proposal writes to the governed proposal namespace."""
+
+    root = Path(settings.project_root).expanduser().resolve()
+    allowed = (root / PAPER_PROPOSAL_DIRECTORY).resolve()
+    candidate = _absolute_without_symlink_resolution(_project_path(path))
+    _reject_output_symlink_ancestors(candidate, label="paper proposal output")
+    if candidate.resolve(strict=False) != candidate or not _is_within(candidate, allowed):
+        raise ValueError(
+            "paper proposal output must stay under "
+            f"{PAPER_PROPOSAL_DIRECTORY.as_posix()}"
+        )
+    if candidate == allowed or candidate.suffix.lower() != ".json":
+        raise ValueError(
+            "paper proposal output must be a .json file under "
+            f"{PAPER_PROPOSAL_DIRECTORY.as_posix()}"
+        )
+    if candidate.exists() and (
+        not candidate.is_file() or candidate.stat().st_nlink != 1
+    ):
+        raise ValueError(
+            f"paper proposal output must be one regular unaliased file: {candidate}"
+        )
+    return candidate
+
+
+def _resolve_readiness_report_path(path: Path) -> Path:
+    """Restrict optional readiness artifacts to their write-once namespace."""
+
+    root = settings.project_root.resolve()
+    allowed = (root / READINESS_REPORT_DIRECTORY).resolve()
+    requested = Path(path).expanduser()
+    candidate = requested if requested.is_absolute() else root / requested
+    for ancestor in (candidate, *candidate.parents):
+        if ancestor.is_symlink():
+            raise ValueError(f"readiness report path cannot contain symlinks: {candidate}")
+        if ancestor == root:
+            break
+    destination = candidate.resolve()
+    try:
+        relative = destination.relative_to(allowed)
+    except ValueError as exc:
+        raise ValueError(
+            "readiness JSON output must stay under "
+            f"{READINESS_REPORT_DIRECTORY.as_posix()}"
+        ) from exc
+    if relative == Path(".") or destination.suffix.lower() != ".json":
+        raise ValueError(
+            "readiness JSON output must be a .json file under "
+            f"{READINESS_REPORT_DIRECTORY.as_posix()}"
+        )
+    if destination.exists() or destination.is_symlink():
+        raise ValueError(f"readiness report already exists: {destination}")
+    return destination
+
+
+def _publish_text_write_once(path: Path, text: str) -> None:
+    """Publish one same-filesystem artifact atomically without overwriting."""
+
+    try:
+        publish_text_write_once(path, text)
+    except FileExistsError:
+        raise ValueError(f"readiness report already exists: {path}") from None
 
 
 def _emit_operational_alert(alert: Any) -> None:
@@ -170,7 +383,8 @@ def doctor() -> None:
 
     # DB
     try:
-        counts = get_store().table_rowcounts()
+        with store_scope(read_only=True) as store:
+            counts = store.table_rowcounts()
         db_tbl = Table(title="Database")
         db_tbl.add_column("table")
         db_tbl.add_column("rows")
@@ -196,11 +410,15 @@ def health(
         bool,
         typer.Option(
             "--strict/--report-only",
-            help="Return a failing exit code when an operating blocker remains.",
+            help=(
+                "Strict mode records incident transitions and fails on blockers; "
+                "report-only performs a side-effect-free operating read."
+            ),
         ),
     ] = True,
 ) -> None:
     """Show whether normal research and paper monitoring are safe to open."""
+    from aios.forward import DEFAULT_FORWARD_RELATIVE_PATH, assess_forward_trial
     from aios.paper import (
         DEFAULT_ACCOUNT_RELATIVE_PATH,
         latest_paper_decision_date,
@@ -208,36 +426,63 @@ def health(
     )
 
     try:
-        store = get_store()
-        decision_date = latest_paper_decision_date(store)
-        report = assess_us_readiness(decision_date, purpose="paper", store=store)
-        account_path = settings.project_root / DEFAULT_ACCOUNT_RELATIVE_PATH
-        paper_detail = "not initialized; research remains available"
-        paper_ok = True
-        if account_path.exists():
-            try:
-                summary = paper_account_summary(account_path, store)
-                paper_detail = (
-                    f"verified; ${summary['equity']:,.2f} simulated value, "
-                    f"{len(summary['holdings'])} holding(s)"
-                )
-            except Exception as exc:
-                paper_ok = False
-                paper_detail = f"blocked; local paper state could not be verified ({exc})"
+        with store_scope(read_only=True) as store:
+            decision_date = latest_paper_decision_date(store)
+            report = assess_us_readiness(decision_date, purpose="paper", store=store)
+            account_path = settings.project_root / DEFAULT_ACCOUNT_RELATIVE_PATH
+            paper_detail = "not initialized; research remains available"
+            paper_ok = True
+            forward_detail = "not frozen; paper results are not an untouched forward trial"
+            forward_ok = True
+            forward_present = False
+            forward_issue_count = 0
+            if account_path.exists():
+                try:
+                    summary = paper_account_summary(account_path, store)
+                    paper_detail = (
+                        f"verified; ${summary['equity']:,.2f} simulated value, "
+                        f"{len(summary['holdings'])} holding(s)"
+                    )
+                except Exception as exc:
+                    paper_ok = False
+                    paper_detail = f"blocked; local paper state could not be verified ({exc})"
+                forward_path = settings.project_root / DEFAULT_FORWARD_RELATIVE_PATH
+                if forward_path.exists():
+                    forward_present = True
+                    try:
+                        forward = assess_forward_trial(
+                            settings.project_root,
+                            forward_path,
+                            account_path,
+                        )
+                        forward_ok = forward.ready
+                        forward_issue_count = len(forward.issues)
+                        forward_detail = (
+                            f"unchanged; {forward.registered_proposals} registered proposal(s)"
+                            if forward.ready
+                            else f"blocked; {forward_issue_count} policy issue(s) require review"
+                        )
+                    except Exception as exc:
+                        forward_ok = False
+                        forward_issue_count = 1
+                        forward_detail = (
+                            f"blocked; forward evidence could not be verified ({exc})"
+                        )
     except duckdb.IOException as exc:
         from aios.alerts import Alert, AlertSeverity
 
-        _emit_operational_alert(
-            Alert(
-                code="health_check_failed",
-                severity=AlertSeverity.CRITICAL,
-                title="AIOS health check could not open the database",
-                body="The operating health check failed before readiness could be verified.",
-                dedup_key="health:execution",
-                source_job="aios health",
-                payload={"error_type": type(exc).__name__},
+        if strict:
+            _emit_operational_alert(
+                Alert(
+                    code="health_check_failed",
+                    severity=AlertSeverity.CRITICAL,
+                    title="AIOS health check could not open the database",
+                    body="The operating health check failed before readiness could be verified.",
+                    dedup_key="health:execution",
+                    source_job="aios health",
+                    payload={"error_type": type(exc).__name__},
+                )
             )
-        )
         console.print(
             "[red]Health check could not open the local database.[/red] Close the "
             "dashboard or another AIOS command, then retry."
@@ -246,17 +491,18 @@ def health(
     except Exception as exc:
         from aios.alerts import Alert, AlertSeverity
 
-        _emit_operational_alert(
-            Alert(
-                code="health_check_failed",
-                severity=AlertSeverity.CRITICAL,
-                title="AIOS health check failed",
-                body="The operating health check failed before a safe result was produced.",
-                dedup_key="health:execution",
-                source_job="aios health",
-                payload={"error_type": type(exc).__name__},
+        if strict:
+            _emit_operational_alert(
+                Alert(
+                    code="health_check_failed",
+                    severity=AlertSeverity.CRITICAL,
+                    title="AIOS health check failed",
+                    body="The operating health check failed before a safe result was produced.",
+                    dedup_key="health:execution",
+                    source_job="aios health",
+                    payload={"error_type": type(exc).__name__},
+                )
             )
-        )
         console.print(f"[red]Health check failed safely:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
@@ -283,13 +529,27 @@ def health(
         paper_detail,
     )
     table.add_row(
+        "Forward-test policy",
+        (
+            "[green]unchanged[/green]"
+            if forward_present and forward_ok
+            else "[yellow]not frozen[/yellow]"
+            if not forward_present
+            else "[red]blocked[/red]"
+        ),
+        forward_detail,
+    )
+    table.add_row(
         "Broker orders",
         "[yellow]disabled[/yellow]",
         "No broker is connected; this installation cannot place an order.",
     )
     console.print(table)
+    decision_date_label = (
+        "Certified decision date" if report.ready else "Blocked decision-date candidate"
+    )
     console.print(
-        f"Certified decision date: {decision_date}. Source dates — prices: "
+        f"{decision_date_label}: {decision_date}. Source dates — prices: "
         f"{report.raw_prices_through}; filings: "
         f"{report.fundamentals_through}; macro releases: "
         f"{report.macro_releases_through}."
@@ -299,37 +559,208 @@ def health(
             "Newer reviewed prices may value existing simulated holdings, but they do not "
             "advance new decisions until the dated universe is certified too."
         )
-    healthy = report.ready and integrity.status != "fail" and paper_ok
-    _resolve_operational_alert("health:execution")
+    research_healthy = report.ready and integrity.status != "fail" and paper_ok
+    forward_blocked = forward_present and not forward_ok
+    healthy = research_healthy and not forward_blocked
+    if strict:
+        _resolve_operational_alert("health:execution")
+        if research_healthy:
+            _resolve_operational_alert("readiness:paper")
+        else:
+            from aios.alerts import Alert, AlertSeverity
+
+            _emit_operational_alert(
+                Alert(
+                    code="readiness_blocked",
+                    severity=AlertSeverity.CRITICAL,
+                    title="Paper research readiness became blocked",
+                    body="One or more fail-closed research-data gates require review.",
+                    dedup_key="readiness:paper",
+                    source_job="aios health",
+                    payload={
+                        "decision_date": str(decision_date),
+                        "blockers": [check.check for check in report.blockers],
+                        "paper_state_verified": paper_ok,
+                    },
+                )
+            )
+        if forward_blocked:
+            from aios.alerts import Alert, AlertSeverity
+
+            _emit_operational_alert(
+                Alert(
+                    code="forward_policy_drift",
+                    severity=AlertSeverity.CRITICAL,
+                    title="Frozen forward policy drifted",
+                    body="Research data remains separate; simulated execution is blocked.",
+                    dedup_key="forward:drift",
+                    source_job="aios health",
+                    payload={
+                        "decision_date": str(decision_date),
+                        "issue_count": forward_issue_count,
+                    },
+                )
+            )
+        elif forward_present:
+            _resolve_operational_alert("forward:drift")
+
     if healthy:
-        _resolve_operational_alert("readiness:paper")
         console.print(
             "[bold green]HEALTHY for supervised research and paper monitoring.[/bold green]"
         )
-    else:
-        from aios.alerts import Alert, AlertSeverity
-
-        _emit_operational_alert(
-            Alert(
-                code="readiness_blocked",
-                severity=AlertSeverity.CRITICAL,
-                title="Paper research readiness became blocked",
-                body="One or more fail-closed operating gates require review.",
-                dedup_key="readiness:paper",
-                source_job="aios health",
-                payload={
-                    "decision_date": str(decision_date),
-                    "blockers": [check.check for check in report.blockers],
-                    "paper_state_verified": paper_ok,
-                },
-            )
+    elif research_healthy and forward_blocked:
+        console.print(
+            "[bold yellow]RESEARCH READY — forward paper execution is blocked until "
+            "the policy trial is prospectively replaced.[/bold yellow]"
         )
+    else:
         console.print("[bold red]BLOCKED — do not create or record a paper proposal.[/bold red]")
     if strict and not healthy:
         raise typer.Exit(code=1)
 
 
+@app.command("preflight")
+def preflight(
+    proposal: Annotated[
+        Path | None,
+        typer.Option(
+            "--proposal",
+            help="Optional path; it must match an active-trial registration.",
+        ),
+    ] = None,
+    review_paper: Annotated[
+        bool,
+        typer.Option(
+            "--review-paper/--timing-only",
+            help=(
+                "Run the full governed paper review when its window is open; "
+                "the default performs only the lightweight timing check."
+            ),
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit only canonical machine-readable JSON."),
+    ] = False,
+    required: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--require",
+            help=(
+                "Fail unless this capability is available; repeat for research, "
+                "proposal_creation, stress_review, paper_recording, operations, "
+                "or real_capital."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Report independent read-only capability states and one safe next action."""
+    from contextlib import redirect_stderr, redirect_stdout
+    from io import StringIO
+
+    def fail_safely(exc: Exception, schema_version: str) -> None:
+        if json_output:
+            typer.echo(
+                json.dumps(
+                    {
+                        "schema_version": schema_version,
+                        "error": {
+                            "type": type(exc).__name__,
+                            "detail": str(exc),
+                        },
+                        "read_only": True,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        else:
+            console.print(f"[red]Operator preflight failed safely:[/red] {exc}")
+            console.print(
+                "No account, proposal, trial, incident, database, or broker state "
+                "was changed."
+            )
+
+    requested = tuple(dict.fromkeys(required or ()))
+    try:
+        from aios.operator_preflight import (
+            CAPABILITY_KEYS,
+            PREFLIGHT_SCHEMA_VERSION,
+            assess_operator_preflight,
+        )
+    except Exception as exc:
+        fail_safely(exc, "operator-preflight.v1")
+        raise typer.Exit(code=1) from exc
+
+    unknown = [scope for scope in requested if scope not in CAPABILITY_KEYS]
+    if unknown:
+        allowed = ", ".join(CAPABILITY_KEYS)
+        console.print(
+            f"[red]Operator preflight refused:[/red] unknown capability "
+            f"{unknown[0]!r}; choose one of: {allowed}"
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            snapshot = assess_operator_preflight(
+                proposal_path=_project_path(proposal) if proposal is not None else None,
+                review_paper=review_paper,
+            )
+    except Exception as exc:
+        fail_safely(exc, PREFLIGHT_SCHEMA_VERSION)
+        raise typer.Exit(code=1) from exc
+
+    unmet = [scope for scope in requested if not snapshot.capability(scope).available]
+    if json_output:
+        typer.echo(snapshot.canonical_json())
+    else:
+        console.rule("[bold]AIOS operator preflight[/bold]")
+        console.print(f"Checked at: {snapshot.checked_at}")
+        console.print(
+            f"Certified decision date: {snapshot.decision_date or 'unavailable'}"
+        )
+        console.print(f"Registered proposal: {snapshot.proposal_path or 'none'}")
+        table = Table()
+        table.add_column("Capability")
+        table.add_column("State")
+        table.add_column("Available now")
+        table.add_column("Plain-language detail")
+        for key in CAPABILITY_KEYS:
+            capability = snapshot.capability(key)
+            color = "green" if capability.available else "yellow"
+            if capability.state in {"blocked", "critical", "expired", "unavailable"}:
+                color = "red"
+            table.add_row(
+                capability.label,
+                f"[{color}]{capability.state}[/{color}]",
+                "yes" if capability.available else "no",
+                capability.detail,
+            )
+        console.print(table)
+        console.rule("[bold]Next safe action[/bold]")
+        console.print(f"[bold]{snapshot.next_action.title}[/bold]")
+        console.print(snapshot.next_action.detail)
+        if snapshot.next_action.command is not None:
+            console.print(f"[bold]{snapshot.next_action.command}[/bold]")
+        elif snapshot.next_action.kind == "human_decision":
+            console.print(
+                "[yellow]Human confirmation is required; preflight intentionally "
+                "generated no state-changing command.[/yellow]"
+            )
+        else:
+            console.print("[yellow]Wait — no command should be run for this state.[/yellow]")
+        console.print(
+            "[dim]Read-only proof: no refresh, proposal, simulation record, incident "
+            "transition, database write, or broker action was performed.[/dim]"
+        )
+    if unmet:
+        raise typer.Exit(code=1)
+
+
 @app.command("backup")
+@_exclusive_project_operation("backup")
 def backup(
     output: Annotated[
         Path | None,
@@ -421,13 +852,42 @@ def verify_backup(
     )
 
 
+@app.command("restore-drill")
+def restore_drill(
+    path: Annotated[Path, typer.Argument(help="Verified backup directory to drill.")],
+) -> None:
+    """Restore into a disposable project and certify DB plus raw evidence."""
+    from aios.operations import drill_local_backup
+
+    try:
+        result = drill_local_backup(
+            _project_path(path),
+            application_version=__version__,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Non-destructive restore drill failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"[bold green]Non-destructive restore drill passed:[/bold green] "
+        f"{result.source}"
+    )
+    console.print(
+        f"{result.files} file(s), {result.bytes:,} bytes; "
+        f"{result.raw_payloads} raw payload(s), "
+        f"{result.replayed_snapshots} parsed replay(s), "
+        f"{result.hard_failures} hard validation failure(s)."
+    )
+    console.print(f"Manifest SHA-256 {result.manifest_sha256}. Live state was untouched.")
+
+
 @app.command("verify-raw-snapshots")
 def verify_raw_snapshot_command() -> None:
     """Verify every registered immutable provider payload."""
     from aios.raw_snapshots import verify_raw_snapshots
 
     try:
-        result = verify_raw_snapshots()
+        with store_scope(read_only=True) as store:
+            result = verify_raw_snapshots(store=store)
     except (OSError, ValueError) as exc:
         console.print(f"[red]Raw snapshot verification failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -435,11 +895,12 @@ def verify_raw_snapshot_command() -> None:
         "[bold green]Raw snapshots verified:[/bold green] "
         f"{result.payloads} payload(s), {result.original_bytes:,} original bytes, "
         f"{result.stored_bytes:,} stored bytes, "
-        f"{result.replayed_snapshots} normalized replay(s)."
+        f"{result.replayed_snapshots} parsed replay(s)."
     )
 
 
 @app.command("review-universe-current")
+@_exclusive_project_operation("review-universe-current")
 def review_universe_current() -> None:
     """Archive free source evidence and extend only an unchanged S&P 500 universe."""
     from aios.alerts import Alert, AlertSeverity
@@ -536,6 +997,7 @@ def review_universe_current() -> None:
 
 
 @app.command("restore")
+@_exclusive_project_operation("restore")
 def restore(
     path: Annotated[Path, typer.Argument(help="Verified backup directory to restore.")],
     confirm_restore: Annotated[
@@ -616,7 +1078,7 @@ def scheduler_install(
         ),
     ] = False,
 ) -> None:
-    """Install recoverable daily, filings, and backup user timers."""
+    """Install core timers plus inactive optional email-delivery unit files."""
     from aios.scheduler import install_user_scheduler
 
     try:
@@ -637,7 +1099,9 @@ def scheduler_install(
         "New York time. It also checks three minutes after the user scheduler starts, "
         "so an interrupted or missed run catches up safely. "
         "Weekly filings run Saturday at 09:00, and verified backups Sunday at 09:00 "
-        "(the weekly jobs use computer local time)."
+        "(the weekly jobs use computer local time). The optional email worker files "
+        "are installed but its timer remains off until an exact-config receipt test "
+        "passes and `aios email-enable --confirm-enable` is run."
     )
     if result.linger_enabled:
         console.print(
@@ -651,8 +1115,9 @@ def scheduler_install(
             "`--keep-running-after-logout` for unattended local updates."
         )
     console.print(
-        "The dashboard uses short read-only database sessions, and scheduled jobs wait up "
-        "to five minutes for a brief overlap. Close it only for restore operations."
+        "The dashboard uses short read-only database sessions. Scheduled writer jobs share "
+        "a 30-minute wait queue, then each DuckDB open still waits up to five minutes for "
+        "a brief reader overlap. Close the dashboard only for restore operations."
     )
 
 
@@ -807,7 +1272,10 @@ def alerts_command(
     from aios.alerts import get_alert_store
 
     try:
-        incidents = get_alert_store().list(unresolved_only=unresolved, limit=limit)
+        incidents = get_alert_store(read_only=True).list(
+            unresolved_only=unresolved,
+            limit=limit,
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         console.print(f"[red]Incident history is unavailable:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -841,7 +1309,7 @@ def alert_show(
     from aios.alerts import get_alert_store
 
     try:
-        store = get_alert_store()
+        store = get_alert_store(read_only=True)
         incident = store.get(incident_id)
         events = store.events(incident_id)
     except (OSError, RuntimeError, ValueError) as exc:
@@ -915,6 +1383,7 @@ def alert_test() -> None:
                 dedup_key="test:local-alert-path",
                 source_job="aios alert-test",
                 payload={"test": True},
+                notify=False,
             )
         )
         store.resolve(incident.incident_id)
@@ -925,6 +1394,541 @@ def alert_test() -> None:
     console.print(
         "The test incident was opened, logged, and resolved; no external message was sent."
     )
+
+
+@app.command("notifications")
+def notifications_command(
+    pending: Annotated[
+        bool,
+        typer.Option(
+            "--pending",
+            help="Show only messages currently waiting for a configured delivery worker.",
+        ),
+    ] = False,
+    needs_review: Annotated[
+        bool,
+        typer.Option(
+            "--needs-review",
+            help="Show only messages that exhausted retry policy.",
+        ),
+    ] = False,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", min=1, max=1000, help="Maximum messages to display."),
+    ] = 100,
+) -> None:
+    """Inspect durable alert copies without sending an external message."""
+    from aios.alerts import get_alert_store
+    from aios.notifications import EMAIL_CHANNEL_NAME, EMAIL_ROUTE_ALIAS
+
+    if pending and needs_review:
+        console.print("[red]Choose either --pending or --needs-review, not both.[/red]")
+        raise typer.Exit(code=1)
+    state = "pending" if pending else ("dead_letter" if needs_review else None)
+    try:
+        store = get_alert_store(read_only=True)
+        summary = store.notification_summary()
+        messages = store.list_notifications(state=state, limit=limit)
+        route = store.notification_route(
+            EMAIL_CHANNEL_NAME,
+            route_alias=EMAIL_ROUTE_ALIAS,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Notification outbox is unavailable:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    route_enabled = route is not None and route.state == "enabled"
+    console.print(
+        "[cyan]External email delivery:[/cyan] "
+        + (
+            "enabled for future incident changes."
+            if route_enabled
+            else "off — incidents and message copies remain safely local."
+        )
+    )
+    console.print(
+        "Held: {held}; waiting: {pending}; sending: {leased}; delivered: "
+        "{delivered}; needs review: {dead_letter}.".format(**summary)
+    )
+    state_labels = {
+        "held": "Held locally",
+        "pending": "Waiting to retry",
+        "leased": "Sending now",
+        "delivered": "Sent",
+        "dead_letter": "Needs review",
+    }
+    table = Table(title="AIOS notification outbox")
+    table.add_column("notification ref", min_width=18, no_wrap=True)
+    table.add_column("state")
+    table.add_column("event")
+    table.add_column("severity")
+    table.add_column("created", no_wrap=True)
+    table.add_column("attempts", justify="right")
+    table.add_column("summary")
+    for message in messages:
+        table.add_row(
+            message.notification_id[:20],
+            state_labels[message.state],
+            message.event_type,
+            message.severity,
+            message.created_at[:16].replace("T", " "),
+            str(message.attempt_count),
+            message.title,
+        )
+    console.print(table)
+    if not messages:
+        console.print("No matching notification messages are recorded.")
+    console.print(
+        "Use `aios notification-show NOTIFICATION_REF` for message and attempt history."
+    )
+
+
+@app.command("notification-show")
+def notification_show(
+    notification_id: Annotated[
+        str,
+        typer.Argument(help="Notification reference shown by `aios notifications`."),
+    ],
+) -> None:
+    """Show one immutable message and every attempted delivery."""
+    from aios.alerts import get_alert_store
+
+    try:
+        store = get_alert_store(read_only=True)
+        message = store.get_notification(notification_id)
+        deliveries = store.notification_deliveries(notification_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Notification detail is unavailable:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.rule(f"[bold]{message.title}[/bold]")
+    console.print(f"Notification: {message.notification_id}")
+    console.print(f"Incident: {message.incident_id or 'none (local test)'}")
+    console.print(
+        f"Event/severity/state: {message.event_type} / "
+        f"{message.severity} / {message.state}"
+    )
+    console.print(f"Source: {message.source_job}")
+    console.print(f"Created/available: {message.created_at} / {message.available_at}")
+    console.print(f"Attempts: {message.attempt_count}")
+    console.print(f"Detail: {message.body}")
+    console.print("Safe structured context:")
+    console.print_json(json.dumps(message.payload, sort_keys=True))
+    table = Table(title="Delivery attempts")
+    table.add_column("attempt")
+    table.add_column("channel")
+    table.add_column("route")
+    table.add_column("state")
+    table.add_column("started")
+    table.add_column("retry")
+    table.add_column("safe error")
+    for delivery in deliveries:
+        table.add_row(
+            str(delivery.attempt_number),
+            delivery.channel,
+            delivery.route_alias,
+            delivery.state.replace("_", " "),
+            delivery.started_at,
+            delivery.retry_at or "—",
+            delivery.error_type or "—",
+        )
+    console.print(table)
+    if not deliveries:
+        console.print("No delivery has been attempted. External alert delivery is off.")
+
+
+@app.command("notification-test")
+def notification_test() -> None:
+    """Certify enqueue, lease, attempt, and completion without network access."""
+    from aios.alerts import (
+        AlertSeverity,
+        NotificationRequest,
+        get_alert_store,
+    )
+    from aios.notifications import LocalTestChannel, dispatch_notifications
+
+    try:
+        store = get_alert_store()
+        message = store.enqueue_notification(
+            NotificationRequest(
+                idempotency_key=f"test:local-notification:{uuid4().hex}",
+                event_type="test",
+                severity=AlertSeverity.INFO,
+                title="Local notification lifecycle test",
+                body="This message is delivered only to the deterministic local test sink.",
+                source_job="aios notification-test",
+                payload={"external_delivery": False, "test": True},
+            ),
+            held=False,
+        )
+        result = dispatch_notifications(
+            store,
+            LocalTestChannel(),
+            notification_id=message.notification_id,
+        )
+        completed = store.get_notification(message.notification_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Local notification test failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if result.succeeded != 1 or completed.state != "delivered":
+        console.print("[red]Local notification test did not reach a delivered state.[/red]")
+        raise typer.Exit(code=1)
+    console.print(
+        f"[bold green]Local notification lifecycle passed:[/bold green] "
+        f"{message.notification_id}"
+    )
+    console.print(
+        "The message was enqueued, leased, attempted, and completed locally. "
+        "No network request, email, Slack message, or broker action occurred."
+    )
+
+
+@app.command("email-status")
+def email_status() -> None:
+    """Show whether SMTP is configured, tested, and durably enabled."""
+    from aios.alerts import get_alert_store
+    from aios.notifications import (
+        EMAIL_CHANNEL_NAME,
+        EMAIL_ROUTE_ALIAS,
+        smtp_email_config,
+    )
+    from aios.scheduler import email_scheduler_status
+
+    try:
+        store = get_alert_store(read_only=True)
+        route = store.notification_route(
+            EMAIL_CHANNEL_NAME,
+            route_alias=EMAIL_ROUTE_ALIAS,
+        )
+        summary = store.notification_summary()
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Email status is unavailable:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        config = smtp_email_config()
+        configured = True
+        config_detail = "complete; secret values and addresses are not displayed"
+    except ValueError as exc:
+        config = None
+        configured = False
+        config_detail = str(exc)
+    try:
+        timer = email_scheduler_status()
+        timer_enabled = bool(timer["enabled"])
+        timer_verified = bool(timer["runtime_verified"])
+    except (OSError, RuntimeError, ValueError):
+        timer = {}
+        timer_enabled = False
+        timer_verified = False
+
+    enabled = route is not None and route.state == "enabled"
+    matches = (
+        enabled
+        and config is not None
+        and route is not None
+        and route.config_fingerprint == config.fingerprint
+    )
+    tested = (
+        config is not None
+        and _successful_email_test_exists(store, config.fingerprint)
+    )
+    configuration_label = (
+        "[green]complete[/green]"
+        if configured
+        else "[yellow]incomplete[/yellow]"
+    )
+    console.print(f"SMTP configuration: {configuration_label}")
+    console.print(config_detail)
+    console.print(
+        f"Future incident email: {'[green]enabled[/green]' if enabled else '[yellow]off[/yellow]'}"
+    )
+    console.print(
+        "Automatic email worker: "
+        + (
+            "[green]enabled[/green]"
+            if timer_enabled and timer_verified
+            else (
+                "[yellow]runtime not verified[/yellow]"
+                if timer_enabled
+                else "[yellow]off[/yellow]"
+            )
+        )
+    )
+    console.print(
+        "Current configuration receipt test: "
+        + ("[green]passed[/green]" if tested else "[yellow]not passed[/yellow]")
+    )
+    if enabled:
+        console.print(
+            "Active configuration match: "
+            + ("[green]yes[/green]" if matches else "[red]no — delivery fails closed[/red]")
+        )
+    console.print(
+        f"Held historical/local messages: {summary['held']}; "
+        f"waiting: {summary['pending']}; needs review: {summary['dead_letter']}."
+    )
+    console.print("No email was sent by this status command.")
+
+
+@app.command("email-test")
+def email_test(
+    confirm_send: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-send/--no-confirm-send",
+            help="Required acknowledgement before one real external test email is sent.",
+        ),
+    ] = False,
+) -> None:
+    """Send exactly one SMTP receipt test without enabling future alerts."""
+    from aios.alerts import (
+        AlertSeverity,
+        NotificationRequest,
+        get_alert_store,
+    )
+    from aios.notifications import dispatch_email_notifications, smtp_email_config
+
+    if not confirm_send:
+        console.print(
+            "[yellow]No email sent.[/yellow] Re-run with --confirm-send after reviewing "
+            "your local SMTP settings."
+        )
+        raise typer.Exit(code=1)
+    message = None
+    try:
+        config = smtp_email_config()
+        store = get_alert_store()
+        message = store.enqueue_notification(
+            NotificationRequest(
+                idempotency_key=f"test:smtp-email:{uuid4().hex}",
+                event_type="test",
+                severity=AlertSeverity.INFO,
+                title="AIOS external email receipt test",
+                body=(
+                    "This is a deliberate delivery test. It does not enable future alerts."
+                ),
+                source_job="aios email-test",
+                payload={
+                    "config_fingerprint": config.fingerprint,
+                    "email_test": True,
+                    "external_delivery": True,
+                },
+            ),
+            held=False,
+        )
+        result = dispatch_email_notifications(
+            store,
+            config,
+            notification_id=message.notification_id,
+            require_enabled_route=False,
+        )
+        completed = store.get_notification(message.notification_id)
+        if result.succeeded != 1 or completed.state != "delivered":
+            if completed.state == "pending":
+                completed = store.hold_notification(
+                    message.notification_id,
+                    reason="email_test_failed",
+                )
+            console.print(
+                f"[red]Email receipt test failed safely:[/red] {completed.notification_id}"
+            )
+            console.print(
+                "The test remains local and will not be retried automatically. "
+                "Inspect it with `aios notification-show NOTIFICATION_REF`."
+            )
+            raise typer.Exit(code=1)
+    except typer.Exit:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        if message is not None:
+            try:
+                unfinished = store.get_notification(message.notification_id)
+                if unfinished.state == "pending":
+                    store.hold_notification(
+                        message.notification_id,
+                        reason="email_test_failed",
+                    )
+            except (OSError, RuntimeError, ValueError):
+                pass
+        console.print(f"[red]Email receipt test was refused safely:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"[bold green]External email receipt accepted:[/bold green] "
+        f"{message.notification_id}"
+    )
+    console.print(
+        "Future incident email is still off. Confirm receipt in your mailbox, then run "
+        "`aios email-enable --confirm-enable`."
+    )
+
+
+@app.command("email-enable")
+def email_enable(
+    confirm_enable: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-enable/--no-confirm-enable",
+            help="Enable email only for incident transitions created after this command.",
+        ),
+    ] = False,
+) -> None:
+    """Enable future SMTP alerts only after an exact-config receipt test."""
+    from aios.alerts import get_alert_store
+    from aios.notifications import (
+        EMAIL_CHANNEL_NAME,
+        EMAIL_ROUTE_ALIAS,
+        smtp_email_config,
+    )
+    from aios.scheduler import set_email_scheduler_active
+
+    if not confirm_enable:
+        console.print(
+            "[yellow]Email remains off.[/yellow] Enabling future alerts requires "
+            "--confirm-enable."
+        )
+        raise typer.Exit(code=1)
+    try:
+        config = smtp_email_config()
+        store = get_alert_store()
+        if not _successful_email_test_exists(store, config.fingerprint):
+            raise ValueError(
+                "no successful receipt test matches the current email configuration; "
+                "run `aios email-test --confirm-send` first"
+            )
+        set_email_scheduler_active(True)
+        try:
+            route = store.enable_notification_route(
+                EMAIL_CHANNEL_NAME,
+                config.fingerprint,
+                route_alias=EMAIL_ROUTE_ALIAS,
+            )
+        except Exception:
+            set_email_scheduler_active(False)
+            raise
+        summary = store.notification_summary()
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Email enable was refused safely:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"[bold green]Future incident email enabled:[/bold green] {route.enabled_at}"
+    )
+    console.print(
+        f"{summary['held']} existing held message(s) remain held and will not be sent. "
+        "Only new incident opens, escalations, reopenings, and eligible recoveries can "
+        "enter the email queue."
+    )
+    console.print("The optional email worker now checks the queue every five minutes.")
+
+
+@app.command("email-disable")
+def email_disable(
+    confirm_disable: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-disable/--no-confirm-disable",
+            help="Required acknowledgement before future email is stopped.",
+        ),
+    ] = False,
+) -> None:
+    """Stop external email and safely hold unsent production messages."""
+    from aios.alerts import get_alert_store
+    from aios.notifications import EMAIL_CHANNEL_NAME, EMAIL_ROUTE_ALIAS
+    from aios.scheduler import set_email_scheduler_active
+
+    if not confirm_disable:
+        console.print(
+            "[yellow]Email state was not changed.[/yellow] Use --confirm-disable."
+        )
+        raise typer.Exit(code=1)
+    try:
+        store = get_alert_store()
+        existing = store.notification_route(
+            EMAIL_CHANNEL_NAME,
+            route_alias=EMAIL_ROUTE_ALIAS,
+        )
+        route = (
+            store.disable_notification_route(
+                EMAIL_CHANNEL_NAME,
+                route_alias=EMAIL_ROUTE_ALIAS,
+            )
+            if existing is not None
+            else None
+        )
+        set_email_scheduler_active(False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Email disable was refused safely:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        "[green]Future incident email is off.[/green]"
+        + (f" Disabled at {route.disabled_at}." if route is not None else "")
+    )
+    console.print("Unsent production messages were held locally; nothing was deleted.")
+
+
+@app.command("email-deliver")
+def email_deliver(
+    limit: Annotated[
+        int,
+        typer.Option("--limit", min=1, max=100, help="Maximum messages this pass."),
+    ] = 20,
+) -> None:
+    """Run one bounded SMTP delivery/retry pass for the enabled route."""
+    from aios.alerts import get_alert_store
+    from aios.notifications import (
+        EMAIL_CHANNEL_NAME,
+        EMAIL_ROUTE_ALIAS,
+        dispatch_email_notifications,
+        smtp_email_config,
+    )
+
+    try:
+        store = get_alert_store()
+        route = store.notification_route(
+            EMAIL_CHANNEL_NAME,
+            route_alias=EMAIL_ROUTE_ALIAS,
+        )
+        if route is None or route.state != "enabled":
+            console.print("External email is off; no delivery was attempted.")
+            return
+        config = smtp_email_config()
+        result = dispatch_email_notifications(store, config, limit=limit)
+        summary = store.notification_summary()
+        route_dead_letters = store.notification_route_dead_letter_count(
+            EMAIL_CHANNEL_NAME,
+            route_alias=EMAIL_ROUTE_ALIAS,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Email delivery failed closed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"Email pass: claimed {result.claimed}, delivered {result.succeeded}, "
+        f"failed {result.failed}, newly needs review {result.dead_lettered}."
+    )
+    if result.failed or summary["pending"] or route_dead_letters:
+        console.print(
+            f"[yellow]{summary['pending']} queued message(s); "
+            f"{route_dead_letters} email message(s) need review.[/yellow]"
+        )
+        raise typer.Exit(code=1)
+    console.print("[green]Email delivery queue is clear.[/green]")
+
+
+def _successful_email_test_exists(store: Any, config_fingerprint: str) -> bool:
+    for message in store.list_notifications(state="delivered", limit=1000):
+        if (
+            message.event_type != "test"
+            or message.payload.get("email_test") is not True
+            or message.payload.get("config_fingerprint") != config_fingerprint
+        ):
+            continue
+        if any(
+            delivery.channel == "smtp-email"
+            and delivery.route_alias == "primary"
+            and delivery.state == "succeeded"
+            for delivery in store.notification_deliveries(message.notification_id)
+        ):
+            return True
+    return False
 
 
 @app.command("alert-service-failure", hidden=True)
@@ -984,7 +1988,10 @@ def dashboard(
         )
         raise typer.Exit(code=1)
 
-    script = settings.project_root / "src" / "aios" / "dashboard.py"
+    script = Path(__file__).resolve().with_name("dashboard.py")
+    if not script.is_file():
+        console.print("[red]Packaged dashboard entrypoint is missing.[/red]")
+        raise typer.Exit(code=1)
     command = [
         sys.executable,
         "-m",
@@ -1010,7 +2017,13 @@ def dashboard(
 def readiness(
     as_of: Annotated[
         str | None,
-        typer.Option("--as-of", help="Decision date (YYYY-MM-DD); defaults to today."),
+        typer.Option(
+            "--as-of",
+            help=(
+                "Decision date (YYYY-MM-DD); defaults to the newest reviewed "
+                "U.S. decision-date candidate."
+            ),
+        ),
     ] = None,
     purpose: Annotated[
         str,
@@ -1028,21 +2041,37 @@ def readiness(
     ] = True,
     json_output: Annotated[
         Path | None,
-        typer.Option("--json-output", help="Optional machine-readable report path."),
+        typer.Option(
+            "--json-output",
+            help=(
+                "Optional write-once .json path under "
+                "data/reports/readiness."
+            ),
+        ),
     ] = None,
 ) -> None:
     """Report whether U.S. evidence is safe for the requested operating use."""
-    decision_date = as_of or date.today().isoformat()
     try:
-        date.fromisoformat(decision_date)
         if purpose not in {"paper", "historical_research"}:
             raise ValueError("purpose must be 'paper' or 'historical_research'")
-        report = assess_us_readiness(decision_date, purpose=purpose)
+        with store_scope(read_only=True) as store:
+            if as_of is None:
+                from aios.paper import latest_paper_decision_date
+
+                decision_date = latest_paper_decision_date(store).isoformat()
+            else:
+                date.fromisoformat(as_of)
+                decision_date = as_of
+            report = assess_us_readiness(
+                decision_date,
+                purpose=purpose,
+                store=store,
+            )
         if json_output is not None:
-            json_output.parent.mkdir(parents=True, exist_ok=True)
-            json_output.write_text(
+            destination = _resolve_readiness_report_path(json_output)
+            _publish_text_write_once(
+                destination,
                 json.dumps(report.to_dict(), indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
             )
     except duckdb.IOException as exc:
         console.print(
@@ -1055,8 +2084,13 @@ def readiness(
         raise typer.Exit(code=1) from exc
 
     console.rule(f"[bold]U.S. readiness — {report.as_of} ({report.purpose})[/bold]")
+    research_window_label = (
+        "Certified historical research window"
+        if report.ready
+        else "Broad-coverage candidate window"
+    )
     console.print(
-        "[cyan]Certified historical research window:[/cyan] "
+        f"[cyan]{research_window_label}:[/cyan] "
         f"{report.certified_research_from or 'unavailable'} through "
         f"{report.certified_research_through or 'unavailable'}"
     )
@@ -1095,6 +2129,7 @@ def readiness(
 
 
 @app.command("paper-init")
+@_exclusive_project_operation("paper-init")
 def paper_init(
     account: Annotated[
         Path,
@@ -1118,13 +2153,14 @@ def paper_init(
 
     destination = _project_path(account)
     try:
-        document = initialize_paper_account(
-            destination,
-            get_store(),
-            initial_capital=initial_capital,
-            commission_bps=commission_bps,
-            slippage_bps=slippage_bps,
-        )
+        with store_scope(read_only=True) as store:
+            document = initialize_paper_account(
+                destination,
+                store,
+                initial_capital=initial_capital,
+                commission_bps=commission_bps,
+                slippage_bps=slippage_bps,
+            )
     except Exception as exc:
         console.print(f"[red]Paper account creation refused:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -1137,6 +2173,7 @@ def paper_init(
 
 
 @app.command("forward-freeze")
+@_exclusive_project_operation("forward-freeze")
 def forward_freeze(
     proposal: Annotated[
         Path | None,
@@ -1204,7 +2241,7 @@ def forward_status(
         typer.Option("--account", help="Local paper-account JSON path."),
     ] = Path("data/paper/us_qv_sandbox.json"),
 ) -> None:
-    """Verify that the active forward policy and registered evidence are unchanged."""
+    """Verify forward evidence without changing incidents or governed state."""
     from aios.forward import assess_forward_trial
 
     try:
@@ -1214,42 +2251,15 @@ def forward_status(
             _project_path(account),
         )
     except (OSError, ValueError) as exc:
-        from aios.alerts import Alert, AlertSeverity
-
-        _emit_operational_alert(
-            Alert(
-                code="forward_status_unavailable",
-                severity=AlertSeverity.CRITICAL,
-                title="Forward-policy status could not be verified",
-                body="The frozen forward-trial evidence could not be opened or validated.",
-                dedup_key="forward:status",
-                source_job="aios forward-status",
-                payload={"error_type": type(exc).__name__},
-            )
-        )
         console.print(f"[red]Forward status unavailable:[/red] {exc}")
         raise typer.Exit(code=1) from exc
     console.rule("[bold]U.S. untouched forward monitor[/bold]")
     console.print(f"Trial ID: {status.trial_id}")
     console.print(f"Registered proposals: {status.registered_proposals}")
-    _resolve_operational_alert("forward:status")
     if status.ready:
-        _resolve_operational_alert("forward:drift")
         console.print("[bold green]UNCHANGED — forward policy evidence is intact.[/bold green]")
         return
-    from aios.alerts import Alert, AlertSeverity
 
-    _emit_operational_alert(
-        Alert(
-            code="forward_policy_drift",
-            severity=AlertSeverity.CRITICAL,
-            title="Frozen forward policy drifted",
-            body="The active trial no longer matches its frozen policy evidence.",
-            dedup_key="forward:drift",
-            source_job="aios forward-status",
-            payload={"trial_id": status.trial_id, "issue_count": len(status.issues)},
-        )
-    )
     for issue in status.issues:
         console.print(f"[red]• {issue}[/red]")
     console.print("[bold red]DRIFTED — do not count newer observations in this trial.[/bold red]")
@@ -1257,6 +2267,7 @@ def forward_status(
 
 
 @app.command("forward-restart")
+@_exclusive_project_operation("forward-restart")
 def forward_restart(
     as_of: Annotated[
         str | None,
@@ -1304,41 +2315,45 @@ def forward_restart(
         )
         raise typer.Exit(code=1)
 
-    store = get_store()
     account_path = _project_path(account)
     trial_path = _project_path(trial)
     created_proposal: Path | None = None
     try:
-        status = assess_forward_trial(
-            settings.project_root,
-            trial_path,
-            account_path,
-        )
-        if status.ready:
-            raise ValueError("active forward trial is unchanged; continue the existing trial")
-        decision_date = date.fromisoformat(as_of) if as_of else latest_paper_decision_date(store)
-        destination = (
-            _project_path(proposal_output)
-            if proposal_output is not None
-            else default_proposal_path(settings.project_root, decision_date)
-        )
-        if destination.exists():
-            raise ValueError(f"replacement proposal already exists: {destination}")
-        proposal = create_paper_proposal(
-            account_path,
-            destination,
-            decision_date,
-            store,
-            top_n=top_n,
-        )
-        created_proposal = proposal.path
-        replacement = replace_drifted_forward_trial(
-            settings.project_root,
-            trial_path,
-            account_path,
-            proposal.path,
-            confirm=True,
-        )
+        with store_scope(read_only=True) as store:
+            status = assess_forward_trial(
+                settings.project_root,
+                trial_path,
+                account_path,
+            )
+            if status.ready:
+                raise ValueError("active forward trial is unchanged; continue the existing trial")
+            decision_date = (
+                date.fromisoformat(as_of) if as_of else latest_paper_decision_date(store)
+            )
+            destination = (
+                _resolve_paper_proposal_output_path(proposal_output)
+                if proposal_output is not None
+                else _resolve_paper_proposal_output_path(
+                    default_proposal_path(settings.project_root, decision_date)
+                )
+            )
+            if destination.exists():
+                raise ValueError(f"replacement proposal already exists: {destination}")
+            proposal = create_paper_proposal(
+                account_path,
+                destination,
+                decision_date,
+                store,
+                top_n=top_n,
+            )
+            created_proposal = proposal.path
+            replacement = replace_drifted_forward_trial(
+                settings.project_root,
+                trial_path,
+                account_path,
+                proposal.path,
+                confirm=True,
+            )
     except Exception as exc:
         if created_proposal is not None:
             with suppress(OSError):
@@ -1359,6 +2374,7 @@ def forward_restart(
 
 
 @app.command("paper-propose")
+@_exclusive_project_operation("paper-propose")
 def paper_propose(
     as_of: Annotated[
         str | None,
@@ -1393,50 +2409,105 @@ def paper_propose(
         assess_forward_trial,
         read_forward_trial,
         register_forward_proposal,
+        require_registered_forward_proposal,
     )
     from aios.paper import (
+        ACCOUNT_DOCUMENT_KIND,
+        PROPOSAL_DOCUMENT_KIND,
         create_paper_proposal,
         default_proposal_path,
         latest_paper_decision_date,
+        read_paper_document,
     )
 
-    store = get_store()
     try:
-        decision_date = date.fromisoformat(as_of) if as_of else latest_paper_decision_date(store)
-        destination = (
-            _project_path(output)
-            if output is not None
-            else default_proposal_path(settings.project_root, decision_date)
-        )
-        trial_path = settings.project_root / DEFAULT_FORWARD_RELATIVE_PATH
-        if trial_path.exists():
-            status = assess_forward_trial(
-                settings.project_root,
-                trial_path,
-                _project_path(account),
+        with store_scope(read_only=True) as store:
+            decision_date = (
+                date.fromisoformat(as_of) if as_of else latest_paper_decision_date(store)
             )
-            if not status.ready:
-                raise ValueError("active forward trial drifted: " + "; ".join(status.issues))
-            trial = read_forward_trial(trial_path)
-            if top_n != int(trial.payload["frozen_configuration"]["top_n"]):
-                raise ValueError("top_n differs from the active forward trial")
+            account_path = _project_path(account)
+            destination = (
+                _resolve_paper_proposal_output_path(output)
+                if output is not None
+                else _resolve_paper_proposal_output_path(
+                    default_proposal_path(settings.project_root, decision_date)
+                )
+            )
             if replace and destination.exists():
-                raise ValueError("registered forward proposals cannot be replaced")
-        document = create_paper_proposal(
-            _project_path(account),
-            destination,
-            decision_date,
-            store,
-            top_n=top_n,
-            replace=replace,
-        )
-        if trial_path.exists():
-            register_forward_proposal(
-                settings.project_root,
-                trial_path,
-                _project_path(account),
-                document.path,
+                existing = read_paper_document(
+                    destination,
+                    expected_kind=PROPOSAL_DOCUMENT_KIND,
+                )
+                current_account = read_paper_document(
+                    account_path,
+                    expected_kind=ACCOUNT_DOCUMENT_KIND,
+                )
+                if existing.payload.get("account_id") != current_account.payload.get(
+                    "account_id"
+                ):
+                    raise ValueError(
+                        "existing proposal belongs to a different paper account"
+                    )
+                if existing.payload.get("decision_date") != decision_date.isoformat():
+                    raise ValueError(
+                        "existing proposal belongs to a different decision date"
+                    )
+            trial_path = settings.project_root / DEFAULT_FORWARD_RELATIVE_PATH
+            if trial_path.exists():
+                status = assess_forward_trial(
+                    settings.project_root,
+                    trial_path,
+                    account_path,
+                )
+                if not status.ready:
+                    raise ValueError(
+                        "active forward trial drifted: " + "; ".join(status.issues)
+                    )
+                trial = read_forward_trial(trial_path)
+                if top_n != int(trial.payload["frozen_configuration"]["top_n"]):
+                    raise ValueError("top_n differs from the active forward trial")
+                if replace and destination.exists():
+                    raise ValueError("registered forward proposals cannot be replaced")
+            document = create_paper_proposal(
+                account_path,
+                destination,
+                decision_date,
+                store,
+                top_n=top_n,
+                replace=replace,
             )
+            if trial_path.exists():
+                try:
+                    register_forward_proposal(
+                        settings.project_root,
+                        trial_path,
+                        account_path,
+                        document.path,
+                    )
+                except Exception as registration_error:
+                    try:
+                        current = read_paper_document(
+                            document.path,
+                            expected_kind=PROPOSAL_DOCUMENT_KIND,
+                        )
+                        if current.payload_sha256 != document.payload_sha256:
+                            raise RuntimeError(
+                                "new proposal changed before registration rollback"
+                            )
+                        document.path.unlink()
+                    except Exception as cleanup_error:
+                        raise RuntimeError(
+                            "proposal registration failed and exact rollback could not "
+                            "be verified; quarantine the unregistered proposal before "
+                            "continuing the trial"
+                        ) from cleanup_error
+                    raise registration_error
+                require_registered_forward_proposal(
+                    settings.project_root,
+                    trial_path,
+                    account_path,
+                    document.path,
+                )
     except Exception as exc:
         console.print(f"[red]Paper proposal refused:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -1474,7 +2545,348 @@ def paper_propose(
     )
 
 
+@app.command("stress-review")
+def stress_review(
+    proposal: Annotated[
+        Path,
+        typer.Option(
+            "--proposal",
+            help="Registered checksum-protected paper proposal to stress.",
+        ),
+    ],
+    account: Annotated[
+        Path,
+        typer.Option("--account", help="Local paper-account JSON path."),
+    ] = Path("data/paper/us_qv_sandbox.json"),
+    trial: Annotated[
+        Path,
+        typer.Option("--trial", help="Active checksum-protected forward-trial JSON path."),
+    ] = Path("data/paper/us_qv_forward_trial.json"),
+    scenario: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--scenario",
+            help="Run only this immutable scenario ID; repeat to select several.",
+        ),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            help="Optional write-once JSON report path. No report is stored by default.",
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Print the canonical report envelope as JSON."),
+    ] = False,
+) -> None:
+    """Review proposal loss, concentration, and liquidity sensitivities without mutation."""
+    from aios.risk.stress import review_registered_paper_proposal_stress
+
+    account_path = _project_path(account)
+    proposal_path = _project_path(proposal)
+    trial_path = _project_path(trial)
+    try:
+        governed_review = review_registered_paper_proposal_stress(
+            settings.project_root,
+            trial_path,
+            account_path,
+            proposal_path,
+            scenario_ids=scenario,
+            output_path=_project_path(output) if output is not None else None,
+        )
+    except Exception as exc:
+        if as_json:
+            typer.echo(
+                json.dumps(
+                    {"error": "stress_review_refused", "detail": str(exc)},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                err=True,
+            )
+        else:
+            console.print(f"[red]Stress review refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    report = governed_review.report
+    artifact_path = governed_review.artifact_path
+    payload = report.payload
+    analysis = payload["analysis"]
+    if as_json:
+        typer.echo(
+            json.dumps(
+                report.envelope(),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        )
+    else:
+        console.rule("[bold]Proposal stress review — advisory only[/bold]")
+        console.print(
+            f"Proposal: [bold]{payload['source']['proposal_id']}[/bold] · "
+            "source is proposal targets, not holdings, fills, or broker positions."
+        )
+        finding_count = sum(
+            len(result["reference_limit_findings"])
+            for result in analysis["scenarios"]
+            if result["status"] == "calculated"
+        )
+        summary = analysis["summary"]
+        calculation_coverage = str(analysis["calculation_coverage"]).replace("_", " ")
+        selected_policy_count = summary["selected_numerical_policy_count"]
+        selected_policy_label = (
+            "policy" if selected_policy_count == 1 else "policies"
+        )
+        console.print(
+            "Report generation: "
+            f"[bold]{payload['report_generation_status']}[/bold] · "
+            f"calculation coverage: [bold]{calculation_coverage}[/bold] · "
+            f"input evidence: [bold]{analysis['input_evidence']}[/bold]"
+        )
+        console.print(
+            "Numerical results: "
+            f"[bold]{summary['calculated_numerical_result_count']} calculated[/bold] / "
+            f"{summary['generated_numerical_result_count']} generated from "
+            f"{selected_policy_count} selected {selected_policy_label} · "
+            f"safeguard demonstrations: "
+            f"{summary['selected_safeguard_demonstration_count']} · "
+            f"advisory reference findings: [bold]{finding_count}[/bold]"
+        )
+
+        def render_results(title: str, results: list[dict[str, Any]]) -> None:
+            if not results:
+                return
+            table = Table(title=title)
+            table.add_column("Scenario ID", max_width=30, overflow="fold")
+            table.add_column("State", max_width=8, no_wrap=True)
+            table.add_column("Loss / equity", justify="right", no_wrap=True)
+            table.add_column("Refs", justify="right", no_wrap=True)
+            for result in results:
+                loss = result.get("portfolio_loss")
+                table.add_row(
+                    str(result["scenario_id"]),
+                    "ok" if result["status"] == "calculated" else "withheld",
+                    f"${loss:,.0f} / {result['portfolio_loss_pct']:.1%}"
+                    if loss is not None
+                    else "withheld",
+                    str(len(result["reference_limit_findings"]))
+                    if result["status"] == "calculated"
+                    else "n/a",
+                )
+            console.print(table)
+
+        fixed_results = [
+            result
+            for result in analysis["scenarios"]
+            if result["result_kind"] == "deterministic_mark_shock"
+        ]
+        proxy_results = [
+            result
+            for result in analysis["scenarios"]
+            if result["result_kind"] == "statistical_loss_proxy"
+        ]
+        render_results("Deterministic mark-shock results", fixed_results)
+        render_results(
+            "Statistical loss proxies — separate from mark shocks",
+            proxy_results,
+        )
+
+        calculated_results = [
+            result
+            for result in analysis["scenarios"]
+            if result["status"] == "calculated"
+        ]
+        if calculated_results:
+            console.print("[bold]Assumptions and advisory findings[/bold]")
+        for result in analysis["scenarios"]:
+            console.print(f"• [bold]{result['scenario_id']}[/bold]")
+            if result["status"] != "calculated":
+                console.print(
+                    "  Numerical output withheld. Missing required evidence: "
+                    + ", ".join(result["blockers"])
+                )
+                continue
+            assumptions = result["assumptions"]
+            if result["result_kind"] == "statistical_loss_proxy":
+                console.print(
+                    "  Loss proxy: "
+                    f"{assumptions['standard_deviation_multiple']:g}σ over "
+                    f"{assumptions['horizon_sessions']} sessions; verified volatility ×"
+                    f"{assumptions['volatility_multiplier']:g}; constant cross-position "
+                    f"correlation {assumptions['constant_correlation_assumption']:.2f}."
+                )
+                console.print(
+                    "  Post-shock holdings, drawdown, concentration, and liquidity: "
+                    "not applicable; Euler contributions are risk allocations, not returns."
+                )
+            else:
+                selector = assumptions["selector"]
+                if selector["kind"] == "all":
+                    scope = "all proposal targets"
+                elif selector["kind"] == "top_weighted":
+                    scope = f"top {selector['count']} weighted proposal targets"
+                else:
+                    scope = f"{result.get('selected_sector')} sector targets"
+                console.print(
+                    f"  Mark transform: {scope} {assumptions['selected_return']:.1%}; "
+                    f"other targets {assumptions['other_return']:.1%}; stressed ADV ×"
+                    f"{assumptions['liquidity_adv_multiplier']:.2f}; generic exit horizon "
+                    f"{assumptions['liquidation_horizon_sessions']} sessions."
+                )
+            findings = result["reference_limit_findings"]
+            if findings:
+                for finding in findings:
+                    console.print(f"  Advisory: {finding['message']}")
+            else:
+                console.print("  Advisory reference findings: none.")
+
+        safeguards = analysis["fail_closed_safeguards"]
+        if safeguards:
+            safeguard_table = Table(title="Fail-closed policy demonstrations")
+            safeguard_table.add_column("Safeguard", max_width=34, overflow="fold")
+            safeguard_table.add_column("Status", no_wrap=True)
+            safeguard_table.add_column("Current evidence", no_wrap=True)
+            for safeguard in safeguards:
+                safeguard_table.add_row(
+                    str(safeguard["label"]),
+                    str(safeguard["status"]).replace("_", " "),
+                    "gap present" if safeguard["live_evidence_gap"] else "present",
+                )
+            console.print(safeguard_table)
+            console.print(
+                "These rows document withholding behavior; no evidence outage was injected "
+                "and no calculation was rerun."
+            )
+        if summary["largest_fixed_shock_scenario_id"] is not None:
+            console.print(
+                "Largest modeled loss among selected fixed mark shocks: "
+                f"[bold]{summary['largest_fixed_shock_scenario_id']}[/bold] · "
+                f"${summary['largest_fixed_shock_loss']:,.2f} "
+                f"({summary['largest_fixed_shock_loss_pct']:.1%} of current equity)."
+            )
+        if summary["largest_statistical_proxy_scenario_id"] is not None:
+            console.print(
+                "Largest statistical proxy (not comparable to a historical mark shock): "
+                f"[bold]{summary['largest_statistical_proxy_scenario_id']}[/bold] · "
+                f"${summary['largest_statistical_proxy_loss']:,.2f} "
+                f"({summary['largest_statistical_proxy_loss_pct']:.1%} of current equity)."
+            )
+        if payload["evidence"]["blockers"]:
+            console.print("[red]Input-evidence gaps:[/red]")
+            for blocker in payload["evidence"]["blockers"][:10]:
+                console.print(f"  • {blocker}")
+            remaining = len(payload["evidence"]["blockers"]) - 10
+            if remaining > 0:
+                console.print(f"  • ... and {remaining} more")
+        if artifact_path is not None:
+            console.print(f"Write-once report: {artifact_path}")
+        console.print(
+            "[yellow]Read-only reproducible stress evidence — historical labels calibrate "
+            "magnitude only; not a forecast, constituent replay, approval, or trade "
+            "instruction. The account, proposal, forward trial, incident ledger, and "
+            "database were not changed, and no broker order was sent.[/yellow]"
+        )
+    if payload["report_generation_status"] != "complete":
+        raise typer.Exit(code=1)
+
+
+@app.command("paper-review")
+def paper_review(
+    proposal: Annotated[
+        Path,
+        typer.Option(
+            "--proposal",
+            help="Proposal JSON to preflight without recording or changing the account.",
+        ),
+    ],
+    account: Annotated[
+        Path,
+        typer.Option("--account", help="Local paper-account JSON path."),
+    ] = Path("data/paper/us_qv_sandbox.json"),
+) -> None:
+    """Project a fill and check every gate without changing the account."""
+    from aios.forward import (
+        DEFAULT_FORWARD_RELATIVE_PATH,
+        require_registered_forward_proposal,
+    )
+    from aios.paper import review_paper_proposal_execution
+
+    try:
+        trial_path = settings.project_root / DEFAULT_FORWARD_RELATIVE_PATH
+        require_registered_forward_proposal(
+            settings.project_root,
+            trial_path,
+            _project_path(account),
+            _project_path(proposal),
+        )
+        with store_scope(read_only=True) as store:
+            result = review_paper_proposal_execution(
+                _project_path(account),
+                _project_path(proposal),
+                store,
+            )
+    except Exception as exc:
+        console.print(f"[red]Paper review refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    labels = {
+        "waiting_for_scheduled_close": "waiting for the scheduled U.S. close",
+        "waiting_for_execution_data": "waiting for reviewed closing-price data",
+        "ready_for_confirmed_simulation": "ready for explicit local simulation",
+        "expired": "expired — retrospective fills are blocked",
+    }
+    status = str(result["status"])
+    color = "green" if result["ready"] else ("red" if status == "expired" else "yellow")
+    console.rule("[bold]Paper proposal execution review[/bold]")
+    console.print(f"Decision close: {result['decision_date']}")
+    console.print(f"Scheduled simulated close: {result['execution_date']}")
+    console.print(f"State: [{color}]{labels.get(status, status)}[/{color}]")
+    console.print(str(result["detail"]))
+    console.print(
+        f"Allowed window (UTC): {result['executable_after']} to {result['expires_at']}."
+    )
+    if result.get("missing_count"):
+        console.print(
+            f"Missing reviewed execution evidence: {result['missing_count']} item(s)."
+        )
+        for item in result["missing"][:6]:
+            console.print(f"  • {item}")
+        if result["missing_count"] > 6:
+            console.print(f"  • ... and {result['missing_count'] - 6} more")
+    if result["ready"]:
+        console.print(
+            f"Projected local trades: {result['projected_trade_count']}; "
+            f"modeled costs: ${result['projected_transaction_costs']:,.2f}."
+        )
+        execute_command = shlex.join(
+            [
+                "aios",
+                "paper-execute",
+                "--proposal",
+                str(proposal),
+                "--account",
+                str(account),
+                "--confirm-simulated",
+            ]
+        )
+        console.print(
+            "If you accept this local simulation before the window expires, run:"
+        )
+        console.print(f"[bold]{execute_command}[/bold]")
+    console.print(
+        "[yellow]Read-only simulation preflight — the account was not changed and no "
+        "order was sent to a broker.[/yellow]"
+    )
+    if status == "expired":
+        raise typer.Exit(code=1)
+
+
 @app.command("paper-execute")
+@_exclusive_project_operation("paper-execute")
 def paper_execute(
     proposal: Annotated[
         Path,
@@ -1501,19 +2913,19 @@ def paper_execute(
 
     try:
         trial_path = settings.project_root / DEFAULT_FORWARD_RELATIVE_PATH
-        if trial_path.exists():
-            require_registered_forward_proposal(
-                settings.project_root,
-                trial_path,
-                _project_path(account),
-                _project_path(proposal),
-            )
-        result = execute_paper_proposal(
+        require_registered_forward_proposal(
+            settings.project_root,
+            trial_path,
             _project_path(account),
             _project_path(proposal),
-            get_store(),
-            confirm_simulated=confirm_simulated,
         )
+        with store_scope(read_only=True) as store:
+            result = execute_paper_proposal(
+                _project_path(account),
+                _project_path(proposal),
+                store,
+                confirm_simulated=confirm_simulated,
+            )
     except Exception as exc:
         console.print(f"[red]Simulated execution refused:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -1527,6 +2939,7 @@ def paper_execute(
 
 
 @app.command("paper-mark")
+@_exclusive_project_operation("paper-mark")
 def paper_mark(
     through: Annotated[
         str | None,
@@ -1543,10 +2956,12 @@ def paper_mark(
     """Update simulated holdings and the daily equity curve without rebalancing."""
     from aios.paper import latest_reviewed_market_close, mark_paper_account
 
-    store = get_store()
     try:
-        mark_date = date.fromisoformat(through) if through else latest_reviewed_market_close(store)
-        result = mark_paper_account(_project_path(account), mark_date, store)
+        with store_scope(read_only=True) as store:
+            mark_date = (
+                date.fromisoformat(through) if through else latest_reviewed_market_close(store)
+            )
+            result = mark_paper_account(_project_path(account), mark_date, store)
     except Exception as exc:
         console.print(f"[red]Paper mark refused:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -1568,7 +2983,8 @@ def paper_status(
     from aios.paper import paper_account_summary
 
     try:
-        summary = paper_account_summary(_project_path(account), get_store())
+        with store_scope(read_only=True) as store:
+            summary = paper_account_summary(_project_path(account), store)
     except Exception as exc:
         console.print(f"[red]Paper status unavailable:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -1616,6 +3032,7 @@ def paper_status(
 
 
 @app.command("ingest-macro")
+@_exclusive_project_operation("ingest-macro")
 def ingest_macro(
     series_ids: Annotated[
         list[str] | None,
@@ -1639,6 +3056,7 @@ def ingest_macro(
 
 
 @app.command("refresh-us-current")
+@_exclusive_project_operation("refresh-us-current")
 def refresh_us_current_command(
     as_of: Annotated[
         str | None,
@@ -1667,7 +3085,10 @@ def refresh_us_current_command(
     ] = True,
     json_output: Annotated[
         Path | None,
-        typer.Option("--json-output", help="Optional machine-readable run summary."),
+        typer.Option(
+            "--json-output",
+            help="Optional write-once .json run summary outside governed state.",
+        ),
     ] = None,
 ) -> None:
     """Refresh the current reviewed U.S. universe without approving new members."""
@@ -1685,6 +3106,19 @@ def refresh_us_current_command(
     refresh_key = "-".join(enabled_areas) or "none"
     failure_fingerprint = f"refresh:{refresh_key}:failure"
     partial_fingerprint = f"refresh:{refresh_key}:partial"
+    try:
+        summary_destination = (
+            _resolve_generated_output_path(
+                json_output,
+                label="current refresh summary",
+                suffix=".json",
+            )
+            if json_output is not None
+            else None
+        )
+    except ValueError as exc:
+        console.print(f"[red]Current refresh output refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
 
     def show_progress(kind: str, identity: str, index: int, total: int) -> None:
         if index == 1 or index == total or index % 25 == 0:
@@ -1698,13 +3132,6 @@ def refresh_us_current_command(
             include_macro=macro,
             progress=show_progress,
         )
-        if json_output is not None:
-            destination = _project_path(json_output)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(
-                json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
     except duckdb.IOException as exc:
         from aios.alerts import Alert, AlertSeverity
 
@@ -1741,6 +3168,16 @@ def refresh_us_current_command(
         console.print(f"[red]Current U.S. refresh refused safely:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
+    summary_error: Exception | None = None
+    if summary_destination is not None:
+        try:
+            publish_text_write_once(
+                summary_destination,
+                json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n",
+            )
+        except (OSError, ValueError) as exc:
+            summary_error = exc
+
     table = Table(title=f"Current U.S. refresh — {result.as_of}")
     table.add_column("area")
     table.add_column("result", justify="right")
@@ -1759,8 +3196,8 @@ def refresh_us_current_command(
         "[yellow]Membership boundary:[/yellow] this refresh uses only already reviewed "
         "identities. New S&P announcements still require source review and import."
     )
-    if json_output is not None:
-        console.print(f"Run summary written to {_project_path(json_output)}.")
+    if summary_destination is not None and summary_error is None:
+        console.print(f"Run summary written to {summary_destination}.")
     for warning in result.warnings[:25]:
         console.print(
             f"  [yellow]{warning.kind} {warning.identity}:[/yellow] {warning.error}"
@@ -1823,9 +3260,16 @@ def refresh_us_current_command(
         "[bold green]Refresh completed.[/bold green] Run `aios health` before creating "
         "or recording a paper proposal."
     )
+    if summary_error is not None:
+        console.print(
+            "[red]The refresh completed, but its optional summary was not published:[/red] "
+            f"{summary_error}"
+        )
+        raise typer.Exit(code=1)
 
 
 @app.command("refresh-us-daily")
+@_exclusive_project_operation("refresh-us-daily")
 def refresh_us_daily_command(
     force: Annotated[
         bool,
@@ -1836,25 +3280,35 @@ def refresh_us_daily_command(
     ] = False,
     json_output: Annotated[
         Path | None,
-        typer.Option("--json-output", help="Optional machine-readable run summary."),
+        typer.Option(
+            "--json-output",
+            help="Optional write-once .json run summary outside governed state.",
+        ),
     ] = None,
 ) -> None:
     """Run the recoverable benchmark-first U.S. daily workflow."""
     from aios.alerts import Alert, AlertSeverity
     from aios.daily import run_us_daily_cycle
 
+    try:
+        summary_destination = (
+            _resolve_generated_output_path(
+                json_output,
+                label="daily refresh summary",
+                suffix=".json",
+            )
+            if json_output is not None
+            else None
+        )
+    except ValueError as exc:
+        console.print(f"[red]Daily refresh output refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
     def show_progress(stage: str, detail: str) -> None:
         console.print(f"  [cyan]{stage.replace('_', ' ')}:[/cyan] {detail}")
 
     try:
         result = run_us_daily_cycle(force=force, progress=show_progress)
-        if json_output is not None:
-            destination = _project_path(json_output)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(
-                json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
     except Exception as exc:
         _emit_operational_alert(
             Alert(
@@ -1876,6 +3330,16 @@ def refresh_us_daily_command(
             "will retry the same idempotent workflow."
         )
         raise typer.Exit(code=1) from exc
+
+    summary_error: Exception | None = None
+    if summary_destination is not None:
+        try:
+            publish_text_write_once(
+                summary_destination,
+                json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n",
+            )
+        except (OSError, ValueError) as exc:
+            summary_error = exc
 
     if result.interrupted_run_ids:
         incident = Alert(
@@ -1927,11 +3391,18 @@ def refresh_us_daily_command(
             "[bold green]Daily update completed safely.[/bold green] The benchmark, "
             "universe, member data, and exact-date readiness now agree."
         )
-    if json_output is not None:
-        console.print(f"Run summary written to {_project_path(json_output)}.")
+    if summary_destination is not None and summary_error is None:
+        console.print(f"Run summary written to {summary_destination}.")
+    if summary_error is not None:
+        console.print(
+            "[red]The daily update completed, but its optional summary was not "
+            f"published:[/red] {summary_error}"
+        )
+        raise typer.Exit(code=1)
 
 
 @app.command("import-universe")
+@_exclusive_project_operation("import-universe")
 def import_universe(
     path: Path = UNIVERSE_FILE_ARGUMENT,
     universe_id: str | None = typer.Option(
@@ -2021,6 +3492,11 @@ def build_universe_membership(
     )
 
     try:
+        destination = _resolve_generated_output_path(
+            output,
+            label="universe membership artifact",
+            suffix=".csv",
+        )
         coverage_start = date.fromisoformat(start)
         coverage_end = date.fromisoformat(end)
         spans = load_effective_spans_csv(baseline_spans)
@@ -2048,11 +3524,14 @@ def build_universe_membership(
             universe_id=universe_id,
             baseline_source=baseline_source,
         )
-        write_membership_csv(output, rows)
+        write_membership_csv(destination, rows)
     except (OSError, ValueError) as exc:
         console.print(f"[red]Universe build refused:[/red] {exc}")
         raise typer.Exit(code=1) from exc
-    console.print(f"[green]Universe build done:[/green] {len(rows)} intervals written to {output}.")
+    console.print(
+        f"[green]Universe build done:[/green] "
+        f"{len(rows)} intervals written to {destination}."
+    )
     console.print(
         f"Certified window: {coverage_start} through {coverage_end}; "
         "rows close after the certified end date."
@@ -2093,10 +3572,15 @@ def build_security_identities(
     from aios.ingest.security_identity import build_security_identity_csv
 
     try:
+        destination = _resolve_generated_output_path(
+            output,
+            label="security identity artifact",
+            suffix=".csv",
+        )
         rows = build_security_identity_csv(
             membership,
             transitions,
-            output,
+            destination,
             universe_id=universe_id,
         )
     except (OSError, ValueError) as exc:
@@ -2105,7 +3589,7 @@ def build_security_identities(
     verified = sum(row["identity_status"] != "bounded_ticker" for row in rows)
     console.print(
         f"[green]Security identity build done:[/green] {len(rows)} interval "
-        f"assignments written to {output}."
+        f"assignments written to {destination}."
     )
     console.print(
         f"Verified transition intervals: {verified}; "
@@ -2114,6 +3598,7 @@ def build_security_identities(
 
 
 @app.command("import-security-identities")
+@_exclusive_project_operation("import-security-identities")
 def import_security_identities(
     path: Path = SECURITY_IDENTITY_FILE_ARGUMENT,
 ) -> None:
@@ -2135,6 +3620,7 @@ def import_security_identities(
 
 
 @app.command("import-reference-identities")
+@_exclusive_project_operation("import-reference-identities")
 def import_reference_identities(
     issuer_ciks: Annotated[
         Path,
@@ -2182,6 +3668,7 @@ def import_reference_identities(
 
 
 @app.command("import-security-conversions")
+@_exclusive_project_operation("import-security-conversions")
 def import_security_conversions(
     path: Path = SECURITY_CONVERSION_FILE_ARGUMENT,
 ) -> None:
@@ -2205,6 +3692,7 @@ def import_security_conversions(
 
 
 @app.command("ingest-liquidation-prices")
+@_exclusive_project_operation("ingest-liquidation-prices")
 def ingest_liquidation_prices(
     path: Path = LIQUIDATION_EXTENSION_FILE_ARGUMENT,
 ) -> None:
@@ -2264,18 +3752,24 @@ def build_reference_batch(
     )
 
     try:
-        tickers = load_batch_tickers(tickers_file)
-        result = build_stable_reference_batch(
-            tickers,
-            universe_id=universe_id,
-            start=start,
-            end=end,
-            provider=provider,
-            verified_date=verified_date,
+        artifact_directory = _resolve_generated_output_directory(
+            output_dir,
+            label="reference batch directory",
         )
+        tickers = load_batch_tickers(tickers_file)
+        with store_scope(read_only=True) as store:
+            result = build_stable_reference_batch(
+                tickers,
+                universe_id=universe_id,
+                start=start,
+                end=end,
+                provider=provider,
+                verified_date=verified_date,
+                store=store,
+            )
         paths = write_reference_batch(
             result,
-            output_dir=output_dir,
+            output_dir=artifact_directory,
             batch_name=batch_name,
         )
     except Exception as exc:
@@ -2326,16 +3820,22 @@ def build_reference_window_batch(
     )
 
     try:
-        windows = load_batch_windows(windows_file)
-        result = build_stable_reference_window_batch(
-            windows,
-            universe_id=universe_id,
-            provider=provider,
-            verified_date=verified_date,
+        artifact_directory = _resolve_generated_output_directory(
+            output_dir,
+            label="reference window batch directory",
         )
+        windows = load_batch_windows(windows_file)
+        with store_scope(read_only=True) as store:
+            result = build_stable_reference_window_batch(
+                windows,
+                universe_id=universe_id,
+                provider=provider,
+                verified_date=verified_date,
+                store=store,
+            )
         paths = write_reference_batch(
             result,
-            output_dir=output_dir,
+            output_dir=artifact_directory,
             batch_name=batch_name,
         )
     except Exception as exc:
@@ -2391,16 +3891,22 @@ def plan_reference_window_batches(
     )
 
     try:
-        windows = plan_missing_reference_windows(
-            universe_id=universe_id,
-            as_of=as_of,
-            start_floor=start_floor,
-            end=end,
-            provider=provider,
+        artifact_directory = _resolve_generated_output_directory(
+            output_dir,
+            label="reference window plan directory",
         )
+        with store_scope(read_only=True) as store:
+            windows = plan_missing_reference_windows(
+                universe_id=universe_id,
+                as_of=as_of,
+                start_floor=start_floor,
+                end=end,
+                provider=provider,
+                store=store,
+            )
         paths = write_reference_window_batches(
             windows,
-            output_dir=output_dir,
+            output_dir=artifact_directory,
             batch_prefix=batch_prefix,
             batch_size=batch_size,
             start_number=start_number,
@@ -2450,15 +3956,21 @@ def plan_historical_reference_batches(
     )
 
     try:
-        windows = plan_historical_reference_gaps(
-            universe_id=universe_id,
-            start=start,
-            end=end,
+        artifact_directory = _resolve_generated_output_directory(
+            output_dir,
+            label="historical reference plan directory",
         )
+        with store_scope(read_only=True) as store:
+            windows = plan_historical_reference_gaps(
+                universe_id=universe_id,
+                start=start,
+                end=end,
+                store=store,
+            )
         paths = (
             write_reference_window_batches(
                 windows,
-                output_dir=output_dir,
+                output_dir=artifact_directory,
                 batch_prefix=batch_prefix,
                 batch_size=batch_size,
                 start_number=start_number,
@@ -2508,10 +4020,14 @@ def merge_reference_batches(
     )
 
     try:
+        artifact_directory = _resolve_generated_output_directory(
+            output_dir,
+            label="merged reference batch directory",
+        )
         result = merge_reference_batch_files(batches)
         paths = write_reference_batch(
             result,
-            output_dir=output_dir,
+            output_dir=artifact_directory,
             batch_name=batch_name,
         )
     except (OSError, ValueError) as exc:
@@ -2525,6 +4041,7 @@ def merge_reference_batches(
 
 
 @app.command("ingest-reference-batch")
+@_exclusive_project_operation("ingest-reference-batch")
 def ingest_reference_batch(
     issuer_ciks: Annotated[
         Path,
@@ -2597,8 +4114,18 @@ def universe_coverage(
     """Audit data coverage without pretending aliases are interchangeable."""
     decision_date = as_of or date.today().isoformat()
     try:
+        missing_destination = (
+            _resolve_generated_output_path(
+                missing_output,
+                label="coverage review list",
+                suffix=".txt",
+            )
+            if missing_output is not None
+            else None
+        )
         date.fromisoformat(decision_date)
-        rows = get_store().universe_data_coverage(universe_id, decision_date)
+        with store_scope(read_only=True) as store:
+            rows = store.universe_data_coverage(universe_id, decision_date)
     except ValueError as exc:
         console.print(f"[red]Coverage audit refused:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -2639,14 +4166,17 @@ def universe_coverage(
             console.print(f"  {row['ticker']}: {', '.join(gaps)}")
         if len(missing) > 25:
             console.print(f"  … and {len(missing) - 25} more")
-    if missing_output is not None:
-        missing_output.parent.mkdir(parents=True, exist_ok=True)
-        missing_output.write_text(
-            "\n".join(row["ticker"] for row in missing) + ("\n" if missing else ""),
-            encoding="utf-8",
-        )
+    if missing_destination is not None:
+        try:
+            publish_text_write_once(
+                missing_destination,
+                "\n".join(row["ticker"] for row in missing) + ("\n" if missing else ""),
+            )
+        except (OSError, ValueError) as exc:
+            console.print(f"[red]Coverage output refused:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
         console.print(
-            f"Missing-member review list written to {missing_output}. "
+            f"Missing-member review list written to {missing_destination}. "
             "Do not bulk-ingest it before provider-symbol and CIK review."
         )
 
@@ -2662,7 +4192,8 @@ def macro_regime(
     from aios.macro.regime import compute_regime
 
     decision_date = as_of or date.today().isoformat()
-    snapshot = compute_regime(decision_date)
+    with store_scope(read_only=True) as store:
+        snapshot = compute_regime(decision_date, store=store)
     console.rule(f"[bold]Macro regime as of {snapshot.as_of}[/bold]")
     console.print(f"[bold cyan]Regime:[/bold cyan] {snapshot.regime}")
 
@@ -2812,30 +4343,41 @@ def backtest_qv(
     from aios.backtest import TaxPolicy, TransactionCostPolicy, run_qv_policy_backtest
 
     try:
-        result = run_qv_policy_backtest(
-            start,
-            end,
-            tickers=tickers,
-            top_n=top_n,
-            require_pit_regime=require_pit_regime,
-            universe_id=universe_id,
-            allow_current_universe=allow_current_universe,
-            benchmark_tickers=benchmarks,
-            calendar_ticker=calendar,
-            excluded_tickers=excluded_tickers,
-            factor_model=factor_model,
-            initial_capital=initial_capital,
-            transaction_costs=TransactionCostPolicy(
-                commission_bps=commission_bps,
-                slippage_bps=slippage_bps,
-                fixed_fee=fixed_fee,
-            ),
-            tax_policy=TaxPolicy(
-                short_term_rate=short_term_tax_rate,
-                long_term_rate=long_term_tax_rate,
-                dividend_rate=dividend_tax_rate,
-            ),
+        audit_destination = (
+            _resolve_generated_output_path(
+                output,
+                label="backtest audit artifact",
+                suffix=".json",
+            )
+            if output is not None
+            else None
         )
+        with store_scope(read_only=True) as store:
+            result = run_qv_policy_backtest(
+                start,
+                end,
+                tickers=tickers,
+                top_n=top_n,
+                require_pit_regime=require_pit_regime,
+                universe_id=universe_id,
+                allow_current_universe=allow_current_universe,
+                benchmark_tickers=benchmarks,
+                calendar_ticker=calendar,
+                excluded_tickers=excluded_tickers,
+                factor_model=factor_model,
+                initial_capital=initial_capital,
+                transaction_costs=TransactionCostPolicy(
+                    commission_bps=commission_bps,
+                    slippage_bps=slippage_bps,
+                    fixed_fee=fixed_fee,
+                ),
+                tax_policy=TaxPolicy(
+                    short_term_rate=short_term_tax_rate,
+                    long_term_rate=long_term_tax_rate,
+                    dividend_rate=dividend_tax_rate,
+                ),
+                store=store,
+            )
     except ValueError as exc:
         console.print(f"[red]Backtest refused:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -3000,8 +4542,16 @@ def backtest_qv(
             console.print(f"  … and {len(skipped) - 5} more")
     for warning in result.warnings:
         console.print(f"[yellow]Warning:[/yellow] {warning}")
-    if output is not None:
-        audit_path = _write_backtest_audit(output, result, explanations)
+    if audit_destination is not None:
+        try:
+            audit_path = _write_backtest_audit(
+                audit_destination,
+                result,
+                explanations,
+            )
+        except (OSError, ValueError) as exc:
+            console.print(f"[red]Backtest output refused:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
         console.print(f"[green]Audit artifact:[/green] {audit_path}")
 
 
@@ -3050,8 +4600,7 @@ def _backtest_ticker_explanations(result, tickers: list[str]) -> list[dict]:
 
 def _write_backtest_audit(output: Path, result, explanations: list[dict]) -> Path:
     """Atomically write a provenance-rich, secret-free backtest audit."""
-    path = output.expanduser().resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = Path(output)
     db_path = settings.duckdb_path
     if not db_path.is_absolute():
         db_path = settings.project_root / db_path
@@ -3083,10 +4632,10 @@ def _write_backtest_audit(output: Path, result, explanations: list[dict]) -> Pat
         "ticker_explanations": explanations,
         "result": result.to_dict(),
     }
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    temporary.replace(path)
-    return path
+    return publish_text_write_once(
+        path,
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    )
 
 
 def _git_output(command: list[str]) -> str:
@@ -3166,6 +4715,7 @@ def _ingest_one(
 
 
 @app.command("ingest-ticker")
+@_exclusive_project_operation("ingest-ticker")
 def ingest_ticker(
     ticker: str = typer.Argument(..., help="Ticker, e.g. AAPL"),
     with_prices: bool = typer.Option(True, "--prices/--no-prices"),
@@ -3176,6 +4726,7 @@ def ingest_ticker(
 
 
 @app.command("ingest-issuer")
+@_exclusive_project_operation("ingest-issuer")
 def ingest_issuer(
     issuer_id: str = typer.Argument(..., help="Reviewed issuer_id, not a ticker."),
 ) -> None:
@@ -3191,6 +4742,7 @@ def ingest_issuer(
 
 
 @app.command("ingest-security-prices")
+@_exclusive_project_operation("ingest-security-prices")
 def ingest_security_prices(
     security_id: str = typer.Argument(..., help="Reviewed immutable security_id."),
     provider: Annotated[
@@ -3227,6 +4779,7 @@ def ingest_security_prices(
 
 
 @app.command("refresh-price-actions")
+@_exclusive_project_operation("refresh-price-actions")
 def refresh_price_actions(
     start: Annotated[
         str,
@@ -3406,6 +4959,10 @@ def build_factor_price_warmup(
     )
 
     try:
+        artifact_directory = _resolve_generated_output_directory(
+            output_dir,
+            label="factor warm-up directory",
+        )
         date.fromisoformat(start)
         if as_of:
             date.fromisoformat(as_of)
@@ -3416,20 +4973,22 @@ def build_factor_price_warmup(
                 f"({candidate['provider']}:{candidate['provider_symbol']})"
             )
 
-        result = _build_factor_price_warmup(
-            output_dir,
-            universe_id=universe_id,
-            start=start,
-            as_of=as_of,
-            security_ids=security_ids,
-            only_missing=only_missing,
-            overlap_days=overlap_days,
-            minimum_overlap_sessions=minimum_overlap_sessions,
-            minimum_warmup_sessions=minimum_warmup_sessions,
-            refresh=refresh,
-            progress=show_progress,
-            rejections_reviewed=allow_rejections,
-        )
+        with store_scope(read_only=True) as store:
+            result = _build_factor_price_warmup(
+                artifact_directory,
+                universe_id=universe_id,
+                start=start,
+                as_of=as_of,
+                security_ids=security_ids,
+                only_missing=only_missing,
+                overlap_days=overlap_days,
+                minimum_overlap_sessions=minimum_overlap_sessions,
+                minimum_warmup_sessions=minimum_warmup_sessions,
+                refresh=refresh,
+                progress=show_progress,
+                rejections_reviewed=allow_rejections,
+                store=store,
+            )
     except Exception as exc:
         console.print(f"[red]Warm-up build failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -3461,6 +5020,7 @@ def build_factor_price_warmup(
 
 
 @app.command("ingest-factor-price-warmup")
+@_exclusive_project_operation("ingest-factor-price-warmup")
 def ingest_factor_price_warmup(
     batch_dir: Annotated[
         Path,
@@ -3496,7 +5056,11 @@ def review_factor_price_warmup_rejections(
     )
 
     try:
-        count = mark_factor_price_warmup_rejections_reviewed(batch_dir)
+        artifact_directory = _resolve_generated_output_directory(
+            batch_dir,
+            label="factor warm-up review directory",
+        )
+        count = mark_factor_price_warmup_rejections_reviewed(artifact_directory)
     except Exception as exc:
         console.print(f"[red]Warm-up rejection review failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -3504,6 +5068,7 @@ def review_factor_price_warmup_rejections(
 
 
 @app.command("ingest-batch")
+@_exclusive_project_operation("ingest-batch")
 def ingest_batch(
     tickers_file: Path = TICKERS_FILE_ARGUMENT,
 ) -> None:
@@ -3540,8 +5105,20 @@ def ingest_batch(
 @app.command()
 def status() -> None:
     """Show row counts + latest dates per table."""
-    s = get_store()
-    counts = s.table_rowcounts()
+    latest_dates: list[tuple[str, str, Any]] = []
+    with store_scope(read_only=True) as store:
+        counts = store.table_rowcounts()
+        for table, column in (
+            ("prices", "date"),
+            ("fundamentals", "as_of_date"),
+            ("macro", "date"),
+        ):
+            try:
+                row = store.query(f"SELECT MAX({column}) AS latest FROM {table}")[0]
+            except Exception:
+                continue
+            latest_dates.append((table, column, row["latest"]))
+
     tbl = Table(title="Storage status")
     tbl.add_column("table")
     tbl.add_column("rows")
@@ -3550,12 +5127,8 @@ def status() -> None:
     console.print(tbl)
 
     # Latest dates where it makes sense
-    for table, col in (("prices", "date"), ("fundamentals", "as_of_date"), ("macro", "date")):
-        try:
-            row = s.query(f"SELECT MAX({col}) AS latest FROM {table}")[0]
-            console.print(f"[cyan]Latest {table}.{col}:[/cyan] {row['latest']}")
-        except Exception:
-            pass
+    for table, column, latest in latest_dates:
+        console.print(f"[cyan]Latest {table}.{column}:[/cyan] {latest}")
 
 
 @app.command()
@@ -3563,7 +5136,8 @@ def audit(
     limit: int = typer.Option(20, min=1, max=200, help="Number of recent runs to show"),
 ) -> None:
     """Show recent ingest outcomes and errors."""
-    rows = get_store().ingest_history(limit)
+    with store_scope(read_only=True) as store:
+        rows = store.ingest_history(limit)
     if not rows:
         console.print("[yellow]No ingest runs have been recorded yet.[/yellow]")
         return
@@ -3590,7 +5164,35 @@ def audit(
 @app.command()
 def validate() -> None:
     """Run read-only data quality checks before analysis or re-ingest."""
-    report = get_store().data_quality_report()
+    with store_scope(read_only=True) as store:
+        report = store.data_quality_report()
+        missing_close_check = next(
+            (
+                row
+                for row in report
+                if row["check"] == "prices_missing_close" and row["status"] == "fail"
+            ),
+            None,
+        )
+        missing_close_samples = (
+            store.query(
+                """
+                SELECT ticker,
+                       CAST(date AS VARCHAR) AS date,
+                       COALESCE(NULLIF(source, ''), 'unknown') AS source
+                FROM prices
+                WHERE close IS NULL
+                   OR NOT isfinite(close)
+                   OR close <= 0
+                ORDER BY date DESC, ticker, source
+                LIMIT ?
+                """,
+                (5,),
+            )
+            if missing_close_check is not None
+            else []
+        )
+
     tbl = Table(title="Data quality")
     tbl.add_column("check")
     tbl.add_column("status")
@@ -3609,11 +5211,24 @@ def validate() -> None:
             row["detail"],
         )
     console.print(tbl)
+    if missing_close_samples:
+        console.print(
+            "[bold]Affected rows for prices_missing_close "
+            f"(showing {len(missing_close_samples)} of {missing_close_check['count']}):[/bold]"
+        )
+        sample_tbl = Table()
+        sample_tbl.add_column("ticker")
+        sample_tbl.add_column("date")
+        sample_tbl.add_column("source")
+        for row in missing_close_samples:
+            sample_tbl.add_row(str(row["ticker"]), str(row["date"]), str(row["source"]))
+        console.print(sample_tbl)
     if has_failure:
         raise typer.Exit(code=1)
 
 
 @app.command("cleanup-legacy-ebitda")
+@_exclusive_project_operation("cleanup-legacy-ebitda")
 def cleanup_legacy_ebitda(
     ticker: str | None = typer.Option(None, help="Limit cleanup to one ticker"),
 ) -> None:
@@ -3624,6 +5239,7 @@ def cleanup_legacy_ebitda(
 
 
 @app.command("quarantine-invalid-fundamentals")
+@_exclusive_project_operation("quarantine-invalid-fundamentals")
 def quarantine_invalid_fundamentals() -> None:
     """Move period_end-after-filing rows into a provenance quarantine table."""
     moved = get_store().quarantine_invalid_fundamental_periods()
@@ -3634,6 +5250,7 @@ def quarantine_invalid_fundamentals() -> None:
 
 
 @app.command("cleanup-legacy-macro")
+@_exclusive_project_operation("cleanup-legacy-macro")
 def cleanup_legacy_macro(
     series_ids: Annotated[
         list[str] | None,

@@ -41,5 +41,11 @@ def test_latest_completed_session_uses_new_york_close_not_india_midnight() -> No
         datetime(2026, 7, 24, 1, 5, tzinfo=india)
     ) == date(2026, 7, 22)
     assert latest_completed_us_equity_session(
+        datetime(2026, 7, 24, 1, 30, tzinfo=india)
+    ) == date(2026, 7, 22)
+    assert latest_completed_us_equity_session(
+        datetime(2026, 7, 24, 1, 59, tzinfo=india)
+    ) == date(2026, 7, 22)
+    assert latest_completed_us_equity_session(
         datetime(2026, 7, 24, 2, 0, tzinfo=india)
     ) == date(2026, 7, 23)

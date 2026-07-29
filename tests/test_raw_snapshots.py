@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from aios.raw_snapshots import (
+    attach_parsed_rows_evidence,
     canonical_request_fingerprint,
     capture_raw_snapshot,
     verify_raw_snapshots,
@@ -96,6 +97,63 @@ def test_snapshot_links_to_an_ingest_run(tmp_path) -> None:
         assert store.query(
             "SELECT run_id, snapshot_id, role FROM ingest_raw_snapshots"
         ) == [{"run_id": run_id, "snapshot_id": result.snapshot_id, "role": "response"}]
+    finally:
+        store.close()
+
+
+def test_linked_capture_is_promoted_once_with_idempotent_parsed_evidence(tmp_path) -> None:
+    store = Store(tmp_path / "data" / "test.duckdb")
+    rows = [{"cik": "0000000001", "metric": "revenue", "value": 100.0}]
+    try:
+        result = _capture(
+            tmp_path,
+            store,
+            parsed_rows=None,
+            parser_version="capture-v1",
+            ingest_run_id="issuer-run",
+            role="companyfacts",
+        )
+
+        snapshot_id = attach_parsed_rows_evidence(
+            store=store,
+            ingest_run_id="issuer-run",
+            role="companyfacts",
+            capture_parser_version="capture-v1",
+            parser_version="parser-v2",
+            parsed_rows=rows,
+        )
+        assert snapshot_id == result.snapshot_id
+        assert (
+            attach_parsed_rows_evidence(
+                store=store,
+                ingest_run_id="issuer-run",
+                role="companyfacts",
+                capture_parser_version="capture-v1",
+                parser_version="parser-v2",
+                parsed_rows=rows,
+            )
+            == result.snapshot_id
+        )
+        evidence = store.query(
+            """
+            SELECT parser_version, parsed_row_count, parsed_rows_sha256
+            FROM raw_snapshots WHERE snapshot_id = ?
+            """,
+            (result.snapshot_id,),
+        )[0]
+        assert evidence["parser_version"] == "parser-v2"
+        assert evidence["parsed_row_count"] == 1
+        assert evidence["parsed_rows_sha256"]
+
+        with pytest.raises(ValueError, match="conflicts with existing values"):
+            attach_parsed_rows_evidence(
+                store=store,
+                ingest_run_id="issuer-run",
+                role="companyfacts",
+                capture_parser_version="capture-v1",
+                parser_version="parser-v2",
+                parsed_rows=[{**rows[0], "value": 101.0}],
+            )
     finally:
         store.close()
 

@@ -176,6 +176,11 @@ def test_factor_price_warmup_store_merges_without_backdating_ticker(tmp_path):
         history = store.pit_factor_price_history(
             "NEW", "2023-08-02", observations=3
         )
+        batch_history = store.pit_factor_price_histories_batch(
+            ["NEW"],
+            "2023-08-02",
+            observations=3,
+        )["NEW"]
         report = {row["check"]: row for row in store.data_quality_report()}
 
         assert counts == {"provenance": 1, "factor_prices": 1}
@@ -184,6 +189,7 @@ def test_factor_price_warmup_store_merges_without_backdating_ticker(tmp_path):
             "2023-08-01",
             "2023-08-02",
         ]
+        assert batch_history == history
         assert store.query("SELECT * FROM factor_prices")[0].get("ticker") is None
         assert all(
             row["status"] == "ok"

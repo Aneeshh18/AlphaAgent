@@ -1368,6 +1368,20 @@ class Store:
             return 0
         normalized: list[dict] = []
         for row in rows:
+            ticker = str(row.get("ticker") or "").strip().upper()
+            row_date = row.get("date")
+            try:
+                close = float(row.get("close"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"price close must be positive and finite for "
+                    f"{ticker or '<missing ticker>'}@{row_date}"
+                ) from exc
+            if not isfinite(close) or close <= 0:
+                raise ValueError(
+                    f"price close must be positive and finite for "
+                    f"{ticker or '<missing ticker>'}@{row_date}"
+                )
             source = str(row.get("source") or "yfinance").strip().lower()
             close_split_adjusted = row.get("close_split_adjusted")
             if close_split_adjusted is None and source in {
@@ -1386,14 +1400,14 @@ class Store:
                     raise ValueError("split_normalization_factor must be positive and finite")
             normalized.append(
                 {
-                    "ticker": str(row.get("ticker") or "").strip().upper(),
+                    "ticker": ticker,
                     "security_id": row.get("security_id"),
                     "provider_symbol": row.get("provider_symbol"),
-                    "date": row.get("date"),
+                    "date": row_date,
                     "open": row.get("open"),
                     "high": row.get("high"),
                     "low": row.get("low"),
-                    "close": row.get("close"),
+                    "close": close,
                     "adj_close": row.get("adj_close"),
                     "volume": row.get("volume"),
                     "dividends": row.get("dividends", 0),
@@ -1406,45 +1420,47 @@ class Store:
                 }
             )
         self._con.register("_tmp_px", _rows_to_arrowable(normalized))
-        n = self._con.execute(
-            """
-            INSERT INTO prices
-            (ticker, security_id, provider_symbol, date, open, high, low, close,
-             adj_close, volume, dividends, split_ratio, actions_complete,
-             close_split_adjusted, split_normalization_factor,
-             split_normalization_through, source, fetched_at)
-            SELECT
-                ticker, security_id, provider_symbol, CAST(date AS DATE),
-                open, high, low, close, adj_close, volume,
-                COALESCE(dividends, 0), COALESCE(split_ratio, 1),
-                COALESCE(actions_complete, FALSE),
-                close_split_adjusted,
-                split_normalization_factor,
-                CAST(split_normalization_through AS DATE),
-                COALESCE(source, 'yfinance'), now()
-            FROM _tmp_px
-            ON CONFLICT (ticker, date) DO UPDATE
-            SET security_id = COALESCE(EXCLUDED.security_id, prices.security_id),
-                provider_symbol = COALESCE(
-                    EXCLUDED.provider_symbol, prices.provider_symbol
-                ),
-                open = EXCLUDED.open,
-                high = EXCLUDED.high,
-                low = EXCLUDED.low,
-                close = EXCLUDED.close,
-                adj_close = EXCLUDED.adj_close,
-                volume = EXCLUDED.volume,
-                dividends = EXCLUDED.dividends,
-                split_ratio = EXCLUDED.split_ratio,
-                actions_complete = EXCLUDED.actions_complete,
-                close_split_adjusted = EXCLUDED.close_split_adjusted,
-                split_normalization_factor = EXCLUDED.split_normalization_factor,
-                split_normalization_through = EXCLUDED.split_normalization_through,
-                source = EXCLUDED.source,
-                fetched_at = EXCLUDED.fetched_at
-            """.strip()
-        ).fetchone()[0]
-        self._con.unregister("_tmp_px")
+        try:
+            n = self._con.execute(
+                """
+                INSERT INTO prices
+                (ticker, security_id, provider_symbol, date, open, high, low, close,
+                 adj_close, volume, dividends, split_ratio, actions_complete,
+                 close_split_adjusted, split_normalization_factor,
+                 split_normalization_through, source, fetched_at)
+                SELECT
+                    ticker, security_id, provider_symbol, CAST(date AS DATE),
+                    open, high, low, close, adj_close, volume,
+                    COALESCE(dividends, 0), COALESCE(split_ratio, 1),
+                    COALESCE(actions_complete, FALSE),
+                    close_split_adjusted,
+                    split_normalization_factor,
+                    CAST(split_normalization_through AS DATE),
+                    COALESCE(source, 'yfinance'), now()
+                FROM _tmp_px
+                ON CONFLICT (ticker, date) DO UPDATE
+                SET security_id = COALESCE(EXCLUDED.security_id, prices.security_id),
+                    provider_symbol = COALESCE(
+                        EXCLUDED.provider_symbol, prices.provider_symbol
+                    ),
+                    open = EXCLUDED.open,
+                    high = EXCLUDED.high,
+                    low = EXCLUDED.low,
+                    close = EXCLUDED.close,
+                    adj_close = EXCLUDED.adj_close,
+                    volume = EXCLUDED.volume,
+                    dividends = EXCLUDED.dividends,
+                    split_ratio = EXCLUDED.split_ratio,
+                    actions_complete = EXCLUDED.actions_complete,
+                    close_split_adjusted = EXCLUDED.close_split_adjusted,
+                    split_normalization_factor = EXCLUDED.split_normalization_factor,
+                    split_normalization_through = EXCLUDED.split_normalization_through,
+                    source = EXCLUDED.source,
+                    fetched_at = EXCLUDED.fetched_at
+                """.strip()
+            ).fetchone()[0]
+        finally:
+            self._con.unregister("_tmp_px")
         return int(n)
 
     def upsert_factor_price_warmup(
@@ -2037,6 +2053,98 @@ class Store:
         )
         return rows[0] if rows else None
 
+    def attach_raw_snapshot_parse_evidence(
+        self,
+        *,
+        ingest_run_id: str,
+        role: str,
+        expected_parser_version: str,
+        parser_version: str,
+        parsed_row_count: int,
+        parsed_rows_sha256: str,
+    ) -> str:
+        """Atomically promote one linked capture after its parser succeeds.
+
+        External bytes are registered before parsing so malformed responses are
+        never lost. A successful downstream parser calls this method once to
+        bind its canonical row count/hash to that exact fetch observation.
+        Repeating the same promotion is idempotent; conflicting evidence fails.
+        """
+        run_id = ingest_run_id.strip()
+        normalized_role = role.strip()
+        expected_version = expected_parser_version.strip()
+        final_version = parser_version.strip()
+        digest = parsed_rows_sha256.strip().lower()
+        if not run_id or not normalized_role:
+            raise ValueError("raw snapshot parse evidence requires an ingest run and role")
+        if not expected_version or not final_version:
+            raise ValueError("raw snapshot parse evidence requires parser versions")
+        if isinstance(parsed_row_count, bool) or parsed_row_count < 0:
+            raise ValueError("raw snapshot parsed row count cannot be negative")
+        if len(digest) != 64:
+            raise ValueError("raw snapshot parsed-row hash must be a 64-character SHA-256")
+        try:
+            int(digest, 16)
+        except ValueError as exc:
+            raise ValueError(
+                "raw snapshot parsed-row hash must be a 64-character SHA-256"
+            ) from exc
+
+        self._con.execute("BEGIN TRANSACTION")
+        try:
+            matches = self.query(
+                """
+                SELECT snapshot.snapshot_id, snapshot.parser_version,
+                       snapshot.parsed_row_count, snapshot.parsed_rows_sha256
+                FROM ingest_raw_snapshots AS linked
+                JOIN raw_snapshots AS snapshot USING (snapshot_id)
+                WHERE linked.run_id = ? AND linked.role = ?
+                ORDER BY snapshot.snapshot_id
+                """,
+                (run_id, normalized_role),
+            )
+            if len(matches) != 1:
+                raise ValueError(
+                    "raw snapshot parse evidence requires exactly one linked "
+                    f"snapshot for run {run_id!r} role {normalized_role!r}"
+                )
+            current = matches[0]
+            current_count = current["parsed_row_count"]
+            current_hash = current["parsed_rows_sha256"]
+            current_version = str(current["parser_version"])
+            if current_count is None and current_hash is None:
+                if current_version != expected_version:
+                    raise ValueError(
+                        "raw snapshot capture parser version changed before promotion"
+                    )
+                self._con.execute(
+                    """
+                    UPDATE raw_snapshots
+                    SET parser_version = ?, parsed_row_count = ?,
+                        parsed_rows_sha256 = ?
+                    WHERE snapshot_id = ?
+                    """,
+                    (
+                        final_version,
+                        parsed_row_count,
+                        digest,
+                        current["snapshot_id"],
+                    ),
+                )
+            elif current_count is None or current_hash is None:
+                raise ValueError("raw snapshot has incomplete parsed evidence")
+            elif (
+                current_version != final_version
+                or int(current_count) != parsed_row_count
+                or str(current_hash) != digest
+            ):
+                raise ValueError("raw snapshot parsed evidence conflicts with existing values")
+            self._con.execute("COMMIT")
+            return str(current["snapshot_id"])
+        except Exception:
+            self._con.execute("ROLLBACK")
+            raise
+
     def apply_universe_coverage_attestation(
         self,
         attestation: dict[str, Any],
@@ -2517,9 +2625,17 @@ class Store:
         )
         add(
             "prices_missing_close",
-            self.query("SELECT COUNT(*) AS n FROM prices WHERE close IS NULL")[0]["n"],
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM prices
+                WHERE close IS NULL
+                   OR NOT isfinite(close)
+                   OR close <= 0
+                """
+            )[0]["n"],
             "fail",
-            "A price row without close cannot support valuation or returns.",
+            "A missing, non-finite, or non-positive close cannot support valuation or returns.",
         )
         add(
             "prices_unverified_corporate_actions",
@@ -2676,6 +2792,40 @@ class Store:
             self.query("SELECT COUNT(*) AS n FROM macro WHERE release_date > CURRENT_DATE")[0]["n"],
             "fail",
             "A future release date is malformed and cannot be used for analysis.",
+        )
+        add(
+            "macro_primary_fallback_divergence",
+            self.query(
+                """
+                WITH fred_ranked AS (
+                    SELECT series_id, date, value,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY series_id, date
+                               ORDER BY release_date DESC, fetched_at DESC
+                           ) AS rn
+                    FROM macro
+                    WHERE source = 'fred'
+                ), treasury_ranked AS (
+                    SELECT series_id, date, value,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY series_id, date
+                               ORDER BY release_date DESC, fetched_at DESC
+                           ) AS rn
+                    FROM macro
+                    WHERE source = 'treasury'
+                )
+                SELECT COUNT(*) AS n
+                FROM fred_ranked AS primary_source
+                JOIN treasury_ranked AS fallback_source
+                  ON fallback_source.series_id = primary_source.series_id
+                 AND fallback_source.date = primary_source.date
+                WHERE primary_source.rn = 1
+                  AND fallback_source.rn = 1
+                  AND ABS(primary_source.value - fallback_source.value) > 0.05
+                """
+            )[0]["n"],
+            "warn",
+            "FRED and Treasury yields for the same observation date should agree within 5 bps.",
         )
         add(
             "universe_invalid_intervals",
@@ -3543,6 +3693,96 @@ class Store:
             return None
         return "ticker = ?", normalized_ticker
 
+    def _factor_identity_routes(
+        self,
+        tickers: list[str],
+        as_of: date | str,
+    ) -> dict[str, dict[str, Any]]:
+        """Resolve factor identity/provenance state for a universe in one read.
+
+        The returned state is intentionally equivalent to the scalar identity
+        helpers used by ``pit_factor_fundamentals``, ``latest_price``, and
+        ``pit_factor_price_history``. Ambiguous dated identities still raise so
+        callers can fall back to the scalar compatibility path without silently
+        choosing one security or issuer.
+        """
+        normalized = sorted({ticker.upper() for ticker in tickers})
+        if not normalized:
+            return {}
+
+        relation = f"_tmp_factor_tickers_{uuid4().hex}"
+        self._con.register(
+            relation,
+            _rows_to_arrowable([{"requested_ticker": ticker} for ticker in normalized]),
+        )
+        try:
+            rows = self.query(
+                f"""
+                WITH security_routes AS (
+                    SELECT requested.requested_ticker,
+                           COUNT(DISTINCT identity.security_id) AS security_count,
+                           MIN(identity.security_id) AS security_id
+                    FROM {relation} AS requested
+                    LEFT JOIN security_identity_assignments AS identity
+                      ON identity.ticker = requested.requested_ticker
+                     AND identity.known_date <= CAST(? AS DATE)
+                     AND identity.effective_start <= CAST(? AS DATE)
+                     AND (
+                            identity.effective_end IS NULL
+                            OR identity.effective_end > CAST(? AS DATE)
+                     )
+                    GROUP BY requested.requested_ticker
+                ), active_owners AS (
+                    SELECT security_id,
+                           COUNT(DISTINCT issuer_id) AS issuer_count,
+                           MIN(issuer_id) AS issuer_id
+                    FROM security_issuer_assignments
+                    WHERE effective_start <= CAST(? AS DATE)
+                      AND (effective_end IS NULL OR effective_end > CAST(? AS DATE))
+                    GROUP BY security_id
+                ), owner_history AS (
+                    SELECT DISTINCT security_id
+                    FROM security_issuer_assignments
+                ), mapping_history AS (
+                    SELECT DISTINCT security_id
+                    FROM provider_symbol_history
+                ), active_mappings AS (
+                    SELECT DISTINCT security_id
+                    FROM provider_symbol_history
+                    WHERE mapping_status = 'verified'
+                      AND data_start <= CAST(? AS DATE)
+                      AND (data_end IS NULL OR data_end > CAST(? AS DATE))
+                )
+                SELECT route.requested_ticker,
+                       route.security_count,
+                       route.security_id,
+                       COALESCE(owner.issuer_count, 0) AS issuer_count,
+                       owner.issuer_id,
+                       history.security_id IS NOT NULL AS has_reviewed_owner,
+                       mapping.security_id IS NOT NULL AS has_reviewed_mapping,
+                       active.security_id IS NOT NULL AS has_active_mapping
+                FROM security_routes AS route
+                LEFT JOIN active_owners AS owner USING (security_id)
+                LEFT JOIN owner_history AS history USING (security_id)
+                LEFT JOIN mapping_history AS mapping USING (security_id)
+                LEFT JOIN active_mappings AS active USING (security_id)
+                ORDER BY route.requested_ticker
+                """,
+                (str(as_of),) * 7,
+            )
+        finally:
+            self._con.unregister(relation)
+
+        resolved: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            ticker = str(row["requested_ticker"])
+            if int(row["security_count"]) > 1:
+                raise ValueError(f"ambiguous security identity for {ticker}@{as_of}")
+            if int(row["issuer_count"]) > 1:
+                raise ValueError(f"ambiguous issuer identity for {row['security_id']}@{as_of}")
+            resolved[ticker] = row
+        return resolved
+
     def issuer_reference(self, issuer_id: str) -> dict | None:
         """Return canonical issuer metadata and its latest verified SEC CIK."""
         rows = self.query(
@@ -3803,6 +4043,108 @@ class Store:
             (identity_value, *normalized_metrics, str(as_of)),
         )
 
+    def pit_factor_fundamentals_batch(
+        self,
+        tickers: list[str],
+        as_of: date | str,
+        metrics: list[str],
+    ) -> dict[str, list[dict]]:
+        """Return PIT-deduped factor histories for a universe in one data read.
+
+        Results use the same dated security-to-issuer routing, reviewed-owner
+        gap, restatement, and legacy-ticker policy as
+        :meth:`pit_factor_fundamentals`. No result is persisted beyond the
+        caller's decision scope.
+        """
+        routes = self._factor_identity_routes(tickers, as_of)
+        result = {ticker: [] for ticker in routes}
+        normalized_metrics = sorted({metric.strip() for metric in metrics if metric.strip()})
+        if not routes or not normalized_metrics:
+            return result
+
+        readable: list[dict] = []
+        for ticker, route in routes.items():
+            issuer_id = route.get("issuer_id")
+            if issuer_id is not None:
+                readable.append(
+                    {
+                        "requested_ticker": ticker,
+                        "identity_kind": "issuer",
+                        "identity_value": issuer_id,
+                    }
+                )
+            elif route.get("security_id") is not None and route.get("has_reviewed_owner"):
+                # Once reviewed ownership exists, a date without an active
+                # owner is an explicit evidence gap and cannot use ticker rows.
+                continue
+            else:
+                readable.append(
+                    {
+                        "requested_ticker": ticker,
+                        "identity_kind": "ticker",
+                        "identity_value": ticker,
+                    }
+                )
+        if not readable:
+            return result
+
+        relation = f"_tmp_factor_fundamental_routes_{uuid4().hex}"
+        self._con.register(relation, _rows_to_arrowable(readable))
+        placeholders = ",".join("?" for _ in normalized_metrics)
+        try:
+            rows = self.query(
+                f"""
+                WITH selected AS (
+                    SELECT route.requested_ticker,
+                           fundamental.metric,
+                           fundamental.period_end,
+                           fundamental.as_of_date,
+                           fundamental.fiscal_period,
+                           fundamental.value,
+                           fundamental.quarter_value
+                    FROM {relation} AS route
+                    JOIN fundamentals AS fundamental
+                      ON route.identity_kind = 'issuer'
+                     AND fundamental.issuer_id = route.identity_value
+                    UNION ALL
+                    SELECT route.requested_ticker,
+                           fundamental.metric,
+                           fundamental.period_end,
+                           fundamental.as_of_date,
+                           fundamental.fiscal_period,
+                           fundamental.value,
+                           fundamental.quarter_value
+                    FROM {relation} AS route
+                    JOIN fundamentals AS fundamental
+                      ON route.identity_kind = 'ticker'
+                     AND fundamental.ticker = route.identity_value
+                ), ranked AS (
+                    SELECT *,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY requested_ticker, metric, period_end
+                               ORDER BY as_of_date DESC
+                           ) AS period_rn
+                    FROM selected
+                    WHERE metric IN ({placeholders})
+                      AND as_of_date <= CAST(? AS DATE)
+                      AND period_end <= as_of_date
+                )
+                SELECT requested_ticker, metric, period_end, as_of_date,
+                       fiscal_period, value, quarter_value
+                FROM ranked
+                WHERE period_rn = 1
+                ORDER BY requested_ticker, metric, period_end
+                """,
+                (*normalized_metrics, str(as_of)),
+            )
+        finally:
+            self._con.unregister(relation)
+
+        for row in rows:
+            ticker = str(row.pop("requested_ticker"))
+            result[ticker].append(row)
+        return result
+
     def pit_macro_history(self, series_id: str, as_of: date | str) -> list[dict]:
         """Return the latest known vintage for every observation up to `as_of`.
 
@@ -3817,7 +4159,13 @@ class Store:
                 SELECT series_id, date, release_date, value, unit, source,
                        ROW_NUMBER() OVER (
                            PARTITION BY series_id, date
-                           ORDER BY release_date DESC, fetched_at DESC
+                           ORDER BY release_date DESC,
+                                    CASE source
+                                        WHEN 'fred' THEN 0
+                                        WHEN 'treasury' THEN 1
+                                        ELSE 2
+                                    END,
+                                    fetched_at DESC
                        ) AS rn
                 FROM macro
                 WHERE series_id = ?
@@ -3845,7 +4193,13 @@ class Store:
                 SELECT series_id, date, release_date, value, unit, source,
                        ROW_NUMBER() OVER (
                            PARTITION BY series_id, date
-                           ORDER BY release_date DESC, fetched_at DESC
+                           ORDER BY release_date DESC,
+                                    CASE source
+                                        WHEN 'fred' THEN 0
+                                        WHEN 'treasury' THEN 1
+                                        ELSE 2
+                                    END,
+                                    fetched_at DESC
                        ) AS vintage_rn
                 FROM macro
                 WHERE series_id IN ({placeholders})
@@ -3953,6 +4307,95 @@ class Store:
                 (ticker.upper(), str(as_of)),
             )
         return rows[0] if rows else None
+
+    def pit_factor_latest_prices_batch(
+        self,
+        tickers: list[str],
+        as_of: date | str,
+    ) -> dict[str, dict | None]:
+        """Return the factor-compatible latest price for every requested ticker.
+
+        Provider mapping gaps fail closed exactly as in :meth:`latest_price`.
+        The selected columns are the complete price/action evidence consumed by
+        the factor layer; this method is not a general replacement for the
+        scalar storage API.
+        """
+        routes = self._factor_identity_routes(tickers, as_of)
+        result: dict[str, dict | None] = {ticker: None for ticker in routes}
+        readable: list[dict] = []
+        for ticker, route in routes.items():
+            if route.get("has_reviewed_mapping"):
+                if not route.get("has_active_mapping"):
+                    continue
+                readable.append(
+                    {
+                        "requested_ticker": ticker,
+                        "identity_kind": "security",
+                        "identity_value": route["security_id"],
+                    }
+                )
+            else:
+                readable.append(
+                    {
+                        "requested_ticker": ticker,
+                        "identity_kind": "ticker",
+                        "identity_value": ticker,
+                    }
+                )
+        if not readable:
+            return result
+
+        relation = f"_tmp_factor_latest_price_routes_{uuid4().hex}"
+        self._con.register(relation, _rows_to_arrowable(readable))
+        try:
+            rows = self.query(
+                f"""
+                WITH candidates AS (
+                    SELECT route.requested_ticker,
+                           price.ticker,
+                           price.security_id,
+                           price.date,
+                           price.close,
+                           price.dividends,
+                           price.split_ratio,
+                           price.actions_complete,
+                           price.close_split_adjusted,
+                           price.split_normalization_factor,
+                           price.split_normalization_through,
+                           price.source,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY route.requested_ticker
+                               ORDER BY price.date DESC
+                           ) AS price_rn
+                    FROM {relation} AS route
+                    JOIN prices AS price
+                      ON (
+                            route.identity_kind = 'security'
+                            AND price.security_id = route.identity_value
+                      )
+                      OR (
+                            route.identity_kind = 'ticker'
+                            AND price.ticker = route.identity_value
+                      )
+                    WHERE price.date <= CAST(? AS DATE)
+                )
+                SELECT requested_ticker, ticker, security_id, date, close,
+                       dividends, split_ratio, actions_complete,
+                       close_split_adjusted, split_normalization_factor,
+                       split_normalization_through, source
+                FROM candidates
+                WHERE price_rn = 1
+                ORDER BY requested_ticker
+                """,
+                (str(as_of),),
+            )
+        finally:
+            self._con.unregister(relation)
+
+        for row in rows:
+            ticker = str(row.pop("requested_ticker"))
+            result[ticker] = row
+        return result
 
     def price_history(
         self,
@@ -4095,6 +4538,153 @@ class Store:
                 (normalized_ticker, str(as_of), observations),
             )
         return rows
+
+    def pit_factor_price_histories_batch(
+        self,
+        tickers: list[str],
+        as_of: date | str,
+        *,
+        observations: int,
+    ) -> dict[str, list[dict]]:
+        """Return identity-safe factor price windows for a whole universe.
+
+        This is the set-based equivalent of :meth:`pit_factor_price_history`.
+        It preserves provider-gap handling, source priority, date de-duplication,
+        and the legacy ticker-only compatibility route.
+        """
+        if observations < 2:
+            raise ValueError("factor price history requires at least two observations")
+        routes = self._factor_identity_routes(tickers, as_of)
+        result = {ticker: [] for ticker in routes}
+        readable: list[dict] = []
+        for ticker, route in routes.items():
+            if route.get("has_reviewed_mapping"):
+                if not route.get("has_active_mapping"):
+                    continue
+                readable.append(
+                    {
+                        "requested_ticker": ticker,
+                        "identity_kind": "security",
+                        "identity_value": route["security_id"],
+                    }
+                )
+            else:
+                readable.append(
+                    {
+                        "requested_ticker": ticker,
+                        "identity_kind": "ticker",
+                        "identity_value": ticker,
+                    }
+                )
+        if not readable:
+            return result
+
+        relation = f"_tmp_factor_price_history_routes_{uuid4().hex}"
+        self._con.register(relation, _rows_to_arrowable(readable))
+        try:
+            rows = self.query(
+                f"""
+                WITH combined AS (
+                    SELECT route.requested_ticker,
+                           route.identity_kind,
+                           price.ticker,
+                           price.security_id,
+                           price.date,
+                           price.close,
+                           price.dividends,
+                           price.split_ratio,
+                           price.actions_complete,
+                           price.close_split_adjusted,
+                           price.split_normalization_factor,
+                           price.split_normalization_through,
+                           price.source,
+                           price.fetched_at,
+                           2 AS source_priority
+                    FROM {relation} AS route
+                    JOIN prices AS price
+                      ON route.identity_kind = 'security'
+                     AND price.security_id = route.identity_value
+                    WHERE price.date <= CAST(? AS DATE)
+                    UNION ALL
+                    SELECT route.requested_ticker,
+                           route.identity_kind,
+                           CAST(route.requested_ticker AS VARCHAR) AS ticker,
+                           factor_price.security_id,
+                           factor_price.date,
+                           factor_price.close,
+                           factor_price.dividends,
+                           factor_price.split_ratio,
+                           factor_price.actions_complete,
+                           factor_price.close_split_adjusted,
+                           factor_price.split_normalization_factor,
+                           factor_price.split_normalization_through,
+                           factor_price.provider AS source,
+                           factor_price.fetched_at,
+                           1 AS source_priority
+                    FROM {relation} AS route
+                    JOIN factor_prices AS factor_price
+                      ON route.identity_kind = 'security'
+                     AND factor_price.security_id = route.identity_value
+                    WHERE factor_price.date <= CAST(? AS DATE)
+                    UNION ALL
+                    SELECT route.requested_ticker,
+                           route.identity_kind,
+                           price.ticker,
+                           price.security_id,
+                           price.date,
+                           price.close,
+                           price.dividends,
+                           price.split_ratio,
+                           price.actions_complete,
+                           price.close_split_adjusted,
+                           price.split_normalization_factor,
+                           price.split_normalization_through,
+                           price.source,
+                           price.fetched_at,
+                           2 AS source_priority
+                    FROM {relation} AS route
+                    JOIN prices AS price
+                      ON route.identity_kind = 'ticker'
+                     AND price.ticker = route.identity_value
+                    WHERE price.date <= CAST(? AS DATE)
+                ), deduped AS (
+                    SELECT *,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY requested_ticker, date
+                               ORDER BY source_priority DESC,
+                                        fetched_at DESC,
+                                        CASE
+                                            WHEN identity_kind = 'ticker' THEN ticker
+                                            ELSE NULL
+                                        END DESC
+                           ) AS date_rn
+                    FROM combined
+                ), recent AS (
+                    SELECT *,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY requested_ticker
+                               ORDER BY date DESC
+                           ) AS observation_rn
+                    FROM deduped
+                    WHERE date_rn = 1
+                )
+                SELECT requested_ticker, ticker, security_id, date, close,
+                       dividends, split_ratio, actions_complete,
+                       close_split_adjusted, split_normalization_factor,
+                       split_normalization_through, source
+                FROM recent
+                WHERE observation_rn <= ?
+                ORDER BY requested_ticker, date
+                """,
+                (str(as_of), str(as_of), str(as_of), observations),
+            )
+        finally:
+            self._con.unregister(relation)
+
+        for row in rows:
+            ticker = str(row.pop("requested_ticker"))
+            result[ticker].append(row)
+        return result
 
     def price_action_refresh_candidates(
         self,

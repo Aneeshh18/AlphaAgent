@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import sys
 from datetime import date
 from http.client import IncompleteRead
@@ -10,10 +11,20 @@ import pandas as pd
 import pytest
 from tenacity import wait_none
 
+from aios.factor_batch import DecisionScopedFactorStore
 from aios.factors import composite as composite_factor
 from aios.factors import quality as quality_factor
 from aios.factors import value as value_factor
-from aios.factors.common import deduped_history, factor_cache_scope, metric_value, ttm_sum
+from aios.factors.common import (
+    deduped_history,
+    factor_cache_scope,
+    factor_price_history,
+    metric_value,
+    ttm_sum,
+)
+from aios.factors.common import (
+    latest_price as factor_latest_price,
+)
 from aios.factors.market_factors import MarketFactorSnapshot
 from aios.factors.policy import (
     BASELINE_FACTOR_WEIGHTS,
@@ -25,6 +36,7 @@ from aios.factors.value import ValueSnapshot, compute_value_raw
 from aios.ingest import edgar
 from aios.ingest import fred as fred_ingest
 from aios.macro.regime import GROWTH_SERIES, compute_regime
+from aios.raw_snapshots import verify_raw_snapshots
 from aios.storage.store import Store
 
 
@@ -142,6 +154,93 @@ def test_factor_cache_batches_reads_and_expires_after_decision_scope(monkeypatch
         store.close()
 
 
+def test_decision_scoped_factor_store_uses_bounded_batch_reads(monkeypatch, tmp_path):
+    store = Store(tmp_path / "factor-cache-universe.duckdb")
+    try:
+        tickers = ["ALPHA", "BETA", "GAMMA"]
+        store.upsert_fundamentals(
+            [
+                _fundamental(
+                    ticker,
+                    "2023-12-31",
+                    "2024-02-01",
+                    "revenue",
+                    value,
+                    fiscal_period="FY2023",
+                )
+                for ticker, value in zip(tickers, [100, 200, 300], strict=True)
+            ]
+        )
+        store.upsert_prices(
+            [
+                {
+                    "ticker": ticker,
+                    "date": price_date,
+                    "close": value + offset,
+                    "actions_complete": True,
+                    "close_split_adjusted": False,
+                    "source": "test",
+                }
+                for ticker, value in zip(tickers, [10, 20, 30], strict=True)
+                for price_date, offset in [("2024-01-31", 0), ("2024-02-01", 1)]
+            ]
+        )
+
+        query_count = 0
+        original_query = store.query
+
+        def counted_query(sql, params=None):
+            nonlocal query_count
+            query_count += 1
+            return original_query(sql, params)
+
+        monkeypatch.setattr(store, "query", counted_query)
+        monkeypatch.setattr(
+            store,
+            "pit_factor_fundamentals",
+            lambda *_args, **_kwargs: pytest.fail("scalar fundamental fallback was used"),
+        )
+        monkeypatch.setattr(
+            store,
+            "latest_price",
+            lambda *_args, **_kwargs: pytest.fail("scalar latest-price fallback was used"),
+        )
+        monkeypatch.setattr(
+            store,
+            "pit_factor_price_history",
+            lambda *_args, **_kwargs: pytest.fail("scalar price-history fallback was used"),
+        )
+
+        factor_store = DecisionScopedFactorStore(store, tickers)
+        with factor_cache_scope(factor_store, tickers):
+            assert [
+                metric_value(factor_store, ticker, "2024-12-31", "revenue", True)
+                for ticker in tickers
+            ] == [100, 200, 300]
+            assert [
+                factor_latest_price(factor_store, ticker, "2024-12-31")
+                for ticker in tickers
+            ] == [11, 21, 31]
+            assert [
+                [
+                    row["close"]
+                    for row in factor_price_history(
+                        factor_store,
+                        ticker,
+                        "2024-12-31",
+                        observations=2,
+                    )
+                ]
+                for ticker in tickers
+            ] == [[10, 11], [20, 21], [30, 31]]
+
+        # One SIC read, then identity + data reads for fundamentals, latest
+        # prices, and price histories. The count is fixed as the universe grows.
+        assert query_count == 7
+    finally:
+        store.close()
+
+
 def test_price_upsert_preserves_provider_source(tmp_path):
     store = Store(tmp_path / "prices.duckdb")
     try:
@@ -165,6 +264,72 @@ def test_price_upsert_preserves_provider_source(tmp_path):
 
         assert store.price_on("TEST", "2024-01-02")["source"] == "stooq"
         assert store.latest_price_date("TEST") == date(2024, 1, 2)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("invalid_close", [None, 0, -1, float("nan"), float("inf")])
+def test_price_upsert_rejects_unusable_close_without_overwriting_valid_row(
+    tmp_path,
+    invalid_close,
+):
+    store = Store(tmp_path / "invalid-price.duckdb")
+    try:
+        store.upsert_prices(
+            [
+                {
+                    "ticker": "TEST",
+                    "date": "2024-01-02",
+                    "close": 100,
+                    "source": "yfinance",
+                }
+            ]
+        )
+
+        with pytest.raises(ValueError, match="price close must be positive and finite"):
+            store.upsert_prices(
+                [
+                    {
+                        "ticker": "TEST",
+                        "date": "2024-01-02",
+                        "open": 110,
+                        "high": 120,
+                        "low": 90,
+                        "close": invalid_close,
+                        "source": "yfinance",
+                    }
+                ]
+            )
+
+        stored = store.price_on("TEST", "2024-01-02")
+        assert stored["close"] == 100
+        assert stored["open"] is None
+    finally:
+        store.close()
+
+
+def test_price_upsert_rejects_invalid_batch_atomically(tmp_path):
+    store = Store(tmp_path / "invalid-price-batch.duckdb")
+    try:
+        with pytest.raises(ValueError, match="BROKEN@2024-01-03"):
+            store.upsert_prices(
+                [
+                    {
+                        "ticker": "VALID",
+                        "date": "2024-01-02",
+                        "close": 100,
+                        "source": "yfinance",
+                    },
+                    {
+                        "ticker": "BROKEN",
+                        "date": "2024-01-03",
+                        "close": None,
+                        "source": "yfinance",
+                    },
+                ]
+            )
+
+        assert store.query("SELECT COUNT(*) AS n FROM prices")[0]["n"] == 0
     finally:
         store.close()
 
@@ -243,6 +408,28 @@ def test_data_quality_report_flags_legacy_ebitda(tmp_path):
         assert report["fundamentals_missing_as_of_date"]["status"] == "ok"
         assert report["legacy_mislabeled_ebitda"]["status"] == "warn"
         assert report["legacy_mislabeled_ebitda"]["count"] == 1
+    finally:
+        store.close()
+
+
+def test_data_quality_report_rejects_nonpositive_and_nonfinite_direct_price_rows(
+    tmp_path,
+):
+    store = Store(tmp_path / "invalid-direct-prices.duckdb")
+    try:
+        store.execute(
+            """
+            INSERT INTO prices (ticker, date, close)
+            VALUES ('ZERO', '2024-01-02', 0),
+                   ('NAN', '2024-01-03', ?)
+            """,
+            (float("nan"),),
+        )
+
+        report = {row["check"]: row for row in store.data_quality_report()}
+
+        assert report["prices_missing_close"]["status"] == "fail"
+        assert report["prices_missing_close"]["count"] == 2
     finally:
         store.close()
 
@@ -885,6 +1072,74 @@ def test_fred_fetch_preserves_observation_and_release_dates(monkeypatch):
     assert rows[0]["release_date"] == "2020-01-30"
 
 
+def test_fred_normalized_export_is_linked_and_replay_verified(
+    monkeypatch,
+    tmp_path,
+):
+    class FakeFred:
+        def __init__(self, api_key):
+            assert api_key == "test-key"
+
+        def get_series_vintage_dates(self, series_id):
+            assert series_id == "GDP"
+            return [pd.Timestamp("2020-01-30")]
+
+        def get_series_all_releases(
+            self,
+            series_id,
+            realtime_start=None,
+            realtime_end=None,
+        ):
+            assert series_id == "GDP"
+            return pd.DataFrame(
+                {
+                    "date": [pd.Timestamp("2019-10-01")],
+                    "realtime_start": [pd.Timestamp(realtime_start)],
+                    "value": [100.0],
+                }
+            )
+
+    monkeypatch.setattr(fred_ingest.settings, "fred_api_key", "test-key")
+    monkeypatch.setitem(sys.modules, "fredapi", SimpleNamespace(Fred=FakeFred))
+    store = Store(tmp_path / "data" / "test.duckdb")
+    try:
+        rows = fred_ingest.fetch_series_fred(
+            "GDP",
+            realtime_start="2020-01-01",
+            store=store,
+            ingest_run_id="macro-run",
+            project_root=tmp_path,
+        )
+
+        snapshot = store.query(
+            """
+            SELECT snapshot_id, artifact_kind, parsed_row_count,
+                   parsed_rows_sha256, payload_sha256
+            FROM raw_snapshots
+            """
+        )[0]
+        assert snapshot["artifact_kind"] == "normalized_provider_export"
+        assert snapshot["parsed_row_count"] == 1
+        assert snapshot["parsed_rows_sha256"]
+        assert store.query(
+            "SELECT run_id, role FROM ingest_raw_snapshots"
+        ) == [{"run_id": "macro-run", "role": "macro:GDP"}]
+        payload_record = store.raw_payload_record(snapshot["payload_sha256"])
+        payload = gzip.decompress(
+            (tmp_path / payload_record["relative_path"]).read_bytes()
+        )
+        assert fred_ingest.parse_fred_normalized_export(payload) == rows
+        assert (
+            verify_raw_snapshots(
+                store=store,
+                project_root=tmp_path,
+            ).replayed_snapshots
+            == 1
+        )
+    finally:
+        store.close()
+
+
 def test_fred_fetch_chunks_oversized_vintage_histories(monkeypatch):
     calls: list[tuple[str, str]] = []
 
@@ -964,7 +1219,12 @@ def test_macro_ingest_continues_after_one_series_fails(monkeypatch, tmp_path):
     store = Store(tmp_path / "macro-resilient.duckdb")
     calls: list[str] = []
 
-    def fake_fetch(series_id, realtime_start=None, realtime_end=None):
+    def fake_fetch(
+        series_id,
+        realtime_start=None,
+        realtime_end=None,
+        **_kwargs,
+    ):
         calls.append(series_id)
         if series_id == "BAD":
             raise ValueError("fixture failure")
@@ -987,6 +1247,42 @@ def test_macro_ingest_continues_after_one_series_fails(monkeypatch, tmp_path):
         assert run["status"] == "failed"
         assert run["rows_inserted"] == 1
         assert "BAD: fixture failure" in run["error"]
+    finally:
+        store.close()
+
+
+def test_macro_ingest_accepts_treasury_for_a_failed_fred_yield(
+    monkeypatch,
+    tmp_path,
+):
+    store = Store(tmp_path / "macro-yield-fallback.duckdb")
+
+    def failed_fred(*_args, **_kwargs):
+        raise ConnectionError("FRED unavailable")
+
+    monkeypatch.setattr(fred_ingest.settings, "fred_api_key", "test-key")
+    monkeypatch.setattr(fred_ingest, "fetch_series_fred", failed_fred)
+    monkeypatch.setattr(
+        fred_ingest,
+        "fetch_treasury_yield_curve",
+        lambda **_kwargs: [
+            _macro(
+                "DGS10",
+                "2026-07-24",
+                "2026-07-24",
+                4.69,
+                source="treasury",
+            )
+        ],
+    )
+    try:
+        assert fred_ingest.ingest_macro(["DGS10"], store=store) == 1
+        run = store.ingest_history(1)[0]
+        assert run["status"] == "warning"
+        assert "official Treasury fallback succeeded" in run["error"]
+        assert store.pit_macro_history("DGS10", "2026-07-24")[0]["source"] == (
+            "treasury"
+        )
     finally:
         store.close()
 
@@ -1014,6 +1310,75 @@ def test_macro_pit_history_selects_vintage_known_on_date(tmp_path):
         ]
         assert store.pit_macro_latest(["GDP"], "2020-03-01")[0]["value"] == 100.0
         assert store.latest_macro_release_date("GDP", source="test") == date(2020, 5, 1)
+    finally:
+        store.close()
+
+
+def test_macro_pit_prefers_fred_when_treasury_has_the_same_vintage(tmp_path):
+    store = Store(tmp_path / "macro-source-priority.duckdb")
+    try:
+        store.upsert_macro(
+            [
+                _macro(
+                    "DGS10",
+                    "2026-07-24",
+                    "2026-07-24",
+                    4.69,
+                    source="fred",
+                )
+            ]
+        )
+        # Insert the cross-check second. Fetch order must never override the
+        # declared primary provider when both describe the same vintage.
+        store.upsert_macro(
+            [
+                _macro(
+                    "DGS10",
+                    "2026-07-24",
+                    "2026-07-24",
+                    4.70,
+                    source="treasury",
+                )
+            ]
+        )
+
+        history = store.pit_macro_history("DGS10", "2026-07-24")
+        latest = store.pit_macro_latest(["DGS10"], "2026-07-24")
+        assert history[-1]["source"] == "fred"
+        assert history[-1]["value"] == 4.69
+        assert latest[0]["source"] == "fred"
+        assert latest[0]["value"] == 4.69
+        report = {row["check"]: row for row in store.data_quality_report()}
+        assert report["macro_primary_fallback_divergence"]["status"] == "ok"
+    finally:
+        store.close()
+
+
+def test_macro_quality_flags_material_fred_treasury_divergence(tmp_path):
+    store = Store(tmp_path / "macro-source-divergence.duckdb")
+    try:
+        store.upsert_macro(
+            [
+                _macro(
+                    "DGS2",
+                    "2026-07-24",
+                    "2026-07-25",
+                    4.30,
+                    source="fred",
+                ),
+                _macro(
+                    "DGS2",
+                    "2026-07-24",
+                    "2026-07-24",
+                    4.40,
+                    source="treasury",
+                ),
+            ]
+        )
+
+        report = {row["check"]: row for row in store.data_quality_report()}
+        assert report["macro_primary_fallback_divergence"]["status"] == "warn"
+        assert report["macro_primary_fallback_divergence"]["count"] == 1
     finally:
         store.close()
 

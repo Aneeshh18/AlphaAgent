@@ -9,9 +9,11 @@ import aios.scheduler as scheduler_module
 from aios import cli
 from aios.scheduler import (
     ALERT_SERVICE_NAME,
+    EMAIL_TIMER_NAME,
     LEGACY_TIMER_NAMES,
     LEGACY_UNIT_NAMES,
     MANAGED_MARKER,
+    OPTIONAL_TIMER_NAMES,
     TIMER_NAMES,
     UNIT_NAMES,
     SchedulerInstallResult,
@@ -19,6 +21,7 @@ from aios.scheduler import (
     install_user_scheduler,
     remove_user_scheduler,
     render_systemd_units,
+    set_email_scheduler_active,
     set_user_scheduler_active,
     user_linger_status,
     user_scheduler_status,
@@ -41,7 +44,16 @@ def test_rendered_scheduler_uses_supported_commands_and_no_dashboard_service(tmp
     assert set(units) == set(UNIT_NAMES)
     assert "refresh-us-daily" in units["aios-us-daily.service"]
     assert "Restart=on-failure" in units["aios-us-daily.service"]
-    assert "AIOS_DUCKDB_LOCK_WAIT_SECONDS=300" in units["aios-us-daily.service"]
+    assert "DUCKDB_LOCK_WAIT_SECONDS=300" in units["aios-us-daily.service"]
+    assert "AIOS_DUCKDB_LOCK_WAIT_SECONDS" not in units["aios-us-daily.service"]
+    for service in (
+        "aios-us-daily.service",
+        "aios-us-filings.service",
+        "aios-backup.service",
+    ):
+        assert "/usr/bin/flock" in units[service]
+        assert "--exclusive --wait 1800" in units[service]
+        assert "data/operations/scheduler.lock" in units[service]
     assert (
         "Tue..Sat *-*-* 02:00:00 America/New_York"
         in units["aios-us-daily.timer"]
@@ -55,6 +67,10 @@ def test_rendered_scheduler_uses_supported_commands_and_no_dashboard_service(tmp
     assert "alert-service-failure --unit %i" in units[ALERT_SERVICE_NAME]
     assert "OnFailure=" not in units[ALERT_SERVICE_NAME]
     assert " backup\n" in units["aios-backup.service"]
+    assert "email-deliver --limit 2" in units["aios-notifications-email.service"]
+    assert "OnFailure=" not in units["aios-notifications-email.service"]
+    assert "OnUnitActiveSec=5min" in units["aios-notifications-email.timer"]
+    assert "SMTP_PASSWORD" not in "\n".join(units.values())
     assert "dashboard" not in "\n".join(units.values()).lower()
     assert "WorkingDirectory=/" in units["aios-us-daily.service"]
     assert "AI\\x20Invester" in units["aios-us-daily.service"]
@@ -86,6 +102,23 @@ def test_scheduler_install_requires_confirmation_and_enables_managed_timers(tmp_
         ["systemctl", "--user", "disable", "--now", *LEGACY_TIMER_NAMES],
         ["systemctl", "--user", "daemon-reload"],
         ["systemctl", "--user", "enable", "--now", *TIMER_NAMES],
+    ]
+    assert EMAIL_TIMER_NAME not in calls[-1]
+
+
+def test_email_timer_requires_separate_explicit_activation() -> None:
+    calls: list[list[str]] = []
+
+    def runner(command, **_kwargs):
+        calls.append(command)
+        return CompletedProcess(command, 0, "", "")
+
+    set_email_scheduler_active(True, runner=runner)
+    set_email_scheduler_active(False, runner=runner)
+
+    assert calls == [
+        ["systemctl", "--user", "enable", "--now", EMAIL_TIMER_NAME],
+        ["systemctl", "--user", "disable", "--now", EMAIL_TIMER_NAME],
     ]
 
 
@@ -172,6 +205,7 @@ def test_scheduler_pause_resume_status_and_removal_are_bounded(tmp_path) -> None
         "disable",
         "--now",
         *TIMER_NAMES,
+        *OPTIONAL_TIMER_NAMES,
         *LEGACY_TIMER_NAMES,
     ]
     assert calls[-1] == ["systemctl", "--user", "daemon-reload"]
@@ -202,6 +236,31 @@ def test_scheduler_status_does_not_report_unrun_systemd_defaults_as_passed() -> 
     assert all(value["last_run"] == "never" for value in status.values())
     assert all(value["service_result"] == "not-run" for value in status.values())
     assert all(value["exit_status"] == "unknown" for value in status.values())
+
+
+def test_scheduler_status_prefers_actual_service_run_over_older_timer_trigger() -> None:
+    def runner(command, **_kwargs):
+        if "is-enabled" in command or "is-active" in command:
+            return CompletedProcess(command, 0, "active\n", "")
+        if "show" in command and command[3].endswith(".timer"):
+            output = (
+                "LastTriggerUSec=Tue 2026-07-21 07:31:00 IST\n"
+                "NextElapseUSecRealtime=Wed 2026-07-22 07:31:00 IST\n"
+            )
+        elif "show" in command:
+            output = (
+                "Result=success\n"
+                "ExecMainStatus=0\n"
+                "ExecMainStartTimestamp=Tue 2026-07-21 08:00:00 IST\n"
+                "ExecMainExitTimestamp=Tue 2026-07-21 08:05:00 IST\n"
+            )
+        else:  # pragma: no cover - all supported status calls are above
+            output = ""
+        return CompletedProcess(command, 0, output, "")
+
+    status = user_scheduler_status(runner=runner)
+
+    assert all("08:05:00" in str(value["last_run"]) for value in status.values())
 
 
 def test_scheduler_status_times_out_to_installed_file_evidence(tmp_path) -> None:
@@ -295,8 +354,10 @@ def test_scheduler_cli_requires_confirmation_and_explains_safe_dashboard_overlap
     assert refused.exit_code == 1
     assert "explicit" in refused.output and "confirmation" in refused.output
     assert installed.exit_code == 0
-    assert "short read-only database sessions" in installed.output
-    assert "five minutes" in installed.output
+    normalized_output = " ".join(installed.output.split())
+    assert "short read-only database sessions" in normalized_output
+    assert "30-minute wait queue" in normalized_output
+    assert "five minutes" in normalized_output
 
 
 def test_scheduler_can_explicitly_enable_and_verify_linger(monkeypatch) -> None:

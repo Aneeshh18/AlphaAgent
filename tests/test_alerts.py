@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from subprocess import CompletedProcess
 
@@ -177,6 +178,74 @@ def test_incident_store_refuses_symbolic_link_database(tmp_path) -> None:
         AlertStore(link)
 
 
+def test_incident_read_only_store_preserves_exact_database_bytes(tmp_path) -> None:
+    path = tmp_path / "alerts.sqlite3"
+    writable = AlertStore(path)
+    incident = writable.emit(_alert())
+    checkpoint = sqlite3.connect(path)
+    try:
+        checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        checkpoint.execute("PRAGMA journal_mode = DELETE")
+    finally:
+        checkpoint.close()
+    before = path.read_bytes()
+    sidecars_before = {
+        suffix: candidate.read_bytes()
+        for suffix in ("-wal", "-shm")
+        if (candidate := path.with_name(f"{path.name}{suffix}")).exists()
+    }
+
+    read_only = AlertStore(path, read_only=True)
+
+    assert read_only.get(incident.incident_id) == incident
+    assert read_only.list(unresolved_only=True) == [incident]
+    assert [event["event_type"] for event in read_only.events(incident.incident_id)] == [
+        "opened"
+    ]
+    assert path.read_bytes() == before
+    assert {
+        suffix: candidate.read_bytes()
+        for suffix in ("-wal", "-shm")
+        if (candidate := path.with_name(f"{path.name}{suffix}")).exists()
+    } == sidecars_before
+
+
+def test_incident_read_only_store_refuses_uncheckpointed_wal(tmp_path) -> None:
+    path = tmp_path / "alerts.sqlite3"
+    writable = AlertStore(path)
+    writable.emit(_alert())
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute(
+            "UPDATE incidents SET body = body || ' [test]' "
+            "WHERE code = 'refresh_partial'"
+        )
+        connection.commit()
+        assert path.with_name(f"{path.name}-wal").stat().st_size > 0
+
+        with pytest.raises(RuntimeError, match="uncheckpointed WAL"):
+            AlertStore(path, read_only=True)
+    finally:
+        connection.close()
+
+
+def test_incident_read_only_store_refuses_schema_migration(tmp_path) -> None:
+    path = tmp_path / "alerts.sqlite3"
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA user_version = 3")
+        connection.commit()
+    finally:
+        connection.close()
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError, match="schema 3 does not match required schema 4"):
+        AlertStore(path, read_only=True)
+
+    assert path.read_bytes() == before
+
+
 def test_incident_references_require_a_unique_prefix_and_same_second_order_is_stable(
     tmp_path,
 ) -> None:
@@ -197,7 +266,13 @@ def test_incident_references_require_a_unique_prefix_and_same_second_order_is_st
 
 def test_alert_cli_tests_lists_and_inspects_local_history(monkeypatch, tmp_path) -> None:
     store = AlertStore(tmp_path / "alerts.sqlite3")
-    monkeypatch.setattr(alerts_module, "get_alert_store", lambda: store)
+    modes: list[dict] = []
+
+    def get_store(**kwargs):
+        modes.append(kwargs)
+        return store
+
+    monkeypatch.setattr(alerts_module, "get_alert_store", get_store)
 
     test_result = CliRunner().invoke(cli.app, ["alert-test"])
     unresolved = store.emit(_alert())
@@ -214,3 +289,9 @@ def test_alert_cli_tests_lists_and_inspects_local_history(monkeypatch, tmp_path)
     assert "Two providers need review" in show_result.output
     assert ack_result.exit_code == 0
     assert store.get(unresolved.incident_id).state == "acknowledged"
+    assert modes == [
+        {},
+        {"read_only": True},
+        {"read_only": True},
+        {},
+    ]

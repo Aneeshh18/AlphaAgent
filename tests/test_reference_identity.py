@@ -189,11 +189,12 @@ def test_yfinance_normalized_export_is_linked_and_replay_verified(
         snapshot = store.query(
             """
             SELECT snapshot_id, artifact_kind, parsed_row_count,
-                   parsed_rows_sha256, payload_sha256
+                   parsed_rows_sha256, payload_sha256, parser_version
             FROM raw_snapshots
             """
         )[0]
         assert snapshot["artifact_kind"] == "normalized_provider_export"
+        assert snapshot["parser_version"] == prices.YFINANCE_PARSER_VERSION
         assert snapshot["parsed_row_count"] == 1
         assert snapshot["parsed_rows_sha256"]
         assert store.query(
@@ -213,6 +214,232 @@ def test_yfinance_normalized_export_is_linked_and_replay_verified(
         )
         with pytest.raises(ValueError, match="replay checksum mismatch"):
             verify_raw_snapshots(store=store, project_root=tmp_path)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("bad_close", [float("nan"), float("inf"), 0.0, -1.0])
+def test_yfinance_rejects_non_eligible_completed_close(
+    monkeypatch,
+    bad_close,
+) -> None:
+    def fake_download(*_args, **_kwargs):
+        return pd.DataFrame(
+            {
+                "Open": [100.0],
+                "High": [101.0],
+                "Low": [99.0],
+                "Close": [bad_close],
+                "Adj Close": [100.0],
+                "Volume": [1000],
+                "Dividends": [0.0],
+                "Stock Splits": [0.0],
+            },
+            index=[pd.Timestamp("2024-01-02")],
+        )
+
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(download=fake_download))
+
+    with pytest.raises(
+        ValueError,
+        match=r"yfinance TEST 2024-01-02 Close must be positive",
+    ):
+        prices.fetch_yfinance("TEST", start="2024-01-01", end="2024-01-03")
+
+
+@pytest.mark.parametrize(
+    ("open_value", "high_value", "low_value", "match"),
+    [
+        (None, 101.0, 99.0, "Open must be positive"),
+        (100.0, 98.0, 99.0, "High is below another OHLC value"),
+        (100.0, 101.0, 101.0, "Low is above another OHLC value"),
+    ],
+)
+def test_yfinance_rejects_invalid_completed_ohlc(
+    monkeypatch,
+    open_value,
+    high_value,
+    low_value,
+    match,
+) -> None:
+    def fake_download(*_args, **_kwargs):
+        return pd.DataFrame(
+            {
+                "Open": [open_value],
+                "High": [high_value],
+                "Low": [low_value],
+                "Close": [100.0],
+                "Adj Close": [100.0],
+                "Volume": [1000],
+                "Dividends": [0.0],
+                "Stock Splits": [0.0],
+            },
+            index=[pd.Timestamp("2024-01-02")],
+        )
+
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(download=fake_download))
+
+    with pytest.raises(ValueError, match=match):
+        prices.fetch_yfinance("TEST", start="2024-01-01", end="2024-01-03")
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value", "match"),
+    [
+        ("Adj Close", None, "Adj Close must be positive"),
+        ("Dividends", None, "Dividends must be non-negative"),
+        ("Dividends", -0.01, "Dividends must be non-negative"),
+        ("Stock Splits", None, "Stock Splits must be non-negative"),
+        ("Stock Splits", -1.0, "Stock Splits must be non-negative"),
+    ],
+)
+def test_yfinance_rejects_incomplete_or_invalid_action_evidence(
+    monkeypatch,
+    field,
+    bad_value,
+    match,
+) -> None:
+    frame = {
+        "Open": [100.0],
+        "High": [101.0],
+        "Low": [99.0],
+        "Close": [100.0],
+        "Adj Close": [100.0],
+        "Volume": [1000],
+        "Dividends": [0.0],
+        "Stock Splits": [0.0],
+    }
+    frame[field] = [bad_value]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "yfinance",
+        SimpleNamespace(
+            download=lambda *_args, **_kwargs: pd.DataFrame(
+                frame,
+                index=[pd.Timestamp("2024-01-02")],
+            )
+        ),
+    )
+
+    with pytest.raises(ValueError, match=match):
+        prices.fetch_yfinance("TEST", start="2024-01-01", end="2024-01-03")
+
+
+def test_yfinance_captures_and_replays_malformed_close_before_rejecting(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    def fake_download(*_args, **_kwargs):
+        return pd.DataFrame(
+            {
+                "Open": [100.0],
+                "High": [101.0],
+                "Low": [99.0],
+                "Close": [float("nan")],
+                "Adj Close": [100.0],
+                "Volume": [1000],
+                "Dividends": [0.0],
+                "Stock Splits": [0.0],
+            },
+            index=[pd.Timestamp("2024-01-02")],
+        )
+
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(download=fake_download))
+    monkeypatch.setattr(
+        prices,
+        "latest_completed_us_equity_session",
+        lambda: date(2024, 1, 5),
+    )
+    store = Store(tmp_path / "data" / "test.duckdb")
+    try:
+        with pytest.raises(ValueError, match="Close must be positive"):
+            prices.fetch_yfinance(
+                "TEST",
+                start="2024-01-01",
+                end="2024-01-03",
+                store=store,
+                ingest_run_id="price-run",
+                project_root=tmp_path,
+            )
+
+        snapshot = store.query(
+            """
+            SELECT parsed_row_count, parsed_rows_sha256, payload_sha256
+            FROM raw_snapshots
+            """
+        )[0]
+        assert snapshot["parsed_row_count"] == 1
+        assert snapshot["parsed_rows_sha256"]
+        payload_record = store.raw_payload_record(snapshot["payload_sha256"])
+        payload = gzip.decompress(
+            (tmp_path / payload_record["relative_path"]).read_bytes()
+        )
+        replayed_rows = prices.parse_yfinance_normalized_export(payload)
+        assert replayed_rows[0]["close"] is None
+        assert verify_raw_snapshots(
+            store=store,
+            project_root=tmp_path,
+        ).replayed_snapshots == 1
+    finally:
+        store.close()
+
+
+def test_yfinance_v2_captures_negative_split_before_rejecting(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    def fake_download(*_args, **_kwargs):
+        return pd.DataFrame(
+            {
+                "Open": [100.0],
+                "High": [101.0],
+                "Low": [99.0],
+                "Close": [100.0],
+                "Adj Close": [100.0],
+                "Volume": [1000],
+                "Dividends": [0.0],
+                "Stock Splits": [-1.0],
+            },
+            index=[pd.Timestamp("2024-01-02")],
+        )
+
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(download=fake_download))
+    monkeypatch.setattr(
+        prices,
+        "latest_completed_us_equity_session",
+        lambda: date(2024, 1, 5),
+    )
+    store = Store(tmp_path / "data" / "test.duckdb")
+    try:
+        with pytest.raises(ValueError, match="Stock Splits must be non-negative"):
+            prices.fetch_yfinance(
+                "TEST",
+                start="2024-01-01",
+                end="2024-01-03",
+                store=store,
+                ingest_run_id="negative-split-run",
+                project_root=tmp_path,
+            )
+
+        snapshot = store.query(
+            """
+            SELECT parser_version, payload_sha256
+            FROM raw_snapshots
+            """
+        )[0]
+        assert snapshot["parser_version"] == "yfinance-normalized-v2"
+        payload_record = store.raw_payload_record(snapshot["payload_sha256"])
+        payload = gzip.decompress(
+            (tmp_path / payload_record["relative_path"]).read_bytes()
+        )
+        assert prices.parse_yfinance_normalized_export(payload)[0]["split_ratio"] == -1.0
+        with pytest.raises(ValueError, match="invalid yfinance split ratio"):
+            prices.parse_yfinance_normalized_export_v1(payload)
+        assert verify_raw_snapshots(
+            store=store,
+            project_root=tmp_path,
+        ).replayed_snapshots == 1
     finally:
         store.close()
 
@@ -538,6 +765,183 @@ def test_pit_fundamentals_follow_issuer_and_ignore_ticker_contamination(tmp_path
         store.close()
 
 
+def test_factor_batch_reads_match_scalar_identity_and_restatement_policy(tmp_path):
+    store = Store(tmp_path / "factor-batch-identity.duckdb")
+    try:
+        _setup_security(store)
+        _install_reference_rows(store)
+        first_filing = _fundamental(
+            100,
+            ticker="OLD",
+            issuer_id=ISSUER_ID,
+            security_id=SECURITY_ID,
+        )
+        restatement = {
+            **first_filing,
+            "as_of_date": "2024-06-01",
+            "value": 110,
+            "quarter_value": 110,
+        }
+        store.upsert_fundamentals([first_filing, restatement])
+        store.upsert_prices(
+            [
+                {
+                    "ticker": "OLD",
+                    "security_id": SECURITY_ID,
+                    "provider_symbol": "NEW",
+                    "date": price_date,
+                    "close": close,
+                    "actions_complete": True,
+                    "close_split_adjusted": False,
+                    "source": "yfinance",
+                }
+                for price_date, close in [
+                    ("2024-06-27", 99.0),
+                    ("2024-06-28", 100.0),
+                ]
+            ]
+        )
+
+        scalar_fundamentals = store.pit_factor_fundamentals(
+            "OLD",
+            "2024-06-30",
+            ["revenue"],
+        )
+        assert store.pit_factor_fundamentals_batch(
+            ["OLD"],
+            "2024-06-30",
+            ["revenue"],
+        ) == {"OLD": scalar_fundamentals}
+        assert scalar_fundamentals[0]["value"] == 110
+
+        scalar_latest = store.latest_price("OLD", "2024-06-30")
+        batch_latest = store.pit_factor_latest_prices_batch(["OLD"], "2024-06-30")["OLD"]
+        assert batch_latest is not None
+        assert scalar_latest is not None
+        assert {key: scalar_latest[key] for key in batch_latest} == batch_latest
+
+        scalar_history = store.pit_factor_price_history(
+            "OLD",
+            "2024-06-30",
+            observations=2,
+        )
+        assert store.pit_factor_price_histories_batch(
+            ["OLD"],
+            "2024-06-30",
+            observations=2,
+        ) == {"OLD": scalar_history}
+    finally:
+        store.close()
+
+
+def test_factor_batch_matches_scalar_same_day_tie_result(tmp_path):
+    store = Store(tmp_path / "factor-batch-same-day-tie.duckdb")
+    try:
+        _setup_security(store)
+        _install_reference_rows(store)
+        store.upsert_fundamentals(
+            [
+                _fundamental(
+                    111,
+                    ticker="OLD",
+                    issuer_id=ISSUER_ID,
+                    security_id=SECURITY_ID,
+                ),
+                _fundamental(
+                    222,
+                    ticker="NEW",
+                    issuer_id=ISSUER_ID,
+                    security_id=SECURITY_ID,
+                ),
+            ]
+        )
+
+        scalar = store.pit_factor_fundamentals(
+            "OLD",
+            "2024-06-30",
+            ["revenue"],
+        )
+        batch = store.pit_factor_fundamentals_batch(
+            ["OLD"],
+            "2024-06-30",
+            ["revenue"],
+        )
+
+        assert batch == {"OLD": scalar}
+    finally:
+        store.close()
+
+
+def test_factor_batch_preserves_ambiguous_security_failure(tmp_path):
+    store = Store(tmp_path / "factor-batch-ambiguous-security.duckdb")
+    try:
+        _setup_security(store)
+        store.execute(
+            """
+            INSERT INTO security_master
+            (security_id, canonical_ticker, identity_status, source)
+            VALUES ('aios:security:other', 'OLD', 'bounded_unverified', 'test')
+            """
+        )
+        store.execute(
+            """
+            INSERT INTO security_identity_assignments
+            (universe_id, ticker, effective_start, effective_end, security_id,
+             known_date, identity_status, source)
+            VALUES
+            ('other', 'OLD', '2024-01-01', '2025-01-01',
+             'aios:security:other', '2023-12-15', 'bounded_unverified', 'test')
+            """
+        )
+
+        with pytest.raises(ValueError, match="ambiguous security identity"):
+            store.pit_factor_fundamentals("OLD", "2024-06-30", ["revenue"])
+        with pytest.raises(ValueError, match="ambiguous security identity"):
+            store.pit_factor_fundamentals_batch(
+                ["OLD"],
+                "2024-06-30",
+                ["revenue"],
+            )
+    finally:
+        store.close()
+
+
+def test_factor_batch_preserves_ambiguous_issuer_failure(tmp_path):
+    store = Store(tmp_path / "factor-batch-ambiguous-issuer.duckdb")
+    try:
+        _setup_security(store)
+        _install_reference_rows(store)
+        store.execute(
+            """
+            INSERT INTO issuer_master
+            (issuer_id, canonical_name, canonical_ticker, source)
+            VALUES ('aios:issuer:other', 'Other Corporation', 'OLD', 'test')
+            """
+        )
+        store.execute(
+            """
+            INSERT INTO security_issuer_assignments
+            (security_id, issuer_id, effective_start, effective_end,
+             verified_date, source)
+            VALUES
+            (?, 'aios:issuer:other', '2024-02-01', '2024-12-01',
+             '2024-02-01', 'test')
+            """,
+            (SECURITY_ID,),
+        )
+
+        with pytest.raises(ValueError, match="ambiguous issuer identity"):
+            store.pit_factor_fundamentals("OLD", "2024-06-30", ["revenue"])
+        with pytest.raises(ValueError, match="ambiguous issuer identity"):
+            store.pit_factor_fundamentals_batch(
+                ["OLD"],
+                "2024-06-30",
+                ["revenue"],
+            )
+    finally:
+        store.close()
+
+
 def test_reviewed_owner_gap_cannot_fall_back_to_legacy_fundamentals(tmp_path):
     store = Store(tmp_path / "reviewed-owner-gap.duckdb")
     try:
@@ -554,6 +958,11 @@ def test_reviewed_owner_gap_cannot_fall_back_to_legacy_fundamentals(tmp_path):
         assert store.pit_fundamentals("OLD", "2024-06-30", ["revenue"]) == []
         assert store.fundamental_history("OLD", "2024-06-30", "revenue") == []
         assert store.pit_factor_fundamentals("OLD", "2024-06-30", ["revenue"]) == []
+        assert store.pit_factor_fundamentals_batch(
+            ["OLD"],
+            "2024-06-30",
+            ["revenue"],
+        ) == {"OLD": []}
         coverage = store.universe_data_coverage("demo", "2024-06-30")[0]
         assert coverage["has_pit_fundamentals"] is False
         assert coverage["latest_fundamental_date"] is None
@@ -640,26 +1049,35 @@ def test_sec_submission_history_file_allows_only_official_shard_names(monkeypatc
 
 def test_tiingo_fetch_uses_header_token_and_preserves_exclusive_end(monkeypatch):
     class FakeHttp:
-        def get_json(self, url, headers=None):
+        def get_bytes(self, url, headers=None):
             assert "token=" not in url
             assert headers == {"Authorization": "Token test-token"}
-            return [
-                {
-                    "date": "2024-01-02T00:00:00.000Z",
-                    "open": 10,
-                    "high": 12,
-                    "low": 9,
-                    "close": 11,
-                    "adjClose": 10.5,
-                    "volume": 1000,
-                    "divCash": 0.25,
-                    "splitFactor": 1,
-                },
-                {
-                    "date": "2024-01-03T00:00:00.000Z",
-                    "close": 12,
-                },
-            ]
+            return json.dumps(
+                [
+                    {
+                        "date": "2024-01-02T00:00:00.000Z",
+                        "open": 10,
+                        "high": 12,
+                        "low": 9,
+                        "close": 11,
+                        "adjClose": 10.5,
+                        "volume": 1000,
+                        "divCash": 0.25,
+                        "splitFactor": 1,
+                        },
+                        {
+                            "date": "2024-01-03T00:00:00.000Z",
+                            "open": 11,
+                            "high": 13,
+                            "low": 10,
+                            "close": 12,
+                            "adjClose": 11.5,
+                            "volume": 1100,
+                            "divCash": 0,
+                            "splitFactor": 1,
+                        },
+                    ]
+                ).encode()
 
     monkeypatch.setattr(prices, "settings", SimpleNamespace(tiingo_api_key="test-token"))
     monkeypatch.setattr(prices, "get_http", lambda: FakeHttp())
@@ -684,6 +1102,12 @@ def test_tiingo_fetch_uses_header_token_and_preserves_exclusive_end(monkeypatch)
         "split_normalization_through": None,
         "source": "tiingo",
     }
+
+
+def test_stooq_symbol_uses_us_suffix_without_corrupting_share_classes():
+    assert prices._stooq_symbol("AAPL") == "aapl.us"
+    assert prices._stooq_symbol("BRK.B") == "brk-b.us"
+    assert prices._stooq_symbol("AAPL.US") == "aapl.us"
 
 
 def test_identity_price_ingest_preserves_transition_and_coverage(monkeypatch, tmp_path):
@@ -736,6 +1160,65 @@ def test_identity_price_ingest_preserves_transition_and_coverage(monkeypatch, tm
         store.close()
 
 
+def test_identity_price_ingest_records_invalid_close_as_failed_without_writes(
+    monkeypatch,
+    tmp_path,
+):
+    store = Store(tmp_path / "invalid-identity-price.duckdb")
+    try:
+        _setup_security(store)
+        _install_reference_rows(store)
+        monkeypatch.setattr(
+            prices,
+            "fetch_provider_prices",
+            lambda *_args, **_kwargs: [
+                {
+                    "ticker": "NEW",
+                    "date": "2024-07-01",
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": None,
+                }
+            ],
+        )
+
+        with pytest.raises(ValueError, match="price close must be positive and finite"):
+            prices.ingest_security_prices(
+                SECURITY_ID,
+                provider="yfinance",
+                start="2024-01-01",
+                end="2025-01-01",
+                store=store,
+            )
+
+        assert store.query("SELECT COUNT(*) AS n FROM prices")[0]["n"] == 0
+        latest = store.ingest_history(1)[0]
+        assert latest["status"] == "failed"
+        assert latest["rows_inserted"] == 0
+        assert "price close must be positive and finite" in latest["error"]
+    finally:
+        store.close()
+
+
+def test_legacy_price_ingest_records_empty_provider_result_as_warning(
+    monkeypatch,
+    tmp_path,
+):
+    store = Store(tmp_path / "empty-price-ingest.duckdb")
+    try:
+        monkeypatch.setattr(prices, "fetch_prices", lambda *_args, **_kwargs: [])
+
+        assert prices.ingest_prices("TEST", store=store) == 0
+
+        latest = store.ingest_history(1)[0]
+        assert latest["status"] == "warning"
+        assert latest["rows_inserted"] == 0
+        assert latest["error"] == "provider returned no usable price rows"
+    finally:
+        store.close()
+
+
 def test_terminal_provider_mapping_cannot_reactivate_legacy_price_rows(tmp_path):
     store = Store(tmp_path / "terminal-provider-mapping.duckdb")
     try:
@@ -750,6 +1233,12 @@ def test_terminal_provider_mapping_cannot_reactivate_legacy_price_rows(tmp_path)
 
         assert store.latest_price("OLD", "2024-06-30") is None
         assert store.pit_factor_price_history("OLD", "2024-06-30", observations=2) == []
+        assert store.pit_factor_latest_prices_batch(["OLD"], "2024-06-30") == {"OLD": None}
+        assert store.pit_factor_price_histories_batch(
+            ["OLD"],
+            "2024-06-30",
+            observations=2,
+        ) == {"OLD": []}
         coverage = store.universe_data_coverage("demo", "2024-06-30")[0]
         assert coverage["has_price_history"] is False
         assert coverage["latest_price_date"] is None

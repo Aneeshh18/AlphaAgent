@@ -5,11 +5,18 @@ from datetime import UTC, datetime
 
 import pytest
 
+from aios.ingest.fred import TREASURY_PARSER_VERSION, parse_treasury_yield_curve_csv
 from aios.operations import (
     create_local_backup,
+    drill_local_backup,
     restore_local_backup,
     verify_local_backup,
 )
+from aios.raw_snapshots import (
+    canonical_request_fingerprint,
+    capture_raw_snapshot,
+)
+from aios.storage.store import Store
 
 
 def test_local_backup_includes_database_and_paper_but_excludes_secrets(tmp_path) -> None:
@@ -221,3 +228,52 @@ def test_restore_merges_raw_snapshots_without_deleting_newer_payloads(tmp_path) 
 
     assert original.read_bytes() == b"old-immutable"
     assert newer.read_bytes() == b"newer-immutable"
+
+
+def test_restore_drill_uses_disposable_project_and_replays_raw_evidence(tmp_path) -> None:
+    project = tmp_path / "project"
+    database = project / "data" / "aios.duckdb"
+    store = Store(database)
+    payload = b"Date,2 Yr,10 Yr,30 Yr\n07/24/2026,4.33,4.69,5.16\n"
+    rows = parse_treasury_yield_curve_csv(payload)
+    try:
+        capture_raw_snapshot(
+            payload,
+            provider="us-treasury",
+            dataset="daily-yield-curve",
+            artifact_kind="exact_response",
+            requested_at=datetime(2026, 7, 25, 1, 0, tzinfo=UTC),
+            received_at=datetime(2026, 7, 25, 1, 0, 1, tzinfo=UTC),
+            request_fingerprint=canonical_request_fingerprint(
+                {"method": "GET", "url": "https://example.test/treasury.csv"}
+            ),
+            adapter_name="test-treasury",
+            adapter_version="1",
+            parser_version=TREASURY_PARSER_VERSION,
+            content_type="text/csv",
+            parsed_rows=rows,
+            store=store,
+            project_root=project,
+        )
+    finally:
+        store.close()
+    source = create_local_backup(
+        project,
+        database,
+        output=project / "backups" / "source-for-drill",
+        application_version="test",
+    )
+    live_hash = database.read_bytes()
+
+    result = drill_local_backup(
+        source.path,
+        application_version="test",
+        scratch_parent=tmp_path,
+    )
+
+    assert result.source == source.path
+    assert result.raw_payloads == 1
+    assert result.replayed_snapshots == 1
+    assert result.hard_failures == 0
+    assert database.read_bytes() == live_hash
+    assert not list(tmp_path.glob("aios-restore-drill-*"))

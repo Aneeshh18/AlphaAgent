@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
@@ -234,9 +235,13 @@ def test_current_us_refresh_uses_latest_recent_reviewed_membership() -> None:
     assert result.ok is True
 
 
-def test_current_us_refresh_cli_keeps_membership_review_boundary(monkeypatch) -> None:
+def test_current_us_refresh_cli_keeps_membership_review_boundary(
+    monkeypatch,
+    tmp_path,
+) -> None:
     captured: dict[str, object] = {}
     recovered: list[str] = []
+    monkeypatch.setattr(cli, "settings", SimpleNamespace(project_root=tmp_path))
 
     def fake_refresh(as_of, **kwargs) -> USRefreshResult:
         captured.update(as_of=as_of, **kwargs)
@@ -271,9 +276,13 @@ def test_current_us_refresh_cli_keeps_membership_review_boundary(monkeypatch) ->
     ]
 
 
-def test_current_us_refresh_cli_records_zero_exit_degradation(monkeypatch) -> None:
+def test_current_us_refresh_cli_records_zero_exit_degradation(
+    monkeypatch,
+    tmp_path,
+) -> None:
     emitted = []
     recovered: list[str] = []
+    monkeypatch.setattr(cli, "settings", SimpleNamespace(project_root=tmp_path))
 
     def fake_refresh(_as_of, **_kwargs) -> USRefreshResult:
         return USRefreshResult(

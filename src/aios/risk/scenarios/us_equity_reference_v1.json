@@ -1,0 +1,477 @@
+{
+  "bundle_id": "us-equity-proposal-reference",
+  "bundle_version": "1.1.0",
+  "currency": "USD",
+  "evidence_policy": {
+    "maximum_revenue_fact_known_age_days": 180,
+    "maximum_price_staleness_days": 7,
+    "minimum_liquidity_observations": 20,
+    "minimum_price_observations": 253
+  },
+  "market": "US",
+  "notice": "Deterministic advisory stress evidence only. Scenario values are source-anchored or explicitly labeled AIOS policy sensitivities; none is a probability, forecast, expected return, trade instruction, or execution gate.",
+  "scenarios": [
+    {
+      "assumptions": {
+        "liquidation_horizon_sessions": 5,
+        "liquidity_adv_multiplier": 0.5,
+        "other_return": 0.0,
+        "selected_return": -0.37,
+        "selector": {
+          "kind": "all"
+        }
+      },
+      "assumption_provenance": {
+        "liquidation_horizon_sessions": "aios_policy_sensitivity",
+        "liquidity_adv_multiplier": "aios_policy_sensitivity",
+        "other_return": "mechanical_unselected_baseline",
+        "recovery_path": "aios_illustrative_assumption_not_used_in_loss_calculation",
+        "selector": "mechanical_scenario_scope",
+        "selected_return": "source_anchored_historical_index_magnitude"
+      },
+      "calibration_sources": [
+        {
+          "basis": "S&P Dow Jones Indices reported a negative 37 percent equity return for 2008. AIOS applies that magnitude uniformly as a transparent sensitivity, not as a forecast or exact historical replay.",
+          "reference": "https://www.spglobal.com/spdji/en/documents/research/research-sp-500-corporate-pensions-and-OPEB-in-2018.pdf",
+          "title": "S&P 500 Corporate Pensions and Other Post-Employment Benefits in 2018"
+        }
+      ],
+      "description": "Apply the reported 2008 broad-equity loss magnitude to every proposed position and halve normal liquidity capacity.",
+      "historical_label": "2008-style calibration",
+      "label": "Broad equity drawdown",
+      "recovery_path": [
+        {
+          "remaining_shock_fraction": 1.0,
+          "session_offset": 0
+        },
+        {
+          "remaining_shock_fraction": 0.5,
+          "session_offset": 252
+        },
+        {
+          "remaining_shock_fraction": 0.0,
+          "session_offset": 756
+        }
+      ],
+      "scenario_id": "broad_drawdown_2008_style",
+      "scenario_type": "fixed_return",
+      "source_posture": "source_anchored_policy_assumption",
+      "version": "1.0.0"
+    },
+    {
+      "assumptions": {
+        "liquidation_horizon_sessions": 10,
+        "liquidity_adv_multiplier": 0.5,
+        "other_return": 0.0,
+        "selected_return": -0.58,
+        "selector": {
+          "kind": "all"
+        }
+      },
+      "assumption_provenance": {
+        "liquidation_horizon_sessions": "aios_policy_sensitivity",
+        "liquidity_adv_multiplier": "aios_policy_sensitivity",
+        "other_return": "mechanical_unselected_baseline",
+        "recovery_path": "aios_illustrative_assumption_not_used_in_loss_calculation",
+        "selector": "mechanical_scenario_scope",
+        "selected_return": "source_anchored_supervisory_equity_magnitude"
+      },
+      "calibration_sources": [
+        {
+          "basis": "The Federal Reserve 2026 supervisory severely adverse scenario specifies an approximately 58 percent equity-price decline and explicitly states that the scenario is hypothetical rather than a forecast.",
+          "reference": "https://www.federalreserve.gov/publications/2026-stress-test-scenarios.htm",
+          "title": "Federal Reserve 2026 Stress Test Scenarios"
+        }
+      ],
+      "description": "Apply the Federal Reserve supervisory severely adverse equity-price magnitude to every proposed position.",
+      "historical_label": null,
+      "label": "Supervisory severe equity decline",
+      "recovery_path": [
+        {
+          "remaining_shock_fraction": 1.0,
+          "session_offset": 0
+        },
+        {
+          "remaining_shock_fraction": 0.5,
+          "session_offset": 504
+        },
+        {
+          "remaining_shock_fraction": 0.0,
+          "session_offset": 756
+        }
+      ],
+      "scenario_id": "supervisory_severe_equity_decline",
+      "scenario_type": "fixed_return",
+      "source_posture": "source_anchored_policy_assumption",
+      "version": "1.1.0"
+    },
+    {
+      "assumptions": {
+        "liquidation_horizon_sessions": 5,
+        "liquidity_adv_multiplier": 0.25,
+        "other_return": 0.0,
+        "selected_return": -0.34,
+        "selector": {
+          "kind": "all"
+        }
+      },
+      "assumption_provenance": {
+        "liquidation_horizon_sessions": "aios_policy_sensitivity",
+        "liquidity_adv_multiplier": "aios_policy_sensitivity",
+        "other_return": "mechanical_unselected_baseline",
+        "recovery_path": "aios_illustrative_assumption_not_used_in_loss_calculation",
+        "selector": "mechanical_scenario_scope",
+        "selected_return": "source_anchored_historical_peak_to_trough_magnitude"
+      },
+      "calibration_sources": [
+        {
+          "basis": "The Federal Reserve reported a 34 percent peak-to-trough equity-price decline in March 2020 and severe market-liquidity strain. The 75 percent ADV haircut is a separate conservative AIOS capacity assumption, not a measured historical statistic.",
+          "reference": "https://www.federalreserve.gov/monetarypolicy/2020-06-mpr-part1.htm",
+          "title": "Federal Reserve Monetary Policy Report, June 2020"
+        },
+        {
+          "basis": "The Federal Reserve documents acute funding and market-functioning stress during the March 2020 dash for cash.",
+          "reference": "https://www.federalreserve.gov/publications/2020-november-financial-stability-report-overview.htm",
+          "title": "Federal Reserve Financial Stability Report, November 2020"
+        }
+      ],
+      "description": "Combine the March 2020 broad-equity drawdown magnitude with an explicit severe reduction in executable liquidity capacity.",
+      "historical_label": "2020-style liquidity calibration",
+      "label": "Liquidity shock",
+      "recovery_path": [
+        {
+          "remaining_shock_fraction": 1.0,
+          "session_offset": 0
+        },
+        {
+          "remaining_shock_fraction": 0.25,
+          "session_offset": 63
+        },
+        {
+          "remaining_shock_fraction": 0.0,
+          "session_offset": 126
+        }
+      ],
+      "scenario_id": "liquidity_shock_2020_style",
+      "scenario_type": "fixed_return",
+      "source_posture": "source_anchored_with_policy_liquidity_haircut",
+      "version": "1.0.0"
+    },
+    {
+      "assumptions": {
+        "liquidation_horizon_sessions": 5,
+        "liquidity_adv_multiplier": 0.6,
+        "other_return": 0.0,
+        "selected_return": -0.18,
+        "selector": {
+          "kind": "all"
+        }
+      },
+      "assumption_provenance": {
+        "liquidation_horizon_sessions": "aios_policy_sensitivity",
+        "liquidity_adv_multiplier": "aios_policy_sensitivity",
+        "other_return": "mechanical_unselected_baseline",
+        "recovery_path": "aios_illustrative_assumption_not_used_in_loss_calculation",
+        "selector": "mechanical_scenario_scope",
+        "selected_return": "source_anchored_historical_index_magnitude"
+      },
+      "calibration_sources": [
+        {
+          "basis": "S&P Dow Jones Indices reported an approximately negative 18 percent S&P 500 total return in 2022 amid high inflation and rapid interest-rate increases. AIOS applies the broad magnitude without claiming identical sector transmission.",
+          "reference": "https://www.spglobal.com/spdji/en/spiva/article/spiva-us-year-end-2022/",
+          "title": "SPIVA U.S. Year-End 2022"
+        }
+      ],
+      "description": "Apply the reported 2022 broad-equity loss magnitude while reducing normal liquidity capacity.",
+      "historical_label": "2022 inflation and rate calibration",
+      "label": "Inflation and rate shock",
+      "recovery_path": [
+        {
+          "remaining_shock_fraction": 1.0,
+          "session_offset": 0
+        },
+        {
+          "remaining_shock_fraction": 0.5,
+          "session_offset": 126
+        },
+        {
+          "remaining_shock_fraction": 0.0,
+          "session_offset": 252
+        }
+      ],
+      "scenario_id": "inflation_rate_shock_2022_style",
+      "scenario_type": "fixed_return",
+      "source_posture": "source_anchored_policy_assumption",
+      "version": "1.0.0"
+    },
+    {
+      "assumptions": {
+        "liquidation_horizon_sessions": 5,
+        "liquidity_adv_multiplier": 0.5,
+        "other_return": -0.1,
+        "selected_return": -0.4,
+        "selector": {
+          "kind": "each_sector"
+        }
+      },
+      "assumption_provenance": {
+        "liquidation_horizon_sessions": "aios_policy_sensitivity",
+        "liquidity_adv_multiplier": "aios_policy_sensitivity",
+        "other_return": "aios_policy_sensitivity",
+        "recovery_path": "aios_illustrative_assumption_not_used_in_loss_calculation",
+        "selector": "mechanical_scenario_scope",
+        "selected_return": "aios_policy_sensitivity"
+      },
+      "calibration_sources": [
+        {
+          "basis": "A round-number deterministic sensitivity used to reveal sector concentration and contribution. It is not a historical estimate or probability.",
+          "reference": "FUTURE_BUILD_PLAN.md#phase-2-deterministic-portfolio-stress-testing",
+          "title": "AIOS deterministic stress roadmap"
+        }
+      ],
+      "description": "Crash each represented sector in turn while applying a smaller concurrent drawdown to the rest of the proposed portfolio.",
+      "historical_label": null,
+      "label": "Sector-specific crash",
+      "recovery_path": [
+        {
+          "remaining_shock_fraction": 1.0,
+          "session_offset": 0
+        },
+        {
+          "remaining_shock_fraction": 0.5,
+          "session_offset": 126
+        },
+        {
+          "remaining_shock_fraction": 0.0,
+          "session_offset": 252
+        }
+      ],
+      "scenario_id": "sector_specific_crash",
+      "scenario_type": "sector_template",
+      "source_posture": "aios_policy_sensitivity",
+      "version": "1.0.0"
+    },
+    {
+      "assumptions": {
+        "constant_correlation_assumption": 0.85,
+        "horizon_sessions": 20,
+        "standard_deviation_multiple": 2.0,
+        "volatility_multiplier": 2.0
+      },
+      "assumption_provenance": {
+        "constant_correlation_assumption": "aios_policy_sensitivity",
+        "horizon_sessions": "aios_policy_sensitivity",
+        "recovery_path": "aios_illustrative_assumption_not_used_in_loss_calculation",
+        "standard_deviation_multiple": "aios_policy_sensitivity",
+        "volatility_multiplier": "aios_policy_sensitivity"
+      },
+      "calibration_sources": [
+        {
+          "basis": "The Federal Reserve uses sharp equity declines and elevated VIX paths in supervisory stress scenarios. AIOS's two-times volatility, constant 0.85 cross-position correlation assumption, two-standard-deviation convention, and 20-session horizon are explicit policy sensitivities rather than sourced forecasts.",
+          "reference": "https://www.federalreserve.gov/publications/2025-stress-test-scenarios.htm",
+          "title": "Federal Reserve 2025 Stress Test Scenarios"
+        }
+      ],
+      "description": "Double each verified annualized volatility, set every cross-position correlation to the explicit 0.85 policy assumption, and report a two-standard-deviation 20-session loss proxy with Euler risk contributions.",
+      "historical_label": null,
+      "label": "Volatility doubling and correlation convergence",
+      "recovery_path": [
+        {
+          "remaining_shock_fraction": 1.0,
+          "session_offset": 0
+        },
+        {
+          "remaining_shock_fraction": 0.5,
+          "session_offset": 63
+        },
+        {
+          "remaining_shock_fraction": 0.0,
+          "session_offset": 126
+        }
+      ],
+      "scenario_id": "volatility_correlation_convergence",
+      "scenario_type": "volatility_correlation",
+      "source_posture": "source_context_with_aios_policy_parameters",
+      "version": "1.0.0"
+    },
+    {
+      "assumptions": {
+        "liquidation_horizon_sessions": 5,
+        "liquidity_adv_multiplier": 0.75,
+        "other_return": 0.0,
+        "selected_return": -0.2,
+        "selector": {
+          "count": 5,
+          "kind": "top_weighted"
+        }
+      },
+      "assumption_provenance": {
+        "liquidation_horizon_sessions": "aios_policy_sensitivity",
+        "liquidity_adv_multiplier": "aios_policy_sensitivity",
+        "other_return": "mechanical_unselected_baseline",
+        "recovery_path": "aios_illustrative_assumption_not_used_in_loss_calculation",
+        "selector": "mechanical_scenario_scope",
+        "selected_return": "aios_policy_sensitivity"
+      },
+      "calibration_sources": [
+        {
+          "basis": "A deterministic concentration sensitivity specified by the AIOS stress roadmap; it is not a forecast.",
+          "reference": "FUTURE_BUILD_PLAN.md#phase-2-deterministic-portfolio-stress-testing",
+          "title": "AIOS deterministic stress roadmap"
+        }
+      ],
+      "description": "Apply a 20 percent loss to the five largest proposed positions.",
+      "historical_label": null,
+      "label": "Top five positions down 20 percent",
+      "recovery_path": [
+        {
+          "remaining_shock_fraction": 1.0,
+          "session_offset": 0
+        },
+        {
+          "remaining_shock_fraction": 0.0,
+          "session_offset": 126
+        }
+      ],
+      "scenario_id": "top_five_down_20",
+      "scenario_type": "fixed_return",
+      "source_posture": "aios_policy_sensitivity",
+      "version": "1.0.0"
+    },
+    {
+      "assumptions": {
+        "liquidation_horizon_sessions": 5,
+        "liquidity_adv_multiplier": 0.6,
+        "other_return": 0.0,
+        "selected_return": -0.3,
+        "selector": {
+          "count": 5,
+          "kind": "top_weighted"
+        }
+      },
+      "assumption_provenance": {
+        "liquidation_horizon_sessions": "aios_policy_sensitivity",
+        "liquidity_adv_multiplier": "aios_policy_sensitivity",
+        "other_return": "mechanical_unselected_baseline",
+        "recovery_path": "aios_illustrative_assumption_not_used_in_loss_calculation",
+        "selector": "mechanical_scenario_scope",
+        "selected_return": "aios_policy_sensitivity"
+      },
+      "calibration_sources": [
+        {
+          "basis": "A deterministic concentration sensitivity specified by the AIOS stress roadmap; it is not a forecast.",
+          "reference": "FUTURE_BUILD_PLAN.md#phase-2-deterministic-portfolio-stress-testing",
+          "title": "AIOS deterministic stress roadmap"
+        }
+      ],
+      "description": "Apply a 30 percent loss to the five largest proposed positions.",
+      "historical_label": null,
+      "label": "Top five positions down 30 percent",
+      "recovery_path": [
+        {
+          "remaining_shock_fraction": 1.0,
+          "session_offset": 0
+        },
+        {
+          "remaining_shock_fraction": 0.0,
+          "session_offset": 189
+        }
+      ],
+      "scenario_id": "top_five_down_30",
+      "scenario_type": "fixed_return",
+      "source_posture": "aios_policy_sensitivity",
+      "version": "1.0.0"
+    },
+    {
+      "assumptions": {
+        "liquidation_horizon_sessions": 5,
+        "liquidity_adv_multiplier": 0.5,
+        "other_return": 0.0,
+        "selected_return": -0.4,
+        "selector": {
+          "count": 5,
+          "kind": "top_weighted"
+        }
+      },
+      "assumption_provenance": {
+        "liquidation_horizon_sessions": "aios_policy_sensitivity",
+        "liquidity_adv_multiplier": "aios_policy_sensitivity",
+        "other_return": "mechanical_unselected_baseline",
+        "recovery_path": "aios_illustrative_assumption_not_used_in_loss_calculation",
+        "selector": "mechanical_scenario_scope",
+        "selected_return": "aios_policy_sensitivity"
+      },
+      "calibration_sources": [
+        {
+          "basis": "A deterministic concentration sensitivity specified by the AIOS stress roadmap; it is not a forecast.",
+          "reference": "FUTURE_BUILD_PLAN.md#phase-2-deterministic-portfolio-stress-testing",
+          "title": "AIOS deterministic stress roadmap"
+        }
+      ],
+      "description": "Apply a 40 percent loss to the five largest proposed positions.",
+      "historical_label": null,
+      "label": "Top five positions down 40 percent",
+      "recovery_path": [
+        {
+          "remaining_shock_fraction": 1.0,
+          "session_offset": 0
+        },
+        {
+          "remaining_shock_fraction": 0.0,
+          "session_offset": 252
+        }
+      ],
+      "scenario_id": "top_five_down_40",
+      "scenario_type": "fixed_return",
+      "source_posture": "aios_policy_sensitivity",
+      "version": "1.0.0"
+    },
+    {
+      "assumptions": {
+        "evidence_kind": "price"
+      },
+      "assumption_provenance": {
+        "evidence_kind": "aios_governance_policy"
+      },
+      "calibration_sources": [
+        {
+          "basis": "The AIOS stress roadmap requires missing-price evidence to block rather than be imputed. This demonstration inspects the configured withholding policy; it does not inject an outage.",
+          "reference": "FUTURE_BUILD_PLAN.md#phase-2-deterministic-portfolio-stress-testing",
+          "title": "AIOS deterministic stress roadmap"
+        }
+      ],
+      "description": "Document the configured no-imputation behavior for missing price evidence. No outage is injected in this demonstration.",
+      "historical_label": null,
+      "label": "Price-evidence withholding policy",
+      "recovery_path": [],
+      "scenario_id": "price_withholding_demonstration",
+      "scenario_type": "evidence_withholding_demonstration",
+      "source_posture": "aios_governance_control",
+      "version": "1.0.0"
+    },
+    {
+      "assumptions": {
+        "evidence_kind": "revenue_fact"
+      },
+      "assumption_provenance": {
+        "evidence_kind": "aios_governance_policy"
+      },
+      "calibration_sources": [
+        {
+          "basis": "The AIOS stress roadmap requires missing point-in-time fundamental evidence to remain explicit rather than be imputed. This demonstration inspects the configured withholding policy; it does not inject an outage or measure filing freshness.",
+          "reference": "FUTURE_BUILD_PLAN.md#phase-2-deterministic-portfolio-stress-testing",
+          "title": "AIOS deterministic stress roadmap"
+        }
+      ],
+      "description": "Document the configured no-imputation behavior for missing point-in-time revenue facts. No outage is injected, and this is not a filing-freshness test.",
+      "historical_label": null,
+      "label": "Revenue-fact withholding policy",
+      "recovery_path": [],
+      "scenario_id": "revenue_fact_withholding_demonstration",
+      "scenario_type": "evidence_withholding_demonstration",
+      "source_posture": "aios_governance_control",
+      "version": "1.0.0"
+    }
+  ],
+  "stress_scenario_bundle_schema_version": 1
+}

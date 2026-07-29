@@ -317,7 +317,12 @@ def require_registered_forward_proposal(
     """Fail before simulation if policy drifted or proposal evidence is unregistered."""
     status = assess_forward_trial(project_root, trial_path, account_path)
     if not status.ready:
-        raise ValueError("forward trial is not unchanged: " + "; ".join(status.issues))
+        raise ValueError(
+            "forward trial is DRIFTED: "
+            + "; ".join(status.issues)
+            + ". Run `aios forward-status`; after a later reviewed decision close, "
+            "start `aios forward-restart --confirm-restart`"
+        )
     proposal = read_paper_document(proposal_path, expected_kind=PROPOSAL_DOCUMENT_KIND)
     trial = read_forward_trial(trial_path)
     if not any(

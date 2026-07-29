@@ -180,35 +180,42 @@ def verify_raw_snapshots(
         stored_total += len(compressed)
 
     replayed = 0
-    normalized = db.query(
+    snapshots = db.query(
         """
         SELECT snapshot_id, provider, dataset, artifact_kind, payload_sha256,
                parser_version, parsed_row_count, parsed_rows_sha256
         FROM raw_snapshots
-        WHERE artifact_kind = 'normalized_provider_export'
         ORDER BY snapshot_id
         """
     )
-    for snapshot in normalized:
+    for snapshot in snapshots:
         payload = payload_bytes.get(str(snapshot["payload_sha256"]))
         if payload is None:
             raise ValueError(
-                f"normalized snapshot payload is unregistered: {snapshot['snapshot_id']}"
+                f"snapshot payload is unregistered: {snapshot['snapshot_id']}"
             )
-        parsed_rows = _replay_normalized_snapshot(snapshot, payload)
+        parsed_rows = _replay_snapshot(snapshot, payload)
+        if parsed_rows is None:
+            if snapshot["artifact_kind"] == "normalized_provider_export":
+                raise ValueError(
+                    "normalized snapshot has no reviewed replay parser: "
+                    f"{snapshot['provider']}/{snapshot['dataset']}/"
+                    f"{snapshot['parser_version']}"
+                )
+            continue
         expected_count = snapshot.get("parsed_row_count")
         expected_hash = snapshot.get("parsed_rows_sha256")
         if expected_count is None or expected_hash is None:
             raise ValueError(
-                f"normalized snapshot lacks parsed evidence: {snapshot['snapshot_id']}"
+                f"snapshot lacks parsed evidence: {snapshot['snapshot_id']}"
             )
         if len(parsed_rows) != int(expected_count):
             raise ValueError(
-                f"normalized snapshot replay row count mismatch: {snapshot['snapshot_id']}"
+                f"snapshot replay row count mismatch: {snapshot['snapshot_id']}"
             )
         if canonical_parsed_rows_sha256(parsed_rows) != expected_hash:
             raise ValueError(
-                f"normalized snapshot replay checksum mismatch: {snapshot['snapshot_id']}"
+                f"snapshot replay checksum mismatch: {snapshot['snapshot_id']}"
             )
         replayed += 1
 
@@ -230,6 +237,26 @@ def canonical_request_fingerprint(request: dict[str, Any]) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def attach_parsed_rows_evidence(
+    *,
+    store: Store,
+    ingest_run_id: str,
+    role: str,
+    capture_parser_version: str,
+    parser_version: str,
+    parsed_rows: list[dict[str, Any]],
+) -> str:
+    """Bind one successful canonical parse to its exact linked response."""
+    return store.attach_raw_snapshot_parse_evidence(
+        ingest_run_id=ingest_run_id,
+        role=role,
+        expected_parser_version=capture_parser_version,
+        parser_version=parser_version,
+        parsed_row_count=len(parsed_rows),
+        parsed_rows_sha256=canonical_parsed_rows_sha256(parsed_rows),
+    )
 
 
 def _write_once(target: Path, compressed: bytes, expected_hash: str) -> None:
@@ -270,23 +297,52 @@ def canonical_parsed_rows_sha256(rows: list[dict[str, Any]]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _replay_normalized_snapshot(
+def _replay_snapshot(
     snapshot: dict[str, Any],
     payload: bytes,
-) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]] | None:
     key = (
         snapshot["provider"],
         snapshot["dataset"],
         snapshot["parser_version"],
     )
     if key == ("yfinance", "daily-prices", "yfinance-normalized-v1"):
+        from aios.ingest.prices import parse_yfinance_normalized_export_v1
+
+        return parse_yfinance_normalized_export_v1(payload)
+    if key == ("yfinance", "daily-prices", "yfinance-normalized-v2"):
         from aios.ingest.prices import parse_yfinance_normalized_export
 
         return parse_yfinance_normalized_export(payload)
-    raise ValueError(
-        "normalized snapshot has no reviewed replay parser: "
-        f"{snapshot['provider']}/{snapshot['dataset']}/{snapshot['parser_version']}"
-    )
+    if key == ("fred", "series-vintages", "fred-normalized-v1"):
+        from aios.ingest.fred import parse_fred_normalized_export
+
+        return parse_fred_normalized_export(payload)
+    if key == ("us-treasury", "daily-yield-curve", "treasury-yield-csv-v2"):
+        from aios.ingest.fred import parse_treasury_yield_curve_csv
+
+        return parse_treasury_yield_curve_csv(payload)
+    if key == ("stooq", "daily-prices", "stooq-daily-csv-v1"):
+        from aios.ingest.prices import parse_stooq_daily_csv
+
+        return parse_stooq_daily_csv(payload)
+    if key == ("tiingo", "daily-prices", "tiingo-eod-json-v1"):
+        from aios.ingest.prices import parse_tiingo_eod_response
+
+        return parse_tiingo_eod_response(payload)
+    if key == ("sec-edgar", "company-tickers", "sec-company-tickers-v2"):
+        from aios.ingest.edgar import parse_sec_company_tickers_response
+
+        return parse_sec_company_tickers_response(payload)
+    if key == ("sec-edgar", "companyfacts", "sec-companyfacts-v2"):
+        from aios.ingest.edgar import parse_sec_companyfacts_response
+
+        return parse_sec_companyfacts_response(payload)
+    if key == ("sec-edgar", "submissions", "sec-submissions-v2"):
+        from aios.ingest.edgar import parse_sec_submissions_response
+
+        return parse_sec_submissions_response(payload)
+    return None
 
 
 def _json_default(value: Any) -> str:

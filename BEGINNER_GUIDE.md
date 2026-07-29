@@ -169,10 +169,11 @@ cp .env.example .env
 ```
 
 Open `.env` and set a real SEC User-Agent email. Add a FRED API key if macro
-data is wanted. The no-key Treasury adapter is a fallback, but its automated
-CSV endpoint currently returns HTTP 403 in this environment, so FRED is the
-reliable active source for yield history. `TIINGO_API_KEY` is optional; leave it
-empty unless you have your own Tiingo token and explicitly review that provider.
+data is wanted. The no-key official Treasury adapter is an independently
+working fallback/cross-check for 2-, 10-, and 30-year yields. It uses a
+year-bounded CSV, keeps the exact response, and refuses malformed data.
+`TIINGO_API_KEY` is optional; leave it empty unless you have your own Tiingo
+token and explicitly review that provider.
 
 Check the installation:
 
@@ -731,14 +732,22 @@ Open the dashboard:
 ```
 
 For ordinary use, you do not need to open DuckDB or run Streamlit yourself.
-These are the four main checks:
+These are the five main checks:
 
 ```bash
 .venv/bin/aios doctor
 .venv/bin/aios validate
 .venv/bin/aios readiness --report-only
-.venv/bin/aios health
+.venv/bin/aios health --report-only
+.venv/bin/aios preflight
 ```
+
+The first four answer whether the installation and research evidence are
+healthy. `preflight` combines the usable scopes into one read-only operator
+answer and prints exactly one safest next action. It keeps supervised research,
+proposal creation, stress review, paper recording, unattended operations, and
+real-capital execution separate, so one green scope cannot hide another blocked
+scope.
 
 Create a timestamped backup of the database and local paper state:
 
@@ -753,6 +762,18 @@ new folder path. Verify that folder later with:
 ```bash
 .venv/bin/aios verify-backup backups/aios-YYYYMMDDTHHMMSSZ
 ```
+
+You can safely prove that a backup is actually recoverable without touching
+your live system:
+
+```bash
+.venv/bin/aios restore-drill backups/aios-YYYYMMDDTHHMMSSZ
+```
+
+The drill restores into a temporary project, opens and validates the recovered
+database, verifies every raw file, replays every supported provider artifact,
+and deletes the temporary copy. It does not replace the live database, paper
+account, incident history, or raw archive.
 
 The dashboard may remain open for normal backups because it now releases its
 short read-only database connection after each cached load. Close it before a
@@ -776,8 +797,10 @@ Refresh current U.S. data with:
 ```
 
 The dashboard can remain open. Its reads are short-lived, and an interactive
-command waits briefly if one happens to overlap. Scheduled jobs wait up to five
-minutes. The daily command first updates SPY, then checks the official
+command waits briefly if one happens to overlap. Daily, filing, backup, and
+scheduled health jobs first share one 30-minute queue, so two startup catch-up
+writers cannot race; DuckDB then waits up to five minutes for a brief dashboard
+read. The daily command first updates SPY, then checks the official
 announcement archive and independent current component list, then extends an
 unchanged dated universe, updates all reviewed member prices and macro releases,
 and finally proves that every broad readiness gate reaches the same U.S. close.
@@ -817,6 +840,13 @@ U.S. winter time—so Friday's U.S. close is not missed. Filings run Saturday at
 # Test and inspect local failure history
 .venv/bin/aios alert-test
 .venv/bin/aios alerts --unresolved
+
+# Inspect and test durable alert messages
+.venv/bin/aios notifications
+.venv/bin/aios notification-test
+
+# Email is optional and remains off during scheduler installation
+.venv/bin/aios email-status
 ```
 
 Installation is deliberately explicit and idempotent: rerunning
@@ -828,9 +858,10 @@ idempotent check runs three minutes after the user scheduler starts. A durable
 job record lets the dashboard distinguish running, completed, failed, and
 interrupted workflows.
 The dashboard releases DuckDB between cached reads. If a short read overlaps a
-scheduled write, the scheduled service waits for up to five minutes instead of
-failing immediately. A genuine long-running conflict still fails safely; the
-status command shows whether the last service passed and when it runs next.
+scheduled write, the scheduled service waits instead of failing immediately.
+The shared queue also covers weekly filings and backups. A genuine conflict
+lasting beyond the bounded queue still fails visibly; the status command shows
+whether the last service passed and when it runs next.
 
 The status check will not wait forever if Linux's desktop scheduler interface
 is temporarily unavailable. After five seconds it shows which managed timer
@@ -851,8 +882,48 @@ its history. To inspect one entry or mark it reviewed:
 .venv/bin/aios alert-resolve INCIDENT_REF
 ```
 
-`alert-test` opens and resolves a harmless test entry. It does not send email,
-Slack, or a mobile notification. External delivery is still a separate step.
+`alert-test` opens and resolves a harmless incident. It never creates an alert
+message. `notification-test` separately proves the complete local message
+lifecycle without using the internet. It creates one harmless audit row marked
+**Sent**, but that means sent to the built-in local test receiver—not email,
+Slack, a phone, or a broker.
+
+The notification screen uses five plain-language states:
+
+- **Held locally:** safely saved while external delivery is switched off.
+- **Waiting to retry:** eligible for a configured sender after a temporary
+  failure.
+- **Sending now:** leased briefly to one sender so two workers cannot claim it.
+- **Sent:** the configured receiver confirmed completion.
+- **Needs review:** five pre-send temporary attempts were exhausted, the
+  failure is permanent, or the provider may have accepted a message before the
+  connection broke. Uncertain outcomes are not retried automatically because
+  that could send a duplicate.
+
+Old incidents are intentionally not turned into new messages during an upgrade,
+so enabling email cannot suddenly send historical failures. Email also has its
+own optional timer: the three data/backup timers do not activate it.
+
+To use email, first add the `SMTP_*` / `ALERT_EMAIL_*` settings shown in
+`.env.example` to your private `.env`. Use an app-specific password or SMTP
+token, never a normal mailbox password, and never paste the password into chat
+or commit it. Then follow this order:
+
+```bash
+.venv/bin/aios email-status
+.venv/bin/aios email-test --confirm-send
+# Check that the test actually arrived in the intended mailbox.
+.venv/bin/aios email-enable --confirm-enable
+
+# At any time:
+.venv/bin/aios email-disable --confirm-disable
+```
+
+The test sends exactly one message and does not enable future alerts. Enabling
+requires a successful test for the same host, account, sender, and recipient.
+Changing those fields later makes delivery fail closed until the new route is
+tested and explicitly enabled. Existing held messages remain local forever;
+only incident changes created under the new activation can be sent.
 
 If today's index membership has not been certified yet, the refresh may collect
 data for the newest reviewed member list up to seven days old. The dashboard
@@ -874,27 +945,57 @@ stays visible as “company filings pending” and is tried again each week. If 
 company that previously had valid filings suddenly returns nothing, the refresh
 still stops and asks for investigation.
 
-The dashboard opens on an **Investment Research Control Room**, anchored to the
-latest broadly covered reviewed market date rather than blindly using today.
-It shows operating readiness, universe and filing coverage, the current paper
-proposal, simulated account, source clocks, and every operating gate before you
-open deeper analysis. **Research Explorer** provides an opportunity map, full
-ranked universe, and a separate missing-evidence queue. **Company Lens** traces
-one symbol into its quality, value, trend, stability, financial, and valuation
-evidence. Choose **Quality + Value (baseline)** or the experimental **Quality +
-Value + Trend + Stability** method. Every view states clearly that a high rank
-is a research shortlist rather than a buy instruction. Reviewed company names
-are shown beside their market symbols. **System Control** shows the scheduler,
-recent ingests, source dates, reviewed coverage, latest checksum-verified backup,
-forward-policy state, durable local incident history, and next human review.
-External notifications remain a future transport milestone.
-The first four-factor load can take longer because it rebuilds dated evidence
-for about 500 companies. The decision cache is then discarded, so a later data
-refresh cannot leave an old filing or price window hidden in memory.
+The dashboard opens on **Overview**, anchored to the latest broadly covered
+reviewed market date rather than blindly using the computer date. The
+Investment Command Center answers whether **Research** is usable, where the
+**Paper Trial** stands, and whether **Operations** needs attention. Ready
+research cannot hide a failed scheduled workflow or critical incident. One
+**Priority Action** identifies the highest-priority safe next screen. Research
+readiness, paper progress, proposal targets, and current incidents stay visible;
+only raw commands, hashes, complete gate history, and other technical evidence
+use disclosure controls.
+
+**Research** keeps the date, scoring model, and company search visible in the
+page toolbar. It opens on the ranked list and uses one visible switch for the
+ranked list, opportunity map, or missing-data coverage; only the selected
+surface renders. The page, date, model, research surface, selected company, and
+search are stored in the browser URL, so the exact screen can be shared when
+reporting a problem. **Company Detail** is opened from a Research row instead
+of occupying global navigation. It starts with four headline measures, then
+keeps business, valuation, market context, and missing evidence visible.
+**Operations & System Health** puts active incidents first, then automation,
+the data pipeline, safeguards, and alert delivery. **Methodology & Sources**
+holds the plain-language model explanation, evidence-source boundaries, and
+technical audit detail.
+
+The dashboard uses a warm ivory canvas, white evidence surfaces, a light
+navigation rail, near-black primary actions, and a restrained clay identity
+accent. Green, amber, and red are reserved for ready, review, and blocked
+states. Normal text is at least 14px, body copy is 16–17px, and controls are at
+least 44px high. Paper Trial always shows Proposal, Forward Trial, Timing
+Review, and Local Record as separate stages. Desktop grids stay aligned, while
+phone-width views collapse the sidebar and stack without horizontal page
+scrolling.
+
+The first Research score calculation now reads the 503-company evidence in
+identity-safe batches. On the certified July 27 snapshot, a fresh baseline QV
+calculation took about 2.9 seconds instead of 25.5 seconds; the experimental
+four-factor calculation took about 3.4 seconds instead of 28.5 seconds. Both
+matched the older scalar calculation exactly. The batch facade and decision
+cache are discarded after the calculation, so a later data refresh cannot
+leave an old filing or price window hidden in memory. If a batch read is
+invalid or unavailable, AIOS falls back to the slower fail-closed scalar path.
 
 ### Is it ready to use?
 
-It is ready **today for supervised U.S. research and local paper simulation**.
+It is ready **today for supervised U.S. research, governed proposal stress
+review, and the local paper workflow**. The active forward-policy baseline is
+unchanged and its one saved proposal is separate from holdings. You can stress
+that proposal now without changing the account: open **Paper Trial** to see the
+Proposal Downside Review under the targets, or run the CLI command below. The
+separate `paper-review` command decides whether its simulation timing window is
+currently valid; if the window expired, create a new prospective proposal
+instead of inventing an old fill.
 You can explore rankings, inspect factor evidence, create a reviewed model
 portfolio proposal, and monitor simulated holdings. It cannot place a broker
 order and it cannot decide what you personally should buy or sell.
@@ -905,11 +1006,27 @@ There is now a separate current-use check:
 .venv/bin/aios readiness --report-only
 ```
 
-On 2026-07-24 the latest reviewed decision close is 2026-07-23. The current
-snapshot has 503 S&P 500 members, stable identities for all 503, PIT filings for
-500, action-safe prices for all 503, and SPY through the same close. The latest
-required macro release is dated 2026-07-23. The readiness command passes this
-supervised paper-use boundary while still showing warnings and source dates.
+With no `--as-of`, this chooses the newest reviewed U.S. decision-date
+candidate from the database instead of treating today's computer date as a
+market close. For one consolidated operator decision, run:
+
+```bash
+# Fast timing and capability view
+.venv/bin/aios preflight
+
+# Full governed paper review; still does not record the simulation
+.venv/bin/aios preflight --review-paper
+
+# Machine gate: non-zero exit unless both scopes are usable
+.venv/bin/aios preflight --json --require research --require stress_review
+```
+
+At the 2026-07-29 live read-only checkpoint the latest reviewed decision close
+is 2026-07-28. The current snapshot has 503 S&P 500 members, stable identities for
+all 503, PIT filings for 500, action-safe prices for all 503, and SPY through
+the same close. The latest required macro release is dated 2026-07-28.
+Validation has zero hard failures and three visible warnings, and readiness is
+`READY`.
 
 The risk gate checks position and broad business-group concentration, leverage,
 turnover, trading liquidity, and account drawdown. It is connected to a local,
@@ -926,7 +1043,15 @@ The normal paper-simulation sequence is:
 .venv/bin/aios paper-propose
 .venv/bin/aios paper-status
 
-# Only after the scheduled closing prices are reviewed
+# Review "what if" losses and constraints without changing or storing anything
+.venv/bin/aios stress-review \
+  --proposal data/paper/proposals/us-qv-2026-07-27.json
+
+# After the scheduled close and provider finalization, check without changing money
+.venv/bin/aios paper-review \
+  --proposal data/paper/proposals/us-qv-2026-07-27.json
+
+# Only when paper-review says it is ready
 .venv/bin/aios paper-execute \
   --proposal data/paper/proposals/us-qv-YYYY-MM-DD.json \
   --confirm-simulated
@@ -934,6 +1059,34 @@ The normal paper-simulation sequence is:
 # Add later reviewed daily values without changing the portfolio
 .venv/bin/aios paper-mark
 ```
+
+A proposal must be created before its scheduled U.S. session opens, so an
+operator cannot watch that day's market move before choosing whether to count
+it. It can be recorded only after that session closes and before the next U.S.
+session opens. If the window expires, the system refuses a made-up historical
+fill and asks for a new prospective proposal. `paper-review` is safe to run
+repeatedly: it does not change the account, send a broker order, or count a
+performance observation.
+
+`stress-review` is also safe to repeat. It first proves that the proposal belongs
+to the unchanged forward trial, then reads the evidence database without writing
+to it. The CLI and Paper Trial panel use the same governed service and recheck
+the trial, account, proposal, and source identities before showing a result.
+Each target is tied to its exact point-in-time security identity, action-safe
+price history, row-level liquidity window, and release-aware revenue fact. If
+one dependency is missing or changed, AIOS withholds the affected number and
+labels the review partial or withheld instead of guessing.
+
+Fixed mark-shock results are kept separate from the statistical
+volatility/correlation loss proxy. The latter does **not** pretend to know future
+holdings, drawdown, concentration, or liquidation. One fixed scenario uses the
+[approximately 58% equity-price decline in the Federal Reserve's hypothetical
+2026 severely adverse scenario](https://www.federalreserve.gov/publications/2026-stress-test-scenarios.htm)
+as a transparent calibration; it is not a forecast. All displayed limits are
+generic advisory references, not permission to trade, and the review cannot
+approve, reject, or execute the proposal. Add `--json` for machine-readable
+output. Add `--output PATH` only when you deliberately want one immutable report
+file; no report file is created by default.
 
 The untouched forward test has a separate policy lock:
 
@@ -957,18 +1110,24 @@ change is reviewed and a new trial is deliberately started. New prices,
 filings, macro releases, and reviewed membership are expected to keep updating
 and therefore are not frozen.
 
-The account is still simulated cash. Its 2026-07-20 proposal was never executed,
-and later correctness changes made that old forward lock drift. The guarded
-restart archived it unchanged under `data/paper/forward_trials/` and activated
-trial `us-qv-forward-8559d86b6a02` from the 2026-07-23 close. Its one registered
-proposal is not a holding and has not been executed.
+The account is still $100,000 of simulated cash with zero holdings, zero
+executions, and no broker connection. Predecessor
+`us-qv-forward-8559d86b6a02` is archived unchanged. Active trial
+`us-qv-forward-72c4560a442d` began prospectively from the 2026-07-27 close and
+has one approved simulation-only proposal for the 2026-07-28 session. Do not
+restart this unchanged trial or treat the proposal as an investment.
+
+The next naturally triggered guarded daily run remains operational evidence to
+observe. Installed units, earlier controlled runs, and historical scheduler
+proof do not by themselves prove that current runtime event.
 
 The historical U.S. technical gate is complete. The current refresh,
 evidence-backed no-change membership review, scheduler, backup/recovery, local
 dashboard smoke, and untouched-policy gate are complete in code, and the full
 six-period rerun now passes. The recoverable daily workflow and prospective
-replacement freeze are live-proven; the remaining local technical-beta step is
-observation of naturally triggered daily, filing, and backup cycles.
+replacement freeze are live-proven. A July 25 startup collision exposed and
+then live-proved the permanent serialized scheduler fix; continued untouched
+daily, filing, backup, and forward-trial observation remains necessary.
 A real-capital pilot is a different gate and needs at least 8–12 weeks of
 untouched forward observation plus broker/data reconciliation, alerts, and your
 tax/risk assumptions. That elapsed evidence period cannot be sped up.
@@ -987,25 +1146,57 @@ Run tests:
 PYTHONPATH=src .venv/bin/pytest -q
 ```
 
+The current regression baseline is 494 passing tests; Ruff, bytecode
+compilation, and the whitespace diff check are clean.
+
 `audit` shows whether a recent ingest succeeded, how many rows it wrote, and
 the error text when it failed. Older data was loaded before this audit trail
 was added, so it is normal for the first audit view to be empty.
 
-`validate` is a read-only pre-flight check. It reports hard failures, such as
-missing PIT dates, closing prices, or unversioned macro rows, separately from
+`validate`, `readiness`, `health --report-only`, and `preflight` are read-only.
+The default strict `health` command may record or resolve local operating
+incidents in the separate SQLite ledger. Use `preflight` for one use-specific
+snapshot of research, proposal creation, stress review, paper recording,
+operations, and real-capital boundaries plus exactly one safe next action. If a
+readiness gate is blocked, health calls the examined date a candidate rather
+than incorrectly calling it certified. `validate` reports hard failures, such
+as missing PIT dates, closing prices, or unversioned macro rows, separately from
 warnings such as historical ingest failures that need inspection. A macro
 vintage failure is a deliberate stop: do not backtest until it is repaired.
+The `alerts`, `alert-show`, `notifications`, `notification-show`, and
+`email-status` inspection commands also preserve the existing operations
+ledger byte-for-byte. They refuse an uncheckpointed or outdated ledger rather
+than silently initializing or migrating it.
+
+Every supported CLI command that changes backup-covered DuckDB, raw-snapshot,
+paper, proposal, or forward-trial state acquires one non-blocking project
+maintenance lease. That includes refresh, ingest, import, repair, and cleanup
+commands as well as backup, restore, paper, and forward workflows. If another
+supported mutation is running, the second command stops visibly instead of
+racing it. Generated reports and review files cannot be aimed at governed
+state; ordinary single-file outputs are atomic and write-once, while mutable
+factor warm-up workspaces reject symlink and hard-link aliases. The lease and
+path policy are cooperative: direct Python imports and unrelated external
+processes do not participate. The active forward trial is therefore
+left unchanged, and deeper final compare-and-set hardening belongs in the next
+intentional paper/forward policy version rather than a mid-trial retrofit.
 
 ## Data-source roles
 
 - SEC EDGAR: primary fundamentals and filing dates.
-- yfinance: primary daily prices.
+- yfinance: primary daily prices. New captures use the replayable v2 normalized
+  format. A malformed completed-session candle is kept as raw evidence but is
+  rejected before storage; the database layer also prevents an invalid close
+  from replacing a valid one. Older v1 captures remain replayable.
 - Tiingo: optional explicit EOD provider when `TIINGO_API_KEY` is configured;
   the token is sent in a header, never in the URL.
-- Stooq: price fallback when yfinance returns no data.
+- Stooq: optional price fallback. It currently returns a JavaScript verification
+  page in this environment. During an ingest, the capture-before-parse path
+  retains that failed evidence and never accepts it as prices.
 - FRED: macro series when `FRED_API_KEY` is configured.
-- US Treasury CSV: intended no-key yield-curve fallback/cross-check; currently
-  blocked by HTTP 403 for automated requests in this environment.
+- US Treasury CSV: live no-key DGS2/DGS10/DGS30 fallback and cross-check using
+  the official current-year download. A difference from FRED above five basis
+  points is shown as a quality warning.
 
 All HTTP calls share rate limiting and retry behavior in
 `src/aios/ingest/http_client.py`. Do not add direct unthrottled downloads.
@@ -1017,7 +1208,10 @@ corrections; a first-time ticker download still requests its full history.
 The foundation, QV/QVML factors, release-aware macro layer, reviewed membership
 and identities, action-safe current prices, costs, persistent holdings, FIFO
 tax lots, daily account values, benchmark comparison, risk gates, paper monitor,
-and current U.S. readiness path are working through the 2026-07-23 close.
+and current U.S. readiness path are working through the 2026-07-28 close.
+Proposal Stress Review v1 is implemented for pending proposal targets. A
+separate stress workflow for current simulated holdings, multifactor or Monte
+Carlo risk models, and owner-authored scenario policies remains future work.
 
 The 2025-to-current stateful historical rerun is complete: six of six periods,
 327 date-aligned strategy and SPY observations, exact quarter-to-quarter state
@@ -1028,9 +1222,10 @@ extensions that do not make them index members again. Regime-aware QV returned
 software checks over a short historical period, not forecasts or proof that the
 strategy will beat the market.
 
-What remains is elapsed operational evidence: observe the active prospective
-forward test and naturally triggered daily/health/filing/backup cycles without
-retuning it. Older
+What remains is elapsed operational evidence: review the existing proposal
+after the July 28 close/provider finalization and before the next U.S. open,
+then observe the active trial and naturally triggered
+daily/health/filing/backup cycles without retuning them. Older
 announcement provenance before August 2023 remains a separate long-history
 expansion.
 
@@ -1044,13 +1239,26 @@ source.
 The ordered roadmap is in [`FUTURE_BUILD_PLAN.md`](./FUTURE_BUILD_PLAN.md). The
 local incident ledger and systemd failure capture are implemented. Immutable
 downloads are now live for reviewed SEC Company Facts and Submissions: the
-first controlled AAPL run retained and verified two exact payloads and linked
-both to its ingest record. Treasury capture is wired but not live-proven. FRED,
-yfinance, parsed replay evidence, and the remaining transports still need their
-honest adapter-specific capture paths. A retry-safe notification outbox and one
-external delivery channel come after that gate. Stress testing, anomaly review
-cases, experiment registration, and the India schema foundation follow in that
-dependency order.
+replay-aware AAPL run retained two exact payloads, linked both to its ingest,
+and reproduced 4,102 Company Facts rows plus one Submissions metadata row.
+yfinance now has an honest normalized-export path:
+it stores the library-returned rows, links them to the ingest, hashes the parsed
+prices, and replays them during verification. FRED has the equivalent
+normalized-vintage path. After the July 24 full-universe recovery and July 25
+provider proof, verification passes for 2,612 unique payloads and 2,111 parsed
+replays. The latest verified backup is
+`backups/aios-20260728T082412Z`: 2,622 files, 380,408,599 bytes, manifest
+SHA-256
+`cd4ce6e3c8256013483eee438b3167cf8ef12815b7ffbb04e03b3e4ea629d25b`.
+It passed a disposable restore drill through the real recovery path. Stooq remains
+explicitly unavailable instead of silently falling back through an HTML page;
+future market adapters must add the same evidence contract. The retry-safe
+notification outbox, no-network local proof, and selected SMTP adapter are
+implemented; private SMTP configuration plus one owner-confirmed mailbox receipt
+are the remaining transport activation steps.
+Proposal Stress Review v1 is implemented. Anomaly review cases, experiment
+registration, and the India schema foundation follow; the broader holdings and
+advanced-risk extensions remain governed future work.
 
 The India sequence is in [`INDIA_BUILD_PLAN.md`](./INDIA_BUILD_PLAN.md). It
 starts with a bounded Nifty 50 research beta and explains the official NSE,
