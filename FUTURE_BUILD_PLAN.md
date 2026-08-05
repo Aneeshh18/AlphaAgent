@@ -9,6 +9,10 @@ be represented as complete.
 and acceptance. A feature is complete only when its exit gate passes; a screen
 or schema alone is not completion.
 
+[`PRODUCT_COMPLETION_GATES.md`](./PRODUCT_COMPLETION_GATES.md) defines the
+mode-specific claim boundary for supervised research, recurring paper,
+unattended local operations, hosted multi-user access, and controlled capital.
+
 ## Current baseline
 
 AIOS currently supports supervised U.S. research, a fail-closed readiness gate,
@@ -17,24 +21,47 @@ backtest, checksum-verified backups, a recoverable benchmark-first exact-date
 daily workflow, installed local scheduler timers, and a durable independent
 local incident/job ledger with systemd failure/recovery capture.
 The channel-neutral notification outbox, local no-network delivery proof,
-selected fail-closed SMTP adapter, and governed proposal stress-review v1 are
-implemented. SMTP activation is deferred at the user's request; when resumed it
-still requires private configuration and an owner-confirmed receipt test. AIOS
-does not otherwise send external alerts, preserve every original provider
-response, ingest Indian-market data, connect to a broker, or make personal
-buy/sell decisions.
+selected fail-closed SMTP adapter, governed proposal stress-review v1, and the
+first governed anomaly-review rule are implemented. The anomaly v1 slice
+compares accepted SEC fundamentals coverage with exact reviewed membership and
+source evidence, then writes only deduplicated cases to the independent
+operations ledger when explicitly recorded. SMTP activation is deferred at the
+user's request; when resumed it still requires private configuration and an
+owner-confirmed receipt test. AIOS does not otherwise send external alerts,
+preserve every original provider response, ingest Indian-market data, connect
+to a broker, or make personal buy/sell decisions.
 
 The live 2026-07-27 operations migration to schema v4 preserved every existing
-incident/message record and passed SQLite integrity and foreign-key checks. The
-optional SMTP timer files are installed and native-verified but remain disabled;
-the three core data/backup timers remain enabled.
+incident/message record and passed SQLite integrity and foreign-key checks.
+The additive schema-v6 migration is now complete: it retained that contract and
+currently holds two immutable anomaly scans, three deduplicated cases, and six
+append-only case events. The optional SMTP timer files are installed and
+native-verified but remain disabled; the three core data/backup timers remain
+enabled.
 
-The 2026-07-29 live read-only research baseline reaches the 2026-07-28 decision
+The 2026-07-30 live read-only research baseline reaches the 2026-07-30 decision
 close: readiness is `READY`, validation has zero failures and three warnings,
 and coverage is 503 members, 500/503 PIT filings, and 503/503 reviewed prices.
-Raw verification passes for 2,612 payloads and 2,111 parsed replays. The
-494-test suite, Ruff, bytecode compilation, and diff check pass. Backup
-`backups/aios-20260728T082412Z` passed its non-destructive restore drill.
+Raw verification passes for 4,252 payloads and 4,424 parsed replays. Backup
+`backups/aios-20260730T092832Z` verifies 4,262 files and passed the production
+non-destructive restore drill with zero hard validation failures. The isolated
+release checkpoint passed the full suite, repository-wide Ruff, bytecode
+compilation, reproducible wheel builds, exact source-to-wheel verification, and
+clean-install smoke. That is historical checkpoint evidence, not proof for the
+changing workspace or a future candidate; each candidate must regenerate the
+complete proof after its source has stabilized.
+
+Company Facts v3 is not part of that certified baseline. The reviewed candidate
+replays 500 payloads, emits 1,119,730 rows, rejects 42 future-period rows,
+withholds 17,860 unsupported-context rows and 26,152 ambiguous storage keys,
+and emits zero duplicate keys. Its disposable database makes 394/503 QV scores
+structurally computable only before freshness and lineage gates. All 1,270,623
+live fundamental rows and the candidate remain unlineaged, leaving zero issuers
+eligible for governed v3 activation. Promotion is blocked until a source-lineaged
+migration, explicit freshness policy, candidate diff, and restore proof pass.
+The new `companyfacts-v3-plan --as-of YYYY-MM-DD` surface can classify already
+captured exact v2 evidence and optionally publish a content-addressed review
+plan. It is read-only, performs no provider fetch, and has no activation path.
 
 Predecessor trial `us-qv-forward-8559d86b6a02` is archived unchanged; it was
 not re-hashed, backdated, or executed. Active trial
@@ -43,14 +70,20 @@ has one registered proposal, and has zero executions. The account remains
 $100,000 simulated cash with zero holdings and no broker connection. On
 2026-07-29 the full read-only paper review passed after the 2026-07-28 close and
 provider finalization. It deliberately produced no execution command and no
-simulation was recorded; explicit human confirmation remains a separate
-decision before the prospective window ends. The 2026-07-29 guarded daily run
-passed at 13:12 IST and host verification proved all three user timers active,
-so the scheduler-visibility warning was resolved through the normal incident
-lifecycle. One non-critical fundamentals-coverage incident remains open for
-three SEC issuers that returned no fundamental rows, so unattended operations
-are not currently claimed. The next scheduled filings run or a reviewed
-bounded retry remains evidence to observe rather than claim in advance.
+simulation was recorded; the proposal is now expired and remains registered.
+The durable ledger records one successful July 30 job for the July 29 session,
+covering 503 members, 2,515 member-price rows, 98,428 macro rows, and zero job
+warnings. A current normal-session report-only check verifies all three timers
+and the scheduler-runtime incident is resolved. `current_refresh_partial`
+remains open. A later natural cycle exposed contradictory HTTP content-
+encoding metadata across SEC and universe sources; the shared transport now
+forces identity bytes and bulk refresh opens a bounded circuit after three
+consecutive transport errors. A natural recovery run is still required before
+closing the current daily, filing, and scheduler incidents. FDXF and HONA were accepted as explicit zero-row gaps with score
+withholding preserved; the acknowledged XOM case remains unresolved pending
+predecessor-successor evidence. Unattended operations are not currently claimed.
+Repeated natural cycles and a reviewed recovery remain evidence to obtain rather
+than claim in advance.
 
 ## Priority decision
 
@@ -59,20 +92,38 @@ bounded retry remains evidence to observe rather than claim in advance.
 | Decision-first dashboard foundation | **Now — implemented** | Makes the local product operable without DuckDB or systemd knowledge | `Today` keeps Research, Paper Trial and Operations scope separate; every displayed fact reconciles to readiness, scheduler, ingest, backup, incident or forward-policy evidence |
 | Institutional dashboard visual system | **Now — implemented** | A research control room must be fast to scan and hard to misread at desktop and phone widths | Light evidence canvas, navy shell, one CTA hierarchy, semantic status colors, symmetric grids, four-stage paper governance, selectable ranked rows, origin-aware URL state, rendered desktop/mobile QA |
 | Canonical operator preflight | **Now — implemented** | Independent capabilities and one next action prevent a green research gate from hiding paper, operations, or real-capital blockers | Versioned checksum JSON, strict registered-proposal resolution, immutable DuckDB/SQLite reads, timing-only and full-review modes, repeatable capability requirements, no generated state-changing command |
+| Release wheel contract verifier | **Now — implemented; each candidate must still pass** | A build file is not release evidence when package bytes or metadata can drift from reviewed source | Exact source/member/entry-point comparison; `METADATA` Python, dependency, and extra parity; pure-Python `WHEEL`; complete SHA-256/size-checked `RECORD`; new temporary-environment install and smoke proof |
 | Cooperative cross-store mutation lease | **Now — implemented for supported CLI workflows** | Backup-covered DuckDB, raw, paper, proposal, and forward mutations must not race | Non-blocking process/thread lease covers refresh, ingest, import, repair, cleanup, backup/restore, paper, and forward CLI boundaries and fails visibly; direct-library callers remain outside the lease |
+| Backup-first local schema upgrade | **Now — implemented; live run pending lease availability** | Opening a new `Store` must not silently migrate DuckDB or the incident ledger before a recovery point exists | One confirmed command owns the lease, checkpoints without application migration, verifies a complete backup, rehearses on exact copies, hashes every old DuckDB/SQLite relation, applies each migration, and emits a checksum-chained phase journal; exact-attempt recovery is implemented, while defective-code rollback still requires the release-pinned producer |
+| Pre-swap semantic restore gate | **Now — implemented** | Manifest hashes alone cannot prove that a backup can safely become live state | Stage the complete candidate first; require application-version parity, openable/zero-hard-failure DuckDB, valid paper/forward envelopes and active cross-references, full raw replay, and no immutable merge conflict before safety backup or live publication; later publication failures use paper rollback/safety backup while raw additions and the stale incident remain forward-only |
 | Governed artifact publication boundary | **Now — implemented** | A caller-selected output path must never overwrite an account, database, immutable input, backup, or source file | Resolve before work; project artifacts stay under `data/` but outside governed state; refuse symlink/hard-link aliases; atomically publish single files and reviewed batch names without replacement; proposals remain confined to their validated namespace |
 | Final forward-library persistence CAS | **Next intentional policy version** | A cooperative CLI lease is not a universal transaction for arbitrary direct-library callers | Add final trial/proposal identity checks at the forward-library persistence boundaries, then begin a new prospective trial; never rewrite the active trial's hashed policy file in place |
+| Expired-proposal rollover lifecycle | **Now — governed v4 preview and dormant transaction engine implemented; activation disabled** | The unchanged trial has one expired registered proposal and retrospective fills remain forbidden | Stable payload binds exact account/trial/proposal files, execution registry, readiness, proposal blueprint, successor policy, paths and no-fill disposition; keep `available_in_this_build=false` until owner TTL, backup-freshness, retention, writer-coordination and recovery constants are approved, then prove the engine only in a naturally prospective window |
 | Research Fast Path v1 | **Now — implemented** | A 29–33 second cold screen was the main daily research bottleneck | Dashboard-only decision-scoped batch facade, exact QV/QVML scalar parity, 12-query bound, read-only/temp-relation cleanup tests, serialized cold builds, no persistent score cache |
+| Fundamental evidence generations v1 | **Now — row-version and factor-read contract implemented; paper activation deferred** | Filing-date PIT alone cannot prevent a fact accepted later from changing an earlier decision | Version the resolved post-merge projection, tombstone governed deletions, reject duplicate keys, and fail when latest history cannot reconstruct current rows; next pin reference routing, prices, membership, macro and policy, then introduce a complete boundary only in a new prospective paper schema |
 | Recoverable exact-date U.S. daily workflow | **Now — implemented** | Separate timer stamps did not prove a full run survived logout, and benchmark-last ordering could leave identity windows one session behind | SPY first, universe second, members/macro third, exact-date readiness last; durable job lifecycle, restart, startup catch-up, linger, live 503-member proof |
 | Local incident ledger and systemd failure capture | **Now — implemented** | Scheduled and application failures must survive analytical DB lock/open failures | Deduplicated open/repeat/acknowledge/resolve/reopen lifecycle, immutable schema-checked CLI inspection, safe structured service evidence, dashboard history, backup archive |
 | Immutable raw-data snapshots | **Now — active U.S. transport gate implemented** | Provider history can change; later anomaly work needs exact ingest evidence | Active SEC, yfinance, FRED, Treasury and reviewed Tiingo paths capture and replay honestly; backup/restore drill passes; every future adapter needs the same gate |
+| Company Facts v3 governed activation | **Next — read-only planner implemented; activation unavailable** | Higher structural score computability cannot override stale or unlineaged inputs | Use `companyfacts-v3-plan --as-of ...` to review exact captured v2 evidence without fetching or mutation; then add source-lineaged migration, metric freshness, reviewed candidate diff, restore proof, and a separately governed activation contract; zero issuers are eligible today |
 | Channel-neutral notification outbox | **Now — implemented** | Channels are replaceable transports, not the source of incident truth | Atomic incident/message writes, stable idempotency, exclusive leases, bounded retries, dead letters, safe attempt audit, local no-network proof, backup/restore coverage |
 | SMTP email delivery adapter | **Implemented; live activation deferred** | The user selected email but deferred setup; destination and credentials still cannot be inferred | Private SMTP config, one exact-route test, owner-confirmed receipt, explicit enable; historical held messages remain quarantined |
 | Governed proposal stress review v1 | **Now — implemented** | Proposal risk should be challenged before adding prediction complexity | CLI and Paper Trial use one registered-proposal CAS service; exact PIT evidence and immutable sources bind every result; mark shocks and the statistical proxy stay separate; missing evidence fails closed |
-| Data-quality anomaly review cases | **Soon after incident core** | Suspect changes must be reviewed, never silently repaired | Baseline comparisons create deduplicated cases with evidence, severity, owner state, and resolution audit |
+| Data-quality anomaly review cases | **Now — SEC coverage v1 implemented** | Suspect changes must be reviewed, never silently repaired | Preview is non-persistent; explicit record creates source-bound deduplicated cases; acknowledgement and disposition are audited; missing evidence withholds; remaining rule families stay gated below |
 | Research experiment registry | **Before new factor experiments** | Prevents accidental cherry-picking and untraceable results | Every run records code/data/policy identity, assumptions, exclusions, metrics, artifacts, and exploratory/frozen/holdout status |
 | Role-based configuration boundaries | **Before hosted or India operation** | Operator actions, research policy, account assumptions, secrets, and data have different change controls | Named policy versions are immutable; policy change starts a new forward trial; secrets are never exported |
 | India adapter foundation | **Before any NSE/BSE ingest** | Market dimensions cannot be bolted onto U.S.-implicit rows safely | Market, exchange, currency, calendar, settlement, action source, benchmark, security type, ISIN, and provider-symbol intervals are first-class and parity-tested |
+
+### Release artifact acceptance
+
+Every release candidate must run
+`.venv/bin/python scripts/verify_release_wheel.py DIST_WHEEL`. Acceptance
+requires exact package contents and bytes, matching `METADATA`
+name/version/Python/dependency/extra contracts, the expected console entry point
+and pure-Python `WHEEL`, and complete `RECORD` coverage with correct SHA-256
+hashes and sizes. The default path also installs the candidate with `--no-deps`
+in a new temporary virtual environment and smoke-tests imports, bundled
+resources, and `aios --help`. Having this verifier implemented does not certify
+an old or not-yet-built wheel.
 
 ## Phase 1 — Reconstructable ingestion and incidents
 
@@ -85,8 +136,10 @@ data/raw/{provider}/{dataset}/{YYYY-MM-DD}/{sha256}.json.gz
 ```
 
 The extension may vary for a genuinely non-JSON response, but compression must
-not change the hash of the original uncompressed bytes. Write to a temporary
-file, verify, then atomically rename.
+not change the hash of the original uncompressed bytes. Walk every directory
+from a held project-root descriptor with no-follow semantics, write and fsync a
+same-directory temporary file, then publish it with an atomic no-replace hard
+link. Never overwrite an existing content address.
 
 Store at minimum:
 
@@ -95,6 +148,8 @@ Store at minimum:
 - a secret-free request fingerprint and exact response SHA-256;
 - relative snapshot path, byte counts, adapter name/version and parser version;
 - parsed row count and canonical parsed-row SHA-256;
+- parser rejection count and canonical structured rejection codes where the
+  parser can withhold source rows;
 - the ingest run ID and the snapshot's role in that ingest.
 
 One ingest can consume multiple payloads, so link snapshots to `ingest_log`
@@ -113,7 +168,11 @@ Acceptance tests:
 3. parsing the snapshot reproduces the stored parsed-row hash;
 4. deleting or modifying a snapshot fails validation;
 5. backup/restore preserves database links and raw files;
-6. a failed parse still retains the response and failure metadata.
+6. a failed parse still retains the response and failure metadata;
+7. traversal, symlink swaps, hardlinks, FIFOs and parser downgrades fail closed;
+8. network reads, stored bytes and decompression have explicit size limits; and
+9. a legacy rejection-evidence migration replays exact historical bytes before
+   it can certify the new schema.
 
 Implemented foundation on 2026-07-22:
 
@@ -122,6 +181,10 @@ Implemented foundation on 2026-07-22:
 - adapter/parser versions, parsed-row hash and optional ingest-run links;
 - `aios verify-raw-snapshots` tamper detection;
 - backup inclusion and forward-only merge on restore.
+- descriptor-relative, no-overwrite publication and bounded, nonblocking reads;
+- bounded streaming at the shared HTTP boundary before response buffering;
+- exact Company Facts rejection replay, including replay-backfilled historical
+  evidence with no mutable timestamp exemption;
 - an opt-in shared HTTP capture boundary with secret-query redaction that keeps
   malformed response bytes before JSON parsing fails;
 - exact-response capture for reviewed SEC Company Facts and Submissions issuer
@@ -158,6 +221,12 @@ Implemented foundation on 2026-07-22:
   through the real confirmed-restore path in disposable storage, opened and
   validated DuckDB, checked all 1,535 payloads, replayed 535 parsed artifacts,
   and proved the live files were untouched.
+- a pre-swap semantic restore gate that stages the complete candidate and
+  requires exact application compatibility, an openable DuckDB with zero hard
+  data-quality failures, valid checksum/schema envelopes for every paper and
+  active/archived forward-trial document, consistent active cross-references,
+  complete raw replay, and conflict-free immutable merge before creating the
+  live safety backup or changing governed live state.
 
 The active U.S. transport gate is complete. Stooq currently returns a
 JavaScript verification page and remains explicitly unavailable; its response
@@ -292,7 +361,47 @@ Still future:
 
 ### 3A. Anomaly review cases
 
-Detect, but never silently correct:
+Implemented v1:
+
+- compare the exact reviewed U.S. membership and active issuer identities with
+  accepted point-in-time SEC fundamentals for one decision date, deduplicating
+  findings at issuer grain;
+- prove covered rows through complete run/snapshot/row-set/row lineage or,
+  for legacy rows only, exact raw replay plus equality with the stored
+  decision-date issuer row set; never infer or backfill legacy lineage;
+- accept SEC warning coverage only when positive rows were stored and the
+  rejected rows were exclusively later than their filing date; zero-row and
+  every other warning remain missing;
+- bind each finding to its ingest run, raw snapshot, payload checksum, parser
+  provenance, rule version, old/new value, severity, confidence, and suggested
+  checks;
+- withhold the complete scan when required source evidence is missing,
+  conflicting, or tampered;
+- keep `--preview` non-persistent, maintenance-lease-free, and lock-file-free,
+  and make `--record` write immutable scans, append lifecycle events, and
+  reconcile fingerprint-deduplicated current cases only within the independent
+  operations ledger;
+- let the first `--record` on schema v4 perform the supported additive
+  schema-v6 migration, creating empty anomaly tables without historical
+  backfill while read-only anomaly views fail closed before migration; a
+  v5-to-v6 upgrade preserves existing anomaly records and deterministically
+  fills only their missing `event_sequence` from prior append order;
+- apply SEC source-boundary policy v2: derive the boundary as the maximum
+  receipt time of only the exact snapshots consumed for accepted coverage and
+  selected missing-issuer warnings, never from unrelated global ingest
+  activity; permit exactly one audited legacy implicit-global-v1 to consumed-v2
+  transition to use an earlier corrected boundary only when the rule bundle,
+  scope, v1/v2 signatures, consumed-snapshot proof, and zero-write safety
+  contract match, while blocking every same-policy regression;
+- expose the queue and latest scan through read-only CLI/dashboard paths; and
+- recommend acknowledgement first while permitting direct disposition when a
+  named owner, note, and current evidence hash are supplied so stale reviews
+  fail visibly.
+
+The v1 scan never updates DuckDB, repairs a value, advances readiness, changes
+paper/proposal/trial state, or contacts a broker.
+
+Remaining rule families must detect, but never silently correct:
 
 - sudden share-count changes and impossible valuation jumps;
 - duplicate or conflicting filings;
@@ -304,7 +413,21 @@ Detect, but never silently correct:
 Each detection creates or updates a review case containing old/new values,
 source snapshots, rule version and suggested operator checks. Resolution must be
 explicitly `accepted`, `source_corrected`, `mapping_corrected`, `false_positive`
-or `deferred`, with an audit note.
+or `deferred`, with an audit note. Source and mapping corrections require a
+complete same-scope scan recorded after the finding, with a distinct
+source-boundary hash, a non-earlier source-boundary time, the exact rule
+executed, the fingerprint absent, and clearance bound to a source-provenanced
+accepted SEC ingest with positive verified rows. Deferral needs a future review
+time and remains unresolved. Case reads and mutations replay the immutable
+ordered lifecycle and verify the mutable projection. No disposition authorizes
+a data edit or bypasses a readiness gate. This local integrity check trusts the
+released AIOS code and OS/filesystem access controls; it is not cryptographic
+attestation against an actor able to replace both code and evidence.
+
+The one-time v1-to-v2 boundary transition changes only scan-recording
+compatibility. It does not relax correction clearance: a verification scan
+used for `source_corrected` or `mapping_corrected` remains subject to the
+non-earlier source-boundary requirement above.
 
 ### 3B. Experiment registry
 

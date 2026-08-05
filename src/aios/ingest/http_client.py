@@ -50,6 +50,11 @@ _SECRET_QUERY_KEYS = {
     "signature",
     "token",
 }
+_MAX_RESPONSE_BYTES = 256 * 1024 * 1024
+
+
+class ResponseTooLargeError(ValueError):
+    """Raised before an external response can exceed the ingest memory boundary."""
 
 
 @dataclass(frozen=True)
@@ -114,7 +119,14 @@ class HttpClient:
     def __init__(self, timeout: float = 30.0) -> None:
         self._client = httpx.Client(
             timeout=timeout,
-            headers={"User-Agent": settings.sec_user_agent},
+            headers={
+                "User-Agent": settings.sec_user_agent,
+                # Provider payloads are captured and compressed locally.  Ask
+                # intermediaries for identity bytes so a stale proxy cannot
+                # attach a gzip/deflate header to an already-decoded body and
+                # make httpx fail before the evidence boundary can inspect it.
+                "Accept-Encoding": "identity",
+            },
             follow_redirects=True,
         )
         self._limiters: dict[str, RateLimiter] = {}
@@ -146,23 +158,54 @@ class HttpClient:
         h = {"User-Agent": settings.sec_user_agent}
         if headers:
             h.update(headers)
-        resp = self._client.get(url, headers=h)
-        # Handle 429 explicitly: sleep with jitter, then force a retry by
-        # raising a transient error that tenacity catches.
-        if resp.status_code == 429:
-            sleep_for = random.uniform(2.0, 5.0)
-            log.warning("http.429_throttle", url=_secret_free_url(url), sleep=sleep_for)
-            time.sleep(sleep_for)
-            raise httpx.HTTPStatusError(
-                "429 Too Many Requests", request=resp.request, response=resp
+        # This is a transport integrity rule, not a caller preference.  The
+        # exact decoded provider payload is bounded below and then compressed
+        # deterministically by the immutable raw-snapshot layer.
+        h["Accept-Encoding"] = "identity"
+        with self._client.stream("GET", url, headers=h) as streamed:
+            # Handle 429 explicitly: sleep with jitter, then force a retry by
+            # raising a transient error that tenacity catches.
+            if streamed.status_code == 429:
+                sleep_for = random.uniform(2.0, 5.0)
+                log.warning(
+                    "http.429_throttle",
+                    url=_secret_free_url(url),
+                    sleep=sleep_for,
+                )
+                time.sleep(sleep_for)
+                raise httpx.HTTPStatusError(
+                    "429 Too Many Requests",
+                    request=streamed.request,
+                    response=streamed,
+                )
+            # 5xx → retry
+            if streamed.status_code >= 500:
+                raise httpx.HTTPStatusError(
+                    f"{streamed.status_code} server error",
+                    request=streamed.request,
+                    response=streamed,
+                )
+            streamed.raise_for_status()
+            declared_length = streamed.headers.get("content-length")
+            if declared_length is not None:
+                try:
+                    declared_bytes = int(declared_length)
+                except ValueError as exc:
+                    raise ResponseTooLargeError("HTTP response Content-Length is invalid") from exc
+                if not 0 <= declared_bytes <= _MAX_RESPONSE_BYTES:
+                    raise ResponseTooLargeError("HTTP response exceeds the ingest byte limit")
+            body = bytearray()
+            for chunk in streamed.iter_bytes():
+                if len(body) + len(chunk) > _MAX_RESPONSE_BYTES:
+                    raise ResponseTooLargeError("HTTP response exceeds the ingest byte limit")
+                body.extend(chunk)
+            return httpx.Response(
+                streamed.status_code,
+                headers=streamed.headers,
+                content=bytes(body),
+                request=streamed.request,
+                extensions=streamed.extensions,
             )
-        # 5xx → retry
-        if resp.status_code >= 500:
-            raise httpx.HTTPStatusError(
-                f"{resp.status_code} server error", request=resp.request, response=resp
-            )
-        resp.raise_for_status()
-        return resp
 
     def get_json(
         self,

@@ -371,7 +371,7 @@ def test_dashboard_workspaces_and_research_surfaces_render_without_exceptions() 
     assert "Investment Command Center" in home_html
     assert "Priority action" in home_html
     assert "Current proposal targets" in home_html
-    assert "Open incidents" in home_html
+    assert "Open reviews" in home_html
     assert app.sidebar.radio("workspace").value == "today"
     assert app.query_params["view"] == ["today"]
 

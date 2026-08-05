@@ -26,8 +26,17 @@ class DecisionScopedFactorStore:
     scalar Store directly.
     """
 
-    def __init__(self, store: Store, tickers: list[str]) -> None:
+    def __init__(
+        self,
+        store: Store,
+        tickers: list[str],
+        *,
+        fundamental_evidence_generation_id: str | None = None,
+    ) -> None:
         self._store = store
+        self._fundamental_evidence_generation_id = (
+            fundamental_evidence_generation_id
+        )
         self._tickers = tuple(sorted({ticker.upper() for ticker in tickers}))
         self._ticker_set = set(self._tickers)
         self._fundamentals: dict[tuple[str, tuple[str, ...]], dict[str, list[dict]]] = {}
@@ -51,6 +60,39 @@ class DecisionScopedFactorStore:
                 f"missing={missing[:5]}, unexpected={unexpected[:5]}"
             )
 
+    def _pit_fundamentals(
+        self,
+        ticker: str,
+        as_of: str,
+        metrics: list[str],
+    ) -> list[dict]:
+        if self._fundamental_evidence_generation_id is None:
+            return self._store.pit_factor_fundamentals(ticker, as_of, metrics)
+        return self._store.pit_factor_fundamentals(
+            ticker,
+            as_of,
+            metrics,
+            evidence_generation_id=self._fundamental_evidence_generation_id,
+        )
+
+    def _pit_fundamentals_batch(
+        self,
+        as_of: str,
+        metrics: list[str],
+    ) -> dict[str, list[dict]]:
+        if self._fundamental_evidence_generation_id is None:
+            return self._store.pit_factor_fundamentals_batch(
+                list(self._tickers),
+                as_of,
+                metrics,
+            )
+        return self._store.pit_factor_fundamentals_batch(
+            list(self._tickers),
+            as_of,
+            metrics,
+            evidence_generation_id=self._fundamental_evidence_generation_id,
+        )
+
     def pit_factor_fundamentals(
         self,
         ticker: str,
@@ -63,13 +105,12 @@ class DecisionScopedFactorStore:
             sorted({metric.strip() for metric in metrics if metric.strip()})
         )
         if normalized_ticker not in self._ticker_set:
-            return self._store.pit_factor_fundamentals(ticker, as_of, metrics)
+            return self._pit_fundamentals(ticker, as_of, metrics)
 
         key = (str(as_of), normalized_metrics)
         if key not in self._fundamentals and key not in self._fundamental_failures:
             try:
-                snapshots = self._store.pit_factor_fundamentals_batch(
-                    list(self._tickers),
+                snapshots = self._pit_fundamentals_batch(
                     as_of,
                     list(normalized_metrics),
                 )
@@ -85,7 +126,7 @@ class DecisionScopedFactorStore:
 
         snapshots = self._fundamentals.get(key)
         if snapshots is None:
-            return self._store.pit_factor_fundamentals(ticker, as_of, metrics)
+            return self._pit_fundamentals(ticker, as_of, metrics)
         return snapshots[normalized_ticker]
 
     def latest_price(self, ticker: str, as_of: str) -> dict | None:

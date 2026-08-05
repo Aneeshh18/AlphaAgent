@@ -827,8 +827,10 @@ def test_sector_template_assigns_unique_ids_to_colliding_slugs() -> None:
     ).payload["analysis"]["scenarios"]
 
     ids = [row["scenario_id"] for row in results]
-    assert len(ids) == len(set(ids)) == 2
-    assert all(result_id.startswith("sector:health-care:") for result_id in ids)
+    assert ids == [
+        "sector:health-care:04b0a88a87070712",
+        "sector:health-care:ce6cf52e8ca3ca37",
+    ]
     assert {row["label"] for row in results} == {
         "sector — Health Care",
         "sector — Health-Care",

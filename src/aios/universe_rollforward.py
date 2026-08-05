@@ -26,13 +26,14 @@ from html import unescape
 from html.parser import HTMLParser
 from io import StringIO
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from aios.ingest.http_client import RawSnapshotContext, get_http
 from aios.market_calendar import latest_completed_us_equity_session
 from aios.paper import latest_reviewed_market_close
+from aios.raw_snapshots import attach_parsed_rows_evidence
 from aios.storage.store import Store, get_store
 
 OFFICIAL_ARCHIVE_URL = "https://press.spglobal.com/index.php?s=2429&l=100"
@@ -45,6 +46,12 @@ ARCHIVE_PAGE_SIZE = 100
 MAX_ARCHIVE_STALENESS_DAYS = 14
 MINIMUM_MEMBERS = 450
 MAXIMUM_MEMBERS = 550
+PRESS_ARCHIVE_PARSER_VERSION = "spglobal-press-archive-html-v1"
+CHANGE_ANNOUNCEMENT_PARSER_VERSION = "spglobal-constituent-change-html-v1"
+COMPONENT_SNAPSHOT_PARSER_VERSION = "sp500-components-csv-v1"
+PRESS_ARCHIVE_CAPTURE_VERSION = "spglobal-press-archive-html-capture-v1"
+CHANGE_ANNOUNCEMENT_CAPTURE_VERSION = "spglobal-constituent-change-html-capture-v1"
+COMPONENT_SNAPSHOT_CAPTURE_VERSION = "sp500-components-csv-capture-v1"
 
 FetchBytes = Callable[[str, RawSnapshotContext], bytes]
 
@@ -67,6 +74,24 @@ class PressRelease:
 class ComponentReference:
     ticker: str
     cik: str
+
+
+@dataclass(frozen=True)
+class ConstituentChange:
+    """One strictly parsed S&P 500 row from an official announcement."""
+
+    effective_date: date
+    action: str
+    company_name: str
+    ticker: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "effective_date": self.effective_date.isoformat(),
+            "action": self.action,
+            "company_name": self.company_name,
+            "ticker": self.ticker,
+        }
 
 
 @dataclass(frozen=True)
@@ -191,16 +216,28 @@ def roll_forward_sp500_coverage(
         candidates = [
             release
             for release in releases
-            if prior < release.release_date <= target
-            and _is_constituent_change_title(release.title)
-            and release.url not in reviewed_sources
+            if release.release_date <= target
+            and is_constituent_change_title(release.title)
+            and not _source_contains_release_url(reviewed_sources, release.url)
         ]
+        blocking_candidates, future_changes, candidate_errors = (
+            _classify_candidate_release_timing(
+                getter,
+                db,
+                run_id,
+                candidates=candidates,
+                target=target,
+                project_root=root,
+            )
+        )
         mismatch_detail = {
             "missing_from_component_snapshot": missing_components[:100],
             "unexpected_in_component_snapshot": unexpected_components[:100],
             "reference_identity_issues": identity_issues[:100],
             "cik_mismatches": cik_mismatches[:100],
             "reviewed_successor_lineage_matches": successor_lineage_matches[:100],
+            "future_effective_releases": future_changes[:100],
+            "candidate_release_parse_errors": candidate_errors[:100],
         }
         mismatch_count = (
             len(missing_components)
@@ -208,13 +245,21 @@ def roll_forward_sp500_coverage(
             + len(identity_issues)
             + len(cik_mismatches)
         )
-        accepted = not candidates and mismatch_count == 0
+        accepted = not blocking_candidates and mismatch_count == 0
         status = "accepted_no_change" if accepted else "blocked_review_required"
-        detail = (
-            "No unreviewed constituent-change announcement or reference drift was found."
-            if accepted
-            else _blocked_detail(candidates, mismatch_count)
-        )
+        if accepted and future_changes:
+            detail = (
+                "No constituent change is effective through the requested date and "
+                "no reference drift was found. Future official changes remain pending "
+                "formal event import."
+            )
+        elif accepted:
+            detail = (
+                "No unreviewed constituent-change announcement or reference drift "
+                "was found."
+            )
+        else:
+            detail = _blocked_detail(blocking_candidates, mismatch_count)
         matching_identities = max(0, len(references) - len(identity_issues) - len(cik_mismatches))
         attestation = {
             "attestation_id": attestation_id,
@@ -228,7 +273,7 @@ def roll_forward_sp500_coverage(
             "official_source_url": OFFICIAL_ARCHIVE_URL,
             "component_source_url": COMPONENT_SNAPSHOT_URL,
             "official_release_count": len(releases),
-            "relevant_release_count": len(candidates),
+            "relevant_release_count": len(blocking_candidates),
             "reviewed_member_count": len(references),
             "component_count": len(components),
             "reviewed_member_set_sha256": _set_sha256(reviewed_tickers),
@@ -236,7 +281,7 @@ def roll_forward_sp500_coverage(
             "identity_match_count": matching_identities,
             "identity_mismatch_count": mismatch_count,
             "candidate_releases_json": _canonical_json(
-                [release.to_dict() for release in candidates]
+                [release.to_dict() for release in blocking_candidates]
             ),
             "mismatch_detail_json": _canonical_json(mismatch_detail),
             "detail": detail,
@@ -247,7 +292,11 @@ def roll_forward_sp500_coverage(
             source="spglobal+fja05680",
             table_name="universe_coverage_attestations",
             rows_inserted=1 if accepted else 0,
-            rows_rejected=0 if accepted else max(1, len(candidates) + mismatch_count),
+            rows_rejected=(
+                0
+                if accepted
+                else max(1, len(blocking_candidates) + mismatch_count)
+            ),
             started_at=started_at,
             finished_at=datetime.now(UTC),
             status="success" if accepted else "warning",
@@ -263,7 +312,7 @@ def roll_forward_sp500_coverage(
             run_id=run_id,
             member_count=len(references),
             official_release_count=len(releases),
-            relevant_release_count=len(candidates),
+            relevant_release_count=len(blocking_candidates),
             identity_mismatch_count=mismatch_count,
             rows_extended=counts,
             detail=detail,
@@ -312,6 +361,112 @@ def parse_press_archive(payload: bytes) -> list[PressRelease]:
     return sorted(releases.values(), key=lambda row: (row.release_date, row.url), reverse=True)
 
 
+def parse_sp500_constituent_changes(payload: bytes) -> list[ConstituentChange]:
+    """Strictly parse dated S&P 500 action rows from an official release page."""
+
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("S&P change announcement is not valid UTF-8") from exc
+    parser = _ReleaseTableParser()
+    parser.feed(text)
+    parser.close()
+    changes: list[ConstituentChange] = []
+    for raw_cells in parser.rows:
+        cells = [" ".join(unescape(cell).replace("\xa0", " ").split()) for cell in raw_cells]
+        normalized_cells = [cell.casefold().replace(" ", "") for cell in cells]
+        index_positions = [
+            position
+            for position, cell in enumerate(normalized_cells)
+            if cell == "s&p500"
+        ]
+        sp_index_positions = [
+            position
+            for position, cell in enumerate(normalized_cells)
+            if cell.startswith("s&p")
+        ]
+        action_positions = [
+            position
+            for position, cell in enumerate(cells)
+            if cell.casefold() in {"addition", "deletion"}
+        ]
+        if not index_positions and not action_positions:
+            continue
+        if not index_positions:
+            if (
+                len(action_positions) != 1
+                or len(sp_index_positions) != 1
+                or sp_index_positions[0] + 1 != action_positions[0]
+            ):
+                raise ValueError("S&P change table has an ambiguous index/action row")
+            # Official multi-index announcements share one table. Other named
+            # S&P indices are outside this parser's S&P 500 scope.
+            continue
+        if (
+            len(index_positions) != 1
+            or len(sp_index_positions) != 1
+            or len(action_positions) != 1
+        ):
+            raise ValueError("S&P 500 change table has an ambiguous index/action row")
+        action_position = action_positions[0]
+        if index_positions[0] + 1 != action_position:
+            raise ValueError("S&P 500 change table has an ambiguous index/action row")
+        if action_position + 2 >= len(cells):
+            raise ValueError("S&P 500 change table row is incomplete")
+        date_cells = [
+            cell
+            for cell in cells
+            if re.fullmatch(
+                r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|"
+                r"Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|"
+                r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?) \d{1,2}, \d{4}",
+                cell,
+            )
+        ]
+        if len(date_cells) != 1:
+            raise ValueError("S&P 500 change table row has no unique effective date")
+        effective_date = None
+        for date_format in ("%B %d, %Y", "%b %d, %Y"):
+            try:
+                effective_date = datetime.strptime(date_cells[0], date_format).date()
+                break
+            except ValueError:
+                continue
+        if effective_date is None:
+            raise ValueError("S&P 500 change table has an invalid effective date")
+        ticker = cells[action_position + 2].upper()
+        if not re.fullmatch(r"[A-Z0-9.]+", ticker):
+            raise ValueError("S&P 500 change table has an invalid ticker")
+        changes.append(
+            ConstituentChange(
+                effective_date=effective_date,
+                action=cells[action_position].casefold(),
+                company_name=cells[action_position + 1],
+                ticker=ticker,
+            )
+        )
+    if not changes:
+        raise ValueError("official announcement has no strict S&P 500 change rows")
+    additions = sum(change.action == "addition" for change in changes)
+    deletions = sum(change.action == "deletion" for change in changes)
+    if additions != deletions:
+        raise ValueError("S&P 500 change table additions and deletions are unbalanced")
+    keys = {
+        (change.effective_date, change.action, change.ticker)
+        for change in changes
+    }
+    if len(keys) != len(changes):
+        raise ValueError("S&P 500 change table repeats an event row")
+    return sorted(
+        changes,
+        key=lambda change: (
+            change.effective_date,
+            change.action,
+            change.ticker,
+        ),
+    )
+
+
 def parse_component_snapshot(payload: bytes) -> list[ComponentReference]:
     """Parse and strictly validate the independent current-component CSV."""
     try:
@@ -355,7 +510,8 @@ def _fetch_official_archive(
     releases: dict[str, PressRelease] = {}
     reached_prior = False
     for page in range(MAX_ARCHIVE_PAGES):
-        url = OFFICIAL_ARCHIVE_URL if page == 0 else f"{OFFICIAL_ARCHIVE_URL}&o={page * 100}"
+        url = sp500_archive_page_url(page)
+        role = sp500_archive_page_role(page)
         payload = getter(
             url,
             RawSnapshotContext(
@@ -363,14 +519,22 @@ def _fetch_official_archive(
                 dataset="sp500_press_archive",
                 store=store,
                 ingest_run_id=run_id,
-                role=f"official_release_archive_page_{page:03d}",
+                role=role,
                 adapter_name="spglobal_press_archive_html",
                 adapter_version="1",
-                parser_version="1",
+                parser_version=PRESS_ARCHIVE_CAPTURE_VERSION,
                 project_root=project_root,
             ),
         )
         page_releases = parse_press_archive(payload)
+        attach_parsed_rows_evidence(
+            store=store,
+            ingest_run_id=run_id,
+            role=role,
+            capture_parser_version=PRESS_ARCHIVE_CAPTURE_VERSION,
+            parser_version=PRESS_ARCHIVE_PARSER_VERSION,
+            parsed_rows=[row.to_dict() for row in page_releases],
+        )
         releases.update((row.url, row) for row in page_releases)
         if min(row.release_date for row in page_releases) <= prior:
             reached_prior = True
@@ -411,6 +575,7 @@ def _fetch_component_snapshot(
     project_root: Path | None,
 ) -> list[ComponentReference]:
     del checked_at  # The raw snapshot layer records the actual request/receive timestamps.
+    role = "independent_component_snapshot"
     payload = getter(
         COMPONENT_SNAPSHOT_URL,
         RawSnapshotContext(
@@ -418,18 +583,125 @@ def _fetch_component_snapshot(
             dataset="sp500_current_components",
             store=store,
             ingest_run_id=run_id,
-            role="independent_component_snapshot",
+            role=role,
             adapter_name="fja05680_sp500_csv",
             adapter_version="1",
-            parser_version="1",
+            parser_version=COMPONENT_SNAPSHOT_CAPTURE_VERSION,
             project_root=project_root,
         ),
     )
-    return parse_component_snapshot(payload)
+    components = parse_component_snapshot(payload)
+    attach_parsed_rows_evidence(
+        store=store,
+        ingest_run_id=run_id,
+        role=role,
+        capture_parser_version=COMPONENT_SNAPSHOT_CAPTURE_VERSION,
+        parser_version=COMPONENT_SNAPSHOT_PARSER_VERSION,
+        parsed_rows=[asdict(row) for row in components],
+    )
+    return components
 
 
 def _fetch_bytes(url: str, context: RawSnapshotContext) -> bytes:
     return get_http().get_bytes(url, raw_snapshot=context)
+
+
+def _source_contains_release_url(sources: str, release_url: str) -> bool:
+    """Match one official release despite equivalent percent-encoding.
+
+    Membership provenance stores labeled URLs inside pipe-delimited source
+    strings. The press archive has emitted both literal and percent-encoded
+    commas for the same release path, so bytewise substring matching can
+    manufacture a historical review gap. Only canonical S&P Global HTTPS URLs
+    participate in this equivalence check.
+    """
+
+    expected = _canonical_spglobal_release_url(release_url)
+    if expected is None:
+        return False
+    for candidate in re.findall(r"https://press\.spglobal\.com/[^|\s]+", sources):
+        if _canonical_spglobal_release_url(candidate) == expected:
+            return True
+    return False
+
+
+def _canonical_spglobal_release_url(value: str) -> str | None:
+    split = urlsplit(unescape(value).strip())
+    if split.scheme.casefold() != "https" or split.hostname != "press.spglobal.com":
+        return None
+    if split.username or split.password or split.port is not None or split.fragment:
+        return None
+    normalized_path = quote(unquote(split.path), safe="/-._~")
+    return urlunsplit(("https", "press.spglobal.com", normalized_path, split.query, ""))
+
+
+def _classify_candidate_release_timing(
+    getter: FetchBytes,
+    store: Store,
+    run_id: str,
+    *,
+    candidates: list[PressRelease],
+    target: date,
+    project_root: Path | None,
+) -> tuple[list[PressRelease], list[dict[str, object]], list[dict[str, str]]]:
+    """Separate already-effective blockers from strictly future changes.
+
+    A release title alone never advances coverage.  Exact official detail is
+    captured and its S&P 500 table must parse completely.  A parsed event can
+    permit unchanged coverage only while every effective date remains later
+    than the requested decision close.  The release stays unreviewed and will
+    be reconsidered on every roll-forward until its event rows are imported.
+    """
+
+    blocking: list[PressRelease] = []
+    future: list[dict[str, object]] = []
+    errors: list[dict[str, str]] = []
+    for position, release in enumerate(candidates):
+        try:
+            role = f"candidate_release_detail_{position:03d}"
+            payload = getter(
+                release.url,
+                RawSnapshotContext(
+                    provider="spglobal",
+                    dataset="sp500_change_announcement",
+                    store=store,
+                    ingest_run_id=run_id,
+                    role=role,
+                    adapter_name="spglobal_constituent_change_html",
+                    adapter_version="1",
+                    parser_version=CHANGE_ANNOUNCEMENT_CAPTURE_VERSION,
+                    project_root=project_root,
+                ),
+            )
+            changes = parse_sp500_constituent_changes(payload)
+            attach_parsed_rows_evidence(
+                store=store,
+                ingest_run_id=run_id,
+                role=role,
+                capture_parser_version=CHANGE_ANNOUNCEMENT_CAPTURE_VERSION,
+                parser_version=CHANGE_ANNOUNCEMENT_PARSER_VERSION,
+                parsed_rows=[change.to_dict() for change in changes],
+            )
+        except Exception as exc:
+            blocking.append(release)
+            errors.append(
+                {
+                    "release_url": release.url,
+                    "error_type": type(exc).__name__,
+                    "detail": str(exc),
+                }
+            )
+            continue
+        if all(change.effective_date > target for change in changes):
+            future.append(
+                {
+                    **release.to_dict(),
+                    "changes": [change.to_dict() for change in changes],
+                }
+            )
+        else:
+            blocking.append(release)
+    return blocking, future, errors
 
 
 def _bounded_coverage_boundary(
@@ -600,7 +872,35 @@ def _reviewed_references(
     return accepted, issues
 
 
-def _is_constituent_change_title(title: str) -> bool:
+def sp500_archive_page_url(page: int) -> str:
+    """Return the exact reviewed S&P press-archive URL for one page."""
+
+    if (
+        isinstance(page, bool)
+        or not isinstance(page, int)
+        or not 0 <= page < MAX_ARCHIVE_PAGES
+    ):
+        raise ValueError("S&P press archive page is out of bounds")
+    return (
+        OFFICIAL_ARCHIVE_URL
+        if page == 0
+        else f"{OFFICIAL_ARCHIVE_URL}&o={page * ARCHIVE_PAGE_SIZE}"
+    )
+
+
+def sp500_archive_page_role(page: int) -> str:
+    """Return the canonical evidence role for one S&P archive page."""
+
+    if (
+        isinstance(page, bool)
+        or not isinstance(page, int)
+        or not 0 <= page < MAX_ARCHIVE_PAGES
+    ):
+        raise ValueError("S&P press archive page is out of bounds")
+    return f"official_release_archive_page_{page:03d}"
+
+
+def is_constituent_change_title(title: str) -> bool:
     normalized = " ".join(unescape(title).casefold().split())
     mentions_sp500 = bool(re.search(r"\bs\s*&\s*p\s*500\b", normalized))
     mentions_us_indices = "s&p u.s. indices" in normalized
@@ -729,3 +1029,41 @@ class _PressArchiveParser(HTMLParser):
                 raise ValueError("S&P press archive contains an incomplete release item")
             self.items.append(self._item)
             self._item = None
+
+
+class _ReleaseTableParser(HTMLParser):
+    """Collect text cells from official release tables without HTML dependencies."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: list[list[str]] = []
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        if tag == "tr":
+            if self._row is not None:
+                raise ValueError("nested S&P change table rows are not supported")
+            self._row = []
+        elif tag in {"td", "th"} and self._row is not None:
+            if self._cell is not None:
+                raise ValueError("nested S&P change table cells are not supported")
+            self._cell = []
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"td", "th"} and self._cell is not None:
+            if self._row is None:
+                raise ValueError("S&P change table cell ended outside a row")
+            self._row.append("".join(self._cell))
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            if self._cell is not None:
+                raise ValueError("S&P change table row ended inside a cell")
+            if self._row:
+                self.rows.append(self._row)
+            self._row = None

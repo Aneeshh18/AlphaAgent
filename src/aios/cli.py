@@ -10,6 +10,8 @@ Commands
   aios readiness     — fail-closed U.S. data/readiness report
   aios health        — one plain-language operating check
   aios backup        — checksum-verified local data/paper backup
+  aios upgrade-local-state — backup, rehearse, and apply local schema upgrades
+  aios upgrade-local-state-recover — reconcile one prepared upgrade attempt
   aios verify-backup — verify a backup without restoring it
   aios verify-raw-snapshots — verify immutable provider payloads
   aios review-universe-current — safely roll forward unchanged S&P 500 coverage
@@ -22,6 +24,12 @@ Commands
   aios alert-test    — verify the local incident lifecycle
   aios alert-ack     — acknowledge one unresolved incident
   aios alert-resolve — explicitly resolve one incident
+  aios anomaly-scan  — detect evidence-bound data-quality review cases
+  aios anomalies     — inspect governed data-quality review cases
+  aios anomaly-show  — inspect one case and its immutable evidence history
+  aios anomaly-ack   — assign and acknowledge one review case
+  aios anomaly-resolve — record one governed case disposition
+  aios companyfacts-v3-plan — preview an evidence-bound parser replay plan
   aios notifications — inspect the channel-neutral alert outbox
   aios notification-show — inspect one message and its delivery attempts
   aios notification-test — certify the local no-network delivery lifecycle
@@ -33,6 +41,8 @@ Commands
   aios dashboard     — open the local research dashboard
   aios paper-init    — create a local simulation-only portfolio
   aios forward-freeze — freeze policy/configuration for untouched monitoring
+  aios forward-rollover — preview/publish an exact plan; activation is disabled
+  aios forward-rollover-recover — reconcile one interrupted rollover attempt
   aios forward-restart — prospectively replace and archive a drifted trial
   aios forward-status — verify the active forward policy has not drifted
   aios paper-propose — build a reviewed QV simulation proposal
@@ -83,9 +93,10 @@ import platform
 import shlex
 import subprocess
 import sys
-from contextlib import suppress
+from contextlib import nullcontext, redirect_stdout, suppress
 from datetime import UTC, date, datetime
 from functools import wraps
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import uuid4
@@ -135,21 +146,24 @@ def _exclusive_project_operation(operation: str):
                 project_maintenance_lock,
             )
 
+            previous_umask = os.umask(0o077)
             try:
-                with project_maintenance_lock(
-                    settings.project_root,
-                    operation=operation,
-                ):
-                    return command(*args, **kwargs)
-            except MaintenanceLockBusyError as exc:
-                console.print(
-                    "[yellow]Another AIOS mutation workflow is already running.[/yellow] "
-                    f"{exc}"
-                )
-                raise typer.Exit(code=75) from exc
-            except MaintenanceLockError as exc:
-                console.print(f"[red]AIOS could not establish its mutation lock:[/red] {exc}")
-                raise typer.Exit(code=1) from exc
+                try:
+                    with project_maintenance_lock(
+                        settings.project_root,
+                        operation=operation,
+                    ):
+                        return command(*args, **kwargs)
+                except MaintenanceLockBusyError as exc:
+                    console.print(
+                        f"[yellow]Another AIOS mutation workflow is already running.[/yellow] {exc}"
+                    )
+                    raise typer.Exit(code=75) from exc
+                except MaintenanceLockError as exc:
+                    console.print(f"[red]AIOS could not establish its mutation lock:[/red] {exc}")
+                    raise typer.Exit(code=1) from exc
+            finally:
+                os.umask(previous_umask)
 
         return guarded
 
@@ -189,9 +203,7 @@ def _validate_generated_output_location(path: Path, *, label: str) -> Path:
         raise ValueError(f"{label} path cannot resolve through a symlink: {candidate}")
 
     if _is_within(candidate, root) and not _is_within(candidate, root / "data"):
-        raise ValueError(
-            f"{label} inside the project must stay under the data directory"
-        )
+        raise ValueError(f"{label} inside the project must stay under the data directory")
 
     protected_directories = (
         root / "data" / "raw",
@@ -202,9 +214,7 @@ def _validate_generated_output_location(path: Path, *, label: str) -> Path:
     )
     for protected in protected_directories:
         if candidate == protected or _is_within(candidate, protected):
-            raise ValueError(
-                f"{label} cannot target governed AIOS state: {candidate}"
-            )
+            raise ValueError(f"{label} cannot target governed AIOS state: {candidate}")
 
     duckdb_setting = Path(getattr(settings, "duckdb_path", "data/aios.duckdb"))
     operations_setting = Path(
@@ -219,9 +229,7 @@ def _validate_generated_output_location(path: Path, *, label: str) -> Path:
         root / "data" / "operations" / "maintenance.lock",
     }
     protected_files.update(
-        Path(f"{database}{suffix}")
-        for database in database_files
-        for suffix in ("-wal", "-shm")
+        Path(f"{database}{suffix}") for database in database_files for suffix in ("-wal", "-shm")
     )
     if candidate in protected_files:
         raise ValueError(f"{label} cannot target governed AIOS state: {candidate}")
@@ -268,21 +276,49 @@ def _resolve_paper_proposal_output_path(path: Path) -> Path:
     _reject_output_symlink_ancestors(candidate, label="paper proposal output")
     if candidate.resolve(strict=False) != candidate or not _is_within(candidate, allowed):
         raise ValueError(
-            "paper proposal output must stay under "
-            f"{PAPER_PROPOSAL_DIRECTORY.as_posix()}"
+            f"paper proposal output must stay under {PAPER_PROPOSAL_DIRECTORY.as_posix()}"
         )
     if candidate == allowed or candidate.suffix.lower() != ".json":
         raise ValueError(
             "paper proposal output must be a .json file under "
             f"{PAPER_PROPOSAL_DIRECTORY.as_posix()}"
         )
-    if candidate.exists() and (
-        not candidate.is_file() or candidate.stat().st_nlink != 1
-    ):
-        raise ValueError(
-            f"paper proposal output must be one regular unaliased file: {candidate}"
-        )
+    if candidate.exists() and (not candidate.is_file() or candidate.stat().st_nlink != 1):
+        raise ValueError(f"paper proposal output must be one regular unaliased file: {candidate}")
     return candidate
+
+
+def _has_unresolved_registered_proposal(
+    trial_payload: dict[str, Any],
+    account_payload: dict[str, Any],
+) -> bool:
+    """Fail closed unless every registered proposal has an exact execution record."""
+
+    proposals = trial_payload.get("proposals")
+    executions = account_payload.get("executions")
+    if not isinstance(proposals, list):
+        raise ValueError("forward proposal lifecycle evidence is invalid")
+    if not isinstance(executions, list):
+        raise ValueError("paper execution lifecycle evidence is invalid")
+
+    executed_ids: set[str] = set()
+    for execution in executions:
+        if not isinstance(execution, dict):
+            raise ValueError("paper execution lifecycle evidence is invalid")
+        proposal_id = execution.get("proposal_id")
+        if not isinstance(proposal_id, str) or not proposal_id.strip():
+            raise ValueError("paper execution lifecycle evidence is invalid")
+        executed_ids.add(proposal_id)
+
+    for proposal in proposals:
+        if not isinstance(proposal, dict):
+            raise ValueError("forward proposal lifecycle evidence is invalid")
+        proposal_id = proposal.get("proposal_id")
+        if not isinstance(proposal_id, str) or not proposal_id.strip():
+            raise ValueError("forward proposal lifecycle evidence is invalid")
+        if proposal_id not in executed_ids:
+            return True
+    return False
 
 
 def _resolve_readiness_report_path(path: Path) -> Path:
@@ -302,8 +338,7 @@ def _resolve_readiness_report_path(path: Path) -> Path:
         relative = destination.relative_to(allowed)
     except ValueError as exc:
         raise ValueError(
-            "readiness JSON output must stay under "
-            f"{READINESS_REPORT_DIRECTORY.as_posix()}"
+            f"readiness JSON output must stay under {READINESS_REPORT_DIRECTORY.as_posix()}"
         ) from exc
     if relative == Path(".") or destination.suffix.lower() != ".json":
         raise ValueError(
@@ -324,6 +359,48 @@ def _publish_text_write_once(path: Path, text: str) -> None:
         raise ValueError(f"readiness report already exists: {path}") from None
 
 
+def _incident_action_cli_arguments(
+    actor: str,
+    note: str,
+    evidence_sha256: str,
+) -> tuple[str, str, str]:
+    """Validate mutation authority before an operations store can be opened."""
+    normalized_actor = str(actor).strip()
+    normalized_note = str(note).strip()
+    normalized_sha256 = str(evidence_sha256).strip().lower()
+    if not normalized_actor:
+        raise ValueError("incident actor is required")
+    if not normalized_note:
+        raise ValueError("incident audit note is required")
+    if len(normalized_actor) > 4000:
+        raise ValueError("incident actor is too long")
+    if len(normalized_note) > 4000:
+        raise ValueError("incident audit note is too long")
+    if len(normalized_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized_sha256
+    ):
+        raise ValueError("incident evidence must be a 64-character SHA-256")
+    return normalized_actor, normalized_note, normalized_sha256
+
+
+def _incident_resolution_outcome_cli(outcome: str) -> str:
+    normalized = str(outcome).strip()
+    if normalized not in {"verified_recovery", "false_positive"}:
+        raise ValueError(
+            "incident outcome must be verified_recovery or false_positive"
+        )
+    return normalized
+
+
+def _incident_evidence_cli_argument(evidence_sha256: str) -> str:
+    normalized = str(evidence_sha256).strip().lower()
+    if len(normalized) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise ValueError("incident evidence must be a 64-character SHA-256")
+    return normalized
+
+
 def _emit_operational_alert(alert: Any) -> None:
     """Persist an application alert without changing the originating job result."""
     try:
@@ -334,14 +411,105 @@ def _emit_operational_alert(alert: Any) -> None:
         console.print(f"[yellow]Local incident recording failed:[/yellow] {exc}")
 
 
-def _resolve_operational_alert(fingerprint: str) -> None:
-    """Record recovery best-effort; notifier errors never fail the healthy job."""
+def _emit_operational_alert_without_schema_migration(alert: Any) -> None:
+    """Record an alert only when the incident ledger is already current.
+
+    Backup must preserve the exact pre-migration state. Its failure path must
+    therefore never initialize or migrate the operations database before a
+    verified snapshot exists.
+    """
     try:
         from aios.alerts import get_alert_store
 
-        get_alert_store().resolve_fingerprint(fingerprint)
+        get_alert_store(
+            _project_path(settings.operations_db_path),
+            read_only=True,
+        )
     except Exception as exc:
-        console.print(f"[yellow]Local incident recovery recording failed:[/yellow] {exc}")
+        console.print(
+            "[yellow]Local incident recording was deferred to preserve the "
+            f"pre-migration backup boundary:[/yellow] {exc}"
+        )
+        return
+    _emit_operational_alert(alert)
+
+
+def _record_scheduler_runtime_recovery(
+    status: dict[str, dict[str, Any]],
+) -> None:
+    """Attest only a complete live scheduler observation for the exact generation."""
+    try:
+        from aios.alerts import (
+            build_scheduler_recovery_evidence,
+            get_alert_store,
+        )
+
+        store = get_alert_store()
+        context = store.recovery_context("scheduler:runtime-unverified")
+        if context is None:
+            return
+        recovery = build_scheduler_recovery_evidence(context, status)
+        store.resolve_fingerprint(
+            "scheduler:runtime-unverified",
+            recovery=recovery,
+        )
+    except Exception as exc:
+        console.print(
+            "[yellow]Scheduler recovery attestation was not recorded:[/yellow] "
+            f"{exc}"
+        )
+
+
+def _record_daily_cycle_recovery(run_id: str) -> None:
+    """Resolve only the matching daily failure from an exact successful job row."""
+
+    try:
+        from aios.alerts import (
+            build_daily_cycle_recovery_evidence,
+            get_alert_store,
+        )
+        from aios.daily import DAILY_JOB_NAME
+
+        store = get_alert_store()
+        context = store.recovery_context("daily:us-cycle:failure")
+        if context is None:
+            return
+        job = store.latest_job(DAILY_JOB_NAME)
+        if job is None or job.run_id != run_id:
+            raise ValueError("latest daily job does not match the completed run")
+        target = date.fromisoformat(job.target_session)
+        readiness = assess_us_readiness(
+            target,
+            purpose="paper",
+            store=get_store(),
+            today=target,
+        )
+        latest_event = store.events(context.incident_id, limit=1)[0]
+        if (
+            latest_event.get("event_type") == "resolved"
+            and latest_event.get("proof_kind") == "daily_cycle_certified_v3"
+        ):
+            return
+        recovery = build_daily_cycle_recovery_evidence(
+            context,
+            job,
+            readiness,
+            assessed_at=datetime.now(UTC),
+        )
+        store.resolve_fingerprint(
+            "daily:us-cycle:failure",
+            recovery=recovery,
+        )
+    except Exception as exc:
+        console.print(
+            "[yellow]Daily-cycle recovery attestation was not recorded:[/yellow] "
+            f"{exc}"
+        )
+
+
+def _resolve_operational_alert(fingerprint: str) -> None:
+    """Compatibility no-op: evidence-free incident closure is disabled."""
+    del fingerprint
 
 
 @app.command()
@@ -352,7 +520,9 @@ def doctor() -> None:
 
     # Env
     console.print(f"[cyan]SEC User-Agent:[/cyan] {settings.sec_user_agent}")
-    console.print(f"[cyan]FRED API key set:[/cyan] {bool(settings.fred_api_key)}")
+    from aios.config import secret_value
+
+    console.print(f"[cyan]FRED API key set:[/cyan] {bool(secret_value(settings.fred_api_key))}")
     console.print(f"[cyan]DuckDB path:[/cyan] {settings.duckdb_path}")
 
     # Deps
@@ -465,9 +635,7 @@ def health(
                     except Exception as exc:
                         forward_ok = False
                         forward_issue_count = 1
-                        forward_detail = (
-                            f"blocked; forward evidence could not be verified ({exc})"
-                        )
+                        forward_detail = f"blocked; forward evidence could not be verified ({exc})"
     except duckdb.IOException as exc:
         from aios.alerts import Alert, AlertSeverity
 
@@ -563,10 +731,7 @@ def health(
     forward_blocked = forward_present and not forward_ok
     healthy = research_healthy and not forward_blocked
     if strict:
-        _resolve_operational_alert("health:execution")
-        if research_healthy:
-            _resolve_operational_alert("readiness:paper")
-        else:
+        if not research_healthy:
             from aios.alerts import Alert, AlertSeverity
 
             _emit_operational_alert(
@@ -601,8 +766,6 @@ def health(
                     },
                 )
             )
-        elif forward_present:
-            _resolve_operational_alert("forward:drift")
 
     if healthy:
         console.print(
@@ -678,8 +841,7 @@ def preflight(
         else:
             console.print(f"[red]Operator preflight failed safely:[/red] {exc}")
             console.print(
-                "No account, proposal, trial, incident, database, or broker state "
-                "was changed."
+                "No account, proposal, trial, incident, database, or broker state was changed."
             )
 
     requested = tuple(dict.fromkeys(required or ()))
@@ -718,9 +880,7 @@ def preflight(
     else:
         console.rule("[bold]AIOS operator preflight[/bold]")
         console.print(f"Checked at: {snapshot.checked_at}")
-        console.print(
-            f"Certified decision date: {snapshot.decision_date or 'unavailable'}"
-        )
+        console.print(f"Certified decision date: {snapshot.decision_date or 'unavailable'}")
         console.print(f"Registered proposal: {snapshot.proposal_path or 'none'}")
         table = Table()
         table.add_column("Capability")
@@ -772,16 +932,15 @@ def backup(
 ) -> None:
     """Create a verified backup of DuckDB and local paper JSON; secrets are excluded."""
     from aios.operations import create_local_backup
+    from aios.storage.store import checkpoint_database_for_backup
 
-    store = None
     try:
-        store = get_store()
-        store.execute("CHECKPOINT")
-        store.close()
+        database_path = _project_path(settings.duckdb_path)
+        checkpoint_database_for_backup(database_path)
         destination = _project_path(output) if output is not None else None
         result = create_local_backup(
             settings.project_root,
-            _project_path(settings.duckdb_path),
+            database_path,
             operations_database_path=_project_path(settings.operations_db_path),
             output=destination,
             application_version=__version__,
@@ -789,7 +948,7 @@ def backup(
     except duckdb.IOException as exc:
         from aios.alerts import Alert, AlertSeverity
 
-        _emit_operational_alert(
+        _emit_operational_alert_without_schema_migration(
             Alert(
                 code="backup_failed",
                 severity=AlertSeverity.CRITICAL,
@@ -808,7 +967,7 @@ def backup(
     except (OSError, RuntimeError, ValueError) as exc:
         from aios.alerts import Alert, AlertSeverity
 
-        _emit_operational_alert(
+        _emit_operational_alert_without_schema_migration(
             Alert(
                 code="backup_failed",
                 severity=AlertSeverity.CRITICAL,
@@ -821,17 +980,131 @@ def backup(
         )
         console.print(f"[red]Backup failed safely:[/red] {exc}")
         raise typer.Exit(code=1) from exc
-    finally:
-        if store is not None:
-            with suppress(Exception):
-                store.close()
-    _resolve_operational_alert("backup:local")
     console.print(f"[bold green]Verified backup created:[/bold green] {result.path}")
     console.print(
         f"{result.files} file(s), {result.bytes:,} bytes; manifest SHA-256 "
         f"{result.manifest_sha256}."
     )
     console.print("The backup excludes .env, logs, caches, and backtest artifacts.")
+
+
+@app.command("upgrade-local-state")
+def upgrade_local_state_command(
+    confirm: Annotated[
+        bool,
+        typer.Option(
+            "--confirm",
+            help="Confirm backup-first rehearsal and migration of local databases.",
+        ),
+    ] = False,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--backup-output",
+            help=(
+                "Explicit pre-upgrade directory under project backups/; must not "
+                "already exist."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Create an exact backup, rehearse migrations, then upgrade live state."""
+    if not confirm:
+        console.print(
+            "[red]Local state upgrade refused:[/red] review the release and rerun "
+            "with --confirm. No database or incident migration was opened."
+        )
+        raise typer.Exit(code=1)
+
+    from aios.local_state_upgrade import upgrade_local_state
+    from aios.maintenance import MaintenanceLockBusyError
+
+    try:
+        result = upgrade_local_state(
+            settings.project_root,
+            _project_path(settings.duckdb_path),
+            _project_path(settings.operations_db_path),
+            application_version=__version__,
+            output=_project_path(output) if output is not None else None,
+            confirm=True,
+        )
+    except MaintenanceLockBusyError as exc:
+        console.print(
+            f"[yellow]Another AIOS mutation workflow is already running.[/yellow] {exc}"
+        )
+        raise typer.Exit(code=75) from exc
+    except (OSError, RuntimeError, TypeError, ValueError, duckdb.Error) as exc:
+        console.print(f"[red]Local state upgrade failed:[/red] {exc}")
+        console.print(
+            "[yellow]Do not bypass the maintenance lease or retry through another "
+            "writer. Preserve any reported pre-upgrade backup for review.[/yellow]"
+        )
+        raise typer.Exit(code=1) from exc
+
+    console.print("[bold green]Local state upgrade verified.[/bold green]")
+    console.print(
+        f"Operations schema {result.operations_schema_before} → "
+        f"{result.operations_schema_after}; {result.fundamentals:,} fundamentals "
+        f"and {result.fundamental_versions:,} immutable versions."
+    )
+    console.print(f"Pre-upgrade backup: {result.backup.path}")
+    console.print(f"Upgrade journal: {result.journal_directory}")
+    console.print(f"Upgrade receipt: {result.receipt}")
+
+
+@app.command("upgrade-local-state-recover")
+def recover_local_state_upgrade_command(
+    journal: Annotated[
+        Path,
+        typer.Option(
+            "--journal",
+            help="Exact prepared upgrade-attempt journal directory.",
+        ),
+    ],
+    confirm: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-recovery",
+            help="Confirm deterministic reconciliation of the exact attempt.",
+        ),
+    ] = False,
+) -> None:
+    """Resume or verify one checksum-chained local state upgrade attempt."""
+    if not confirm:
+        console.print(
+            "[red]Local state upgrade recovery refused:[/red] rerun with "
+            "--confirm-recovery after reviewing the journal and backup."
+        )
+        raise typer.Exit(code=1)
+
+    from aios.local_state_upgrade import recover_local_state_upgrade
+    from aios.maintenance import MaintenanceLockBusyError
+
+    try:
+        result = recover_local_state_upgrade(
+            settings.project_root,
+            _project_path(journal),
+            _project_path(settings.duckdb_path),
+            _project_path(settings.operations_db_path),
+            confirm=True,
+        )
+    except MaintenanceLockBusyError as exc:
+        console.print(
+            f"[yellow]Another AIOS mutation workflow is already running.[/yellow] {exc}"
+        )
+        raise typer.Exit(code=75) from exc
+    except (OSError, RuntimeError, TypeError, ValueError, duckdb.Error) as exc:
+        console.print(f"[red]Local state upgrade recovery failed:[/red] {exc}")
+        console.print(
+            "[yellow]Preserve the exact backup and journal; do not start another "
+            "upgrade attempt.[/yellow]"
+        )
+        raise typer.Exit(code=1) from exc
+
+    console.print("[bold green]Local state upgrade recovery verified.[/bold green]")
+    console.print(f"Pre-upgrade backup: {result.backup.path}")
+    console.print(f"Upgrade journal: {result.journal_directory}")
+    console.print(f"Verified receipt: {result.receipt}")
 
 
 @app.command("verify-backup")
@@ -867,10 +1140,7 @@ def restore_drill(
     except (OSError, RuntimeError, ValueError) as exc:
         console.print(f"[red]Non-destructive restore drill failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc
-    console.print(
-        f"[bold green]Non-destructive restore drill passed:[/bold green] "
-        f"{result.source}"
-    )
+    console.print(f"[bold green]Non-destructive restore drill passed:[/bold green] {result.source}")
     console.print(
         f"{result.files} file(s), {result.bytes:,} bytes; "
         f"{result.raw_payloads} raw payload(s), "
@@ -954,8 +1224,6 @@ def review_universe_current() -> None:
     table.add_row("Unreviewed change announcements", str(result.relevant_release_count))
     table.add_row("Identity/component mismatches", str(result.identity_mismatch_count))
     console.print(table)
-    _resolve_operational_alert("universe:coverage:execution")
-
     if result.review_required:
         _emit_operational_alert(
             Alert(
@@ -979,7 +1247,6 @@ def review_universe_current() -> None:
         )
         raise typer.Exit(code=1)
 
-    _resolve_operational_alert("universe:coverage:review")
     if result.status == "up_to_date":
         console.print(
             "[bold green]Universe coverage is already current for the newest eligible "
@@ -1010,15 +1277,12 @@ def restore(
 ) -> None:
     """Restore database and paper state after an automatic pre-restore backup."""
     from aios.operations import restore_local_backup
-    from aios.storage.store import Store
+    from aios.storage.store import Store, checkpoint_database_for_backup
 
-    store = None
     restored_store = None
     try:
-        store = get_store()
-        store.execute("CHECKPOINT")
-        store.close()
         database_path = _project_path(settings.duckdb_path)
+        checkpoint_database_for_backup(database_path)
         result = restore_local_backup(
             _project_path(path),
             settings.project_root,
@@ -1028,9 +1292,7 @@ def restore(
             confirm=confirm_restore,
         )
         restored_store = Store(database_path)
-        failures = [
-            row for row in restored_store.data_quality_report() if row["status"] == "fail"
-        ]
+        failures = [row for row in restored_store.data_quality_report() if row["status"] == "fail"]
     except duckdb.IOException as exc:
         console.print(
             "[red]Restore could not lock the local database.[/red] Close the dashboard "
@@ -1041,10 +1303,9 @@ def restore(
         console.print(f"[red]Restore refused safely:[/red] {exc}")
         raise typer.Exit(code=1) from exc
     finally:
-        for connection in (restored_store, store):
-            if connection is not None:
-                with suppress(Exception):
-                    connection.close()
+        if restored_store is not None:
+            with suppress(Exception):
+                restored_store.close()
     console.print(f"[bold green]Restore completed from:[/bold green] {result.source}")
     console.print(f"Automatic pre-restore safety backup: {result.safety_backup}")
     if failures:
@@ -1056,6 +1317,14 @@ def restore(
     console.print(
         "[bold green]The restored database opened with zero hard validation failures.[/bold green]"
     )
+    if result.operations_rescan_required:
+        console.print(
+            "[bold yellow]Operations review evidence is now stale.[/bold yellow] "
+            "Inspect `aios anomaly-scan --preview`, then record the reviewed scan "
+            "before relying on current case status."
+        )
+        if result.operations_incident_id:
+            console.print(f"Tracked by operations incident: {result.operations_incident_id}")
 
 
 @app.command("scheduler-install")
@@ -1122,7 +1391,18 @@ def scheduler_install(
 
 
 @app.command("scheduler-status")
-def scheduler_status() -> None:
+def scheduler_status(
+    record_incidents: Annotated[
+        bool,
+        typer.Option(
+            "--record-incidents/--report-only",
+            help=(
+                "Explicitly reconcile the scheduler-runtime incident, or keep the "
+                "default report-only inspection."
+            ),
+        ),
+    ] = False,
+) -> None:
     """Show whether each supported local timer is installed and waiting."""
     from aios.scheduler import user_linger_status, user_scheduler_status
 
@@ -1154,15 +1434,9 @@ def scheduler_status() -> None:
                 else "not run yet"
             )
         else:
-            last_result = (
-                f"failed ({state['service_result']}, exit {state['exit_status']})"
-            )
+            last_result = f"failed ({state['service_result']}, exit {state['exit_status']})"
         last_event = state.get("last_run", state["last_trigger"])
-        last_run = (
-            f"{last_result}; {last_event}"
-            if last_event != "never"
-            else last_result
-        )
+        last_run = f"{last_result}; {last_event}" if last_event != "never" else last_result
         table.add_row(
             timer,
             "yes" if state["enabled"] else "no",
@@ -1178,33 +1452,40 @@ def scheduler_status() -> None:
         console.print("Keep running after desktop logout: [yellow]disabled[/yellow]")
     else:
         console.print("Keep running after desktop logout: [yellow]not verified[/yellow]")
-    runtime_unverified = any(
-        not state.get("runtime_verified", True) for state in status.values()
+    from aios.scheduler import TIMER_NAMES
+
+    runtime_unverified = set(status) != set(TIMER_NAMES) or any(
+        state.get("runtime_verified") is not True for state in status.values()
     )
     if runtime_unverified:
-        from aios.alerts import Alert, AlertSeverity
+        if record_incidents:
+            from aios.alerts import Alert, AlertSeverity
 
-        _emit_operational_alert(
-            Alert(
-                code="scheduler_runtime_unverified",
-                severity=AlertSeverity.WARNING,
-                title="Local scheduler runtime could not be verified",
-                body=(
-                    "Installed timer files are visible, but the user service manager "
-                    "did not answer."
-                ),
-                dedup_key="scheduler:runtime-unverified",
-                source_job="aios scheduler-status",
-                payload={"timers": sorted(status)},
+            _emit_operational_alert(
+                Alert(
+                    code="scheduler_runtime_unverified",
+                    severity=AlertSeverity.WARNING,
+                    title="Local scheduler runtime could not be verified",
+                    body=(
+                        "Installed timer files are visible, but the user service manager "
+                        "did not answer."
+                    ),
+                    dedup_key="scheduler:runtime-unverified",
+                    source_job="aios scheduler-status",
+                    payload={"timers": sorted(status)},
+                )
             )
-        )
         console.print(
             "[yellow]The systemd user manager did not answer within 5 seconds.[/yellow] "
             "Installed/enabled files are shown, but live waiting and run times could not "
             "be verified. Try again from your normal logged-in terminal."
         )
-    else:
-        _resolve_operational_alert("scheduler:runtime-unverified")
+    elif record_incidents:
+        _record_scheduler_runtime_recovery(status)
+    if not record_incidents:
+        console.print(
+            "[dim]Report-only inspection: the operating-incident lifecycle was not changed.[/dim]"
+        )
 
 
 @app.command("scheduler-pause")
@@ -1249,9 +1530,7 @@ def scheduler_remove(
     except (OSError, RuntimeError, ValueError) as exc:
         console.print(f"[red]Scheduler removal refused safely:[/red] {exc}")
         raise typer.Exit(code=1) from exc
-    console.print(
-        f"[green]Local AIOS scheduler removed:[/green] {len(removed)} managed file(s)."
-    )
+    console.print(f"[green]Local AIOS scheduler removed:[/green] {len(removed)} managed file(s).")
 
 
 @app.command("alerts")
@@ -1263,6 +1542,16 @@ def alerts_command(
             help="Show only open or acknowledged incidents, or include resolved history.",
         ),
     ] = False,
+    blocking: Annotated[
+        bool,
+        typer.Option(
+            "--blocking",
+            help=(
+                "Show exact operational blockers, including resolved incidents "
+                "without a valid current-generation proof."
+            ),
+        ),
+    ] = False,
     limit: Annotated[
         int,
         typer.Option("--limit", min=1, max=1000, help="Maximum incidents to display."),
@@ -1272,8 +1561,11 @@ def alerts_command(
     from aios.alerts import get_alert_store
 
     try:
+        if unresolved and blocking:
+            raise ValueError("--unresolved and --blocking cannot be combined")
         incidents = get_alert_store(read_only=True).list(
             unresolved_only=unresolved,
+            blocking_only=blocking,
             limit=limit,
         )
     except (OSError, RuntimeError, ValueError) as exc:
@@ -1283,7 +1575,8 @@ def alerts_command(
     table.add_column("incident ref", min_width=12, no_wrap=True)
     table.add_column("severity")
     table.add_column("state")
-    table.add_column("last seen", no_wrap=True)
+    table.add_column("resolution proof")
+    table.add_column("last seen UTC", no_wrap=True)
     table.add_column("count", justify="right")
     table.add_column("summary")
     for incident in incidents:
@@ -1291,6 +1584,7 @@ def alerts_command(
             incident.incident_id[:12],
             incident.severity,
             incident.state,
+            incident.resolution_proof_status,
             incident.last_seen_at[:16].replace("T", " "),
             str(incident.occurrence_count),
             incident.title,
@@ -1319,18 +1613,62 @@ def alert_show(
     console.print(f"Incident: {incident.incident_id}")
     console.print(f"Code: {incident.code}")
     console.print(f"Severity/state: {incident.severity} / {incident.state}")
+    console.print(f"Resolution proof: {incident.resolution_proof_status}")
+    console.print(
+        "Operational blocker: "
+        + ("yes" if incident.operationally_blocking else "no")
+    )
     console.print(f"Source: {incident.source_job}")
     console.print(f"First/last seen: {incident.first_seen_at} / {incident.last_seen_at}")
     console.print(f"Occurrences: {incident.occurrence_count}")
+    console.print(f"Evidence SHA-256: {incident.evidence_sha256}")
     console.print(f"Detail: {incident.body}")
     console.print("Structured evidence:")
     console.print_json(json.dumps(incident.payload, sort_keys=True))
     event_table = Table(title="Lifecycle events")
     event_table.add_column("time")
     event_table.add_column("event")
+    event_table.add_column("actor")
+    event_table.add_column("outcome")
+    event_table.add_column("note")
     for event in events:
-        event_table.add_row(event["created_at"], event["event_type"])
+        event_table.add_row(
+            event["created_at"],
+            event["event_type"],
+            str(event.get("actor") or event.get("producer") or ""),
+            str(
+                event.get("resolution_outcome")
+                or event.get("proof_kind")
+                or ""
+            ),
+            str(event.get("note") or event.get("proof_error") or ""),
+        )
     console.print(event_table)
+    if (
+        incident.fingerprint == "scheduler:runtime-unverified"
+        and incident.resolution_proof_status in {"legacy_unproven", "invalid"}
+    ):
+        console.print(
+            "[yellow]This scheduler incident still blocks unattended operation.[/yellow] "
+            "Run `aios scheduler-status --record-incidents` from your normal "
+            "logged-in session so every managed timer can be verified live."
+        )
+    if incident.resolution_proof_status == "legacy_unproven":
+        console.print(
+            "After reviewing the historical resolution evidence, append a manual "
+            "proof with `aios alert-attest-resolution` and this exact evidence "
+            "SHA-256. The incident projection will remain unchanged."
+        )
+    elif incident.resolution_proof_status == "invalid":
+        console.print(
+            "[red]This resolution proof is invalid and remains a forensic "
+            "blocker.[/red] Manual attestation is refused."
+        )
+    if incident.state != "resolved":
+        console.print(
+            "Use this exact evidence SHA-256 with `aios alert-ack` or "
+            "`aios alert-resolve`; stale evidence is refused."
+        )
 
 
 @app.command("alert-ack")
@@ -1338,12 +1676,41 @@ def alert_ack(
     incident_id: Annotated[
         str, typer.Argument(help="Unresolved incident reference to acknowledge.")
     ],
+    actor: Annotated[
+        str,
+        typer.Option(
+            "--actor",
+            "--owner",
+            help="Human actor or owner responsible for this incident review.",
+        ),
+    ],
+    note: Annotated[
+        str,
+        typer.Option("--note", help="Required audit note describing the review."),
+    ],
+    evidence_sha256: Annotated[
+        str,
+        typer.Option(
+            "--evidence-sha256",
+            help="Exact current evidence hash shown by `aios alert-show`.",
+        ),
+    ],
 ) -> None:
     """Record that an operator has reviewed an unresolved incident."""
-    from aios.alerts import get_alert_store
-
     try:
-        incident = get_alert_store().acknowledge(incident_id)
+        actor, note, evidence_sha256 = _incident_action_cli_arguments(
+            actor,
+            note,
+            evidence_sha256,
+        )
+        from aios.alerts import get_alert_store
+
+        incident = get_alert_store().acknowledge(
+            incident_id,
+            actor=actor,
+            note=note,
+            expected_evidence_sha256=evidence_sha256,
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         console.print(f"[red]Incident acknowledgement refused:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -1352,19 +1719,797 @@ def alert_ack(
 
 @app.command("alert-resolve")
 def alert_resolve(
-    incident_id: Annotated[
-        str, typer.Argument(help="Incident reference to resolve explicitly.")
+    incident_id: Annotated[str, typer.Argument(help="Incident reference to resolve explicitly.")],
+    actor: Annotated[
+        str,
+        typer.Option(
+            "--actor",
+            "--owner",
+            help="Human actor or owner responsible for the resolution.",
+        ),
+    ],
+    note: Annotated[
+        str,
+        typer.Option("--note", help="Required evidence-based resolution note."),
+    ],
+    outcome: Annotated[
+        str,
+        typer.Option(
+            "--outcome",
+            help="Explicit manual outcome: verified_recovery or false_positive.",
+        ),
+    ],
+    evidence_sha256: Annotated[
+        str,
+        typer.Option(
+            "--evidence-sha256",
+            help="Exact current evidence hash shown by `aios alert-show`.",
+        ),
     ],
 ) -> None:
     """Resolve one incident while retaining its history."""
-    from aios.alerts import get_alert_store
-
     try:
-        incident = get_alert_store().resolve(incident_id)
+        actor, note, evidence_sha256 = _incident_action_cli_arguments(
+            actor,
+            note,
+            evidence_sha256,
+        )
+        outcome = _incident_resolution_outcome_cli(outcome)
+        from aios.alerts import get_alert_store
+
+        incident = get_alert_store().resolve(
+            incident_id,
+            actor=actor,
+            note=note,
+            outcome=outcome,
+            expected_evidence_sha256=evidence_sha256,
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         console.print(f"[red]Incident resolution refused:[/red] {exc}")
         raise typer.Exit(code=1) from exc
     console.print(f"[green]Incident resolved:[/green] {incident.incident_id}")
+
+
+@app.command("alert-attest-resolution")
+def alert_attest_resolution(
+    incident_id: Annotated[
+        str,
+        typer.Argument(help="Legacy resolved incident reference to attest."),
+    ],
+    actor: Annotated[
+        str,
+        typer.Option(
+            "--actor",
+            "--owner",
+            help="Human actor responsible for the historical resolution review.",
+        ),
+    ],
+    note: Annotated[
+        str,
+        typer.Option(
+            "--note",
+            help="Required evidence-based note for the legacy resolution.",
+        ),
+    ],
+    outcome: Annotated[
+        str,
+        typer.Option(
+            "--outcome",
+            help="Explicit manual outcome: verified_recovery or false_positive.",
+        ),
+    ],
+    evidence_sha256: Annotated[
+        str,
+        typer.Option(
+            "--evidence-sha256",
+            help="Exact current evidence hash shown by `aios alert-show`.",
+        ),
+    ],
+) -> None:
+    """Append proof to a legacy resolution without changing its projection."""
+    try:
+        actor, note, evidence_sha256 = _incident_action_cli_arguments(
+            actor,
+            note,
+            evidence_sha256,
+        )
+        outcome = _incident_resolution_outcome_cli(outcome)
+        from aios.alerts import get_alert_store
+
+        incident = get_alert_store().attest_legacy_resolution(
+            incident_id,
+            actor=actor,
+            note=note,
+            outcome=outcome,
+            expected_evidence_sha256=evidence_sha256,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Incident resolution attestation refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"[green]Legacy incident resolution attested:[/green] "
+        f"{incident.incident_id}"
+    )
+
+
+@app.command("alert-reconcile-fundamentals")
+def alert_reconcile_fundamentals(
+    incident_id: Annotated[
+        str,
+        typer.Argument(help="Partial fundamentals incident reference."),
+    ],
+    evidence_sha256: Annotated[
+        str,
+        typer.Option(
+            "--evidence-sha256",
+            help="Exact current evidence hash shown by `aios alert-show`.",
+        ),
+    ],
+    record: Annotated[
+        bool,
+        typer.Option(
+            "--record/--preview",
+            help="Append the producer proof, or validate it read-only.",
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the reconciliation proof as JSON."),
+    ] = False,
+) -> None:
+    """Reconcile a partial refresh only after every named case is resolved."""
+
+    from aios.alerts import get_alert_store
+
+    try:
+        evidence_sha256 = _incident_evidence_cli_argument(evidence_sha256)
+        store = get_alert_store(read_only=not record)
+        recovery = store.fundamentals_review_recovery(
+            incident_id,
+            expected_evidence_sha256=evidence_sha256,
+        )
+        incident = (
+            store.resolve_fingerprint(
+                recovery.fingerprint,
+                recovery=recovery,
+            )
+            if record
+            else None
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Fundamentals reconciliation refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    payload = {
+        "schema_version": "fundamentals-review-reconciliation.v1",
+        "status": "recorded" if record else "preview",
+        "recorded": record,
+        "incident_id": recovery.incident_id,
+        "fingerprint": recovery.fingerprint,
+        "generation_event_id": recovery.generation_event_id,
+        "expected_evidence_sha256": recovery.expected_evidence_sha256,
+        "observation": recovery.observation,
+        "result": (
+            {
+                "state": incident.state,
+                "resolution_proof_status": incident.resolution_proof_status,
+                "operationally_blocking": incident.operationally_blocking,
+            }
+            if incident is not None
+            else None
+        ),
+    }
+    if json_output:
+        console.print_json(json.dumps(payload, sort_keys=True))
+        return
+    if record:
+        console.print(
+            f"[green]Fundamentals incident reconciled:[/green] "
+            f"{recovery.incident_id}"
+        )
+    else:
+        console.print(
+            f"[green]Fundamentals reconciliation is eligible:[/green] "
+            f"{recovery.incident_id}"
+        )
+        console.print("No incident, research, readiness, paper, or broker state changed.")
+
+
+@app.command("anomaly-scan")
+def anomaly_scan(
+    as_of: Annotated[
+        datetime | None,
+        typer.Option(
+            "--as-of",
+            formats=["%Y-%m-%d"],
+            help=("Reviewed comparison date. Defaults to the latest certified research close."),
+        ),
+    ] = None,
+    record: Annotated[
+        bool,
+        typer.Option(
+            "--record/--preview",
+            help=(
+                "Persist deduplicated review cases, or only show the complete "
+                "source-bound comparison."
+            ),
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit one machine-readable scan report."),
+    ] = False,
+) -> None:
+    """Detect governed data-quality cases without repairing research data."""
+    from dataclasses import asdict
+
+    from aios.alerts import get_alert_store
+    from aios.anomalies import scan_sec_fundamental_coverage
+    from aios.maintenance import (
+        MaintenanceLockBusyError,
+        project_maintenance_lock,
+    )
+
+    try:
+        operation_guard = (
+            project_maintenance_lock(
+                settings.project_root,
+                operation="anomaly-scan",
+            )
+            if record
+            else nullcontext()
+        )
+        with operation_guard:
+            with store_scope(read_only=True) as store:
+                decision_date = as_of.date() if as_of is not None else None
+                if decision_date is None:
+                    readiness = assess_us_readiness(
+                        purpose="historical_research",
+                        store=store,
+                    )
+                    if readiness.certified_research_through is None:
+                        raise ValueError(
+                            "no certified research close is available; pass --as-of "
+                            "only after the reviewed universe is initialized"
+                        )
+                    decision_date = date.fromisoformat(readiness.certified_research_through)
+                scan = scan_sec_fundamental_coverage(
+                    store=store,
+                    as_of=decision_date,
+                    project_root=settings.project_root,
+                )
+            cases = get_alert_store().record_anomaly_scan(scan) if record else ()
+    except MaintenanceLockBusyError as exc:
+        if json_output:
+            console.print_json(
+                json.dumps(
+                    {
+                        "schema_version": "data-quality-anomaly-scan.v1",
+                        "status": "withheld",
+                        "recorded": False,
+                        "error": "another AIOS mutation workflow is running",
+                    },
+                    sort_keys=True,
+                )
+            )
+        else:
+            console.print(
+                f"[yellow]Another AIOS mutation workflow is already running.[/yellow] {exc}"
+            )
+        raise typer.Exit(code=75) from exc
+    except (OSError, RuntimeError, ValueError, duckdb.Error) as exc:
+        if json_output:
+            console.print_json(
+                json.dumps(
+                    {
+                        "schema_version": "data-quality-anomaly-scan.v1",
+                        "status": "withheld",
+                        "recorded": False,
+                        "error": str(exc),
+                    },
+                    sort_keys=True,
+                )
+            )
+        else:
+            console.print(f"[red]Data-quality scan withheld safely:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    payload = {
+        "schema_version": "data-quality-anomaly-scan.v1",
+        "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "status": "recorded" if record else "preview",
+        "recorded": record,
+        "scan": {
+            "scan_id": scan.scan_id,
+            "rule_bundle_version": scan.rule_bundle_version,
+            "executed_rules": list(scan.executed_rules),
+            "scope": scan.scope,
+            "source_boundary_sha256": scan.source_boundary_sha256,
+            "source_boundary_at": scan.source_boundary_at,
+            "observation_count": len(scan.observations),
+            "evidence": scan.evidence,
+            "observations": [asdict(row) for row in scan.observations],
+        },
+        "cases": [asdict(row) for row in cases],
+        "safety": {
+            "research_data_changed": False,
+            "readiness_overridden": False,
+            "paper_state_changed": False,
+            "broker_action": False,
+        },
+    }
+    if json_output:
+        console.print_json(json.dumps(payload, default=str, sort_keys=True))
+        return
+
+    mode = "Recorded" if record else "Preview"
+    console.rule(f"[bold]{mode} data-quality review scan[/bold]")
+    console.print(f"Reviewed comparison date: {decision_date.isoformat()}")
+    console.print(f"Scan: {scan.scan_id}")
+    console.print(
+        "SEC fundamentals coverage: "
+        f"{scan.evidence['covered_issuers']}/{scan.evidence['reviewed_issuers']} "
+        f"({scan.evidence['coverage_rate']:.1%})"
+    )
+    console.print(
+        f"Reviewed securities / issuers: {scan.evidence['reviewed_members']} / "
+        f"{scan.evidence['reviewed_issuers']}"
+    )
+    table = Table(title="Evidence-bound review findings")
+    table.add_column("severity")
+    table.add_column("company")
+    table.add_column("subject")
+    table.add_column("confidence")
+    table.add_column("summary")
+    for observation in scan.observations:
+        issuer = observation.evidence.get("issuer", {})
+        table.add_row(
+            observation.severity,
+            str(issuer.get("canonical_ticker") or observation.subject_id),
+            observation.subject_id,
+            observation.confidence,
+            observation.title,
+        )
+    console.print(table)
+    if not scan.observations:
+        console.print("[green]No SEC fundamentals coverage cases were detected.[/green]")
+    elif record:
+        console.print(
+            f"[yellow]{len(cases)} governed review case(s) reconciled.[/yellow] "
+            "No research value was changed."
+        )
+    else:
+        console.print(
+            "Preview only. Re-run with `--record` to reconcile the independent review ledger."
+        )
+    console.print(
+        "The scan never repairs data, changes readiness, records a paper fill, "
+        "or contacts a broker."
+    )
+
+
+@app.command("companyfacts-v3-plan")
+def companyfacts_v3_plan(
+    as_of: Annotated[
+        datetime,
+        typer.Option(
+            "--as-of",
+            formats=["%Y-%m-%d"],
+            help="Decision date bounding reviewed identities and captured evidence.",
+        ),
+    ],
+    issuer_ids: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--issuer-id",
+            help="Optional reviewed issuer_id; repeat to restrict the plan.",
+        ),
+    ] = None,
+    write_plan: Annotated[
+        bool,
+        typer.Option(
+            "--write-plan",
+            help="Publish the content-addressed review plan under data/reports.",
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit one machine-readable result."),
+    ] = False,
+) -> None:
+    """Plan a Company Facts v3 replay without activation or provider access."""
+    from aios.companyfacts_replay import (
+        persist_companyfacts_v3_plan,
+        preview_companyfacts_v3_replay,
+    )
+
+    try:
+        decision_date = as_of.date()
+        with store_scope(read_only=True) as store:
+            preview = preview_companyfacts_v3_replay(
+                settings.project_root,
+                store=store,
+                as_of=decision_date,
+                issuer_ids=issuer_ids,
+            )
+        published = (
+            persist_companyfacts_v3_plan(settings.project_root, preview)
+            if write_plan
+            else None
+        )
+    except (OSError, RuntimeError, TypeError, ValueError, duckdb.Error) as exc:
+        if json_output:
+            console.print_json(
+                json.dumps(
+                    {
+                        "schema_version": "companyfacts-v3-plan-cli.v1",
+                        "status": "withheld",
+                        "error": str(exc),
+                        "safety": {
+                            "database_mutation": False,
+                            "provider_fetch": False,
+                            "paper_state_mutation": False,
+                            "broker_action": False,
+                            "activation": False,
+                        },
+                    },
+                    sort_keys=True,
+                )
+            )
+        else:
+            console.print(f"[red]Company Facts replay plan withheld:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    envelope = {
+        "schema_version": "companyfacts-v3-plan-cli.v1",
+        "status": "published" if published is not None else "preview",
+        "plan": preview.to_plan_envelope(),
+        "publication": {
+            "written": published is not None,
+            "path": (
+                published.relative_to(settings.project_root).as_posix()
+                if published is not None
+                else None
+            ),
+        },
+        "safety": {
+            "database_mutation": False,
+            "provider_fetch": False,
+            "paper_state_mutation": False,
+            "broker_action": False,
+            "activation": False,
+        },
+    }
+    if json_output:
+        console.print_json(json.dumps(envelope, sort_keys=True))
+        return
+
+    plan = preview.plan
+    summary = plan["summary"]
+    console.rule("[bold]Company Facts v3 replay plan[/bold]")
+    console.print(f"Decision evidence through: {decision_date.isoformat()}")
+    console.print(f"Plan SHA-256: {preview.plan_sha256}")
+    console.print(
+        "Eligible / ineligible issuers: "
+        f"{summary['eligible_issuers']} / {summary['ineligible_issuers']}"
+    )
+    console.print(
+        "Excluded source observations: "
+        f"{summary['excluded_source_observations']}"
+    )
+    if published is not None:
+        console.print(
+            "[green]Review plan published:[/green] "
+            f"{published.relative_to(settings.project_root)}"
+        )
+    else:
+        console.print("Preview only. Use --write-plan to publish the exact plan.")
+    console.print(
+        "[yellow]Activation is unavailable.[/yellow] No database, provider, "
+        "paper-account, or broker state was changed."
+    )
+
+
+@app.command("anomalies")
+def anomalies_command(
+    unresolved: Annotated[
+        bool,
+        typer.Option(
+            "--unresolved/--all",
+            help="Show unresolved review cases, or include resolved history.",
+        ),
+    ] = True,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", min=1, max=1000, help="Maximum cases to display."),
+    ] = 100,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the case list as JSON."),
+    ] = False,
+) -> None:
+    """Show governed data-quality review cases without changing their state."""
+    from dataclasses import asdict
+
+    from aios.alerts import get_alert_store
+
+    try:
+        store = get_alert_store(read_only=True)
+        cases = store.anomaly_cases(unresolved_only=unresolved, limit=limit)
+        summary = store.anomaly_summary()
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Data-quality case history is unavailable:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if json_output:
+        console.print_json(
+            json.dumps(
+                {
+                    "schema_version": "data-quality-anomaly-cases.v1",
+                    "summary": summary,
+                    "cases": [asdict(row) for row in cases],
+                },
+                default=str,
+                sort_keys=True,
+            )
+        )
+        return
+
+    table = Table(title="AIOS data-quality review cases")
+    table.add_column("case ref", min_width=12, no_wrap=True)
+    table.add_column("severity")
+    table.add_column("state")
+    table.add_column("subject")
+    table.add_column("owner")
+    table.add_column("last seen", no_wrap=True)
+    table.add_column("summary")
+    for case in cases:
+        table.add_row(
+            case.case_id[:12],
+            case.severity,
+            case.state,
+            case.subject_id,
+            case.owner or "Unassigned",
+            case.last_seen_at[:16].replace("T", " "),
+            case.title,
+        )
+    console.print(table)
+    if not cases:
+        console.print("No matching data-quality review cases are recorded.")
+    console.print("Use `aios anomaly-show CASE_REF` for source-bound evidence.")
+
+
+@app.command("anomaly-show")
+def anomaly_show(
+    case_id: Annotated[
+        str,
+        typer.Argument(help="Case reference shown by `aios anomalies`."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit case evidence and events as JSON."),
+    ] = False,
+) -> None:
+    """Show one anomaly case and its append-only review history."""
+    from dataclasses import asdict
+
+    from aios.alerts import get_alert_store
+
+    try:
+        store = get_alert_store(read_only=True)
+        case = store.anomaly_case(case_id)
+        events = store.anomaly_case_events(case_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Data-quality case detail is unavailable:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if json_output:
+        console.print_json(
+            json.dumps(
+                {
+                    "schema_version": "data-quality-anomaly-case.v1",
+                    "case": asdict(case),
+                    "events": events,
+                },
+                default=str,
+                sort_keys=True,
+            )
+        )
+        return
+
+    console.rule(f"[bold]{case.title}[/bold]")
+    console.print(f"Case: {case.case_id}")
+    console.print(f"Rule: {case.rule_id}@{case.rule_version}")
+    console.print(f"Severity/confidence: {case.severity} / {case.confidence}")
+    console.print(f"State/owner: {case.state} / {case.owner or 'Unassigned'}")
+    console.print(f"Subject: {case.subject_type} / {case.subject_id}")
+    console.print(f"First/last seen: {case.first_seen_at} / {case.last_seen_at}")
+    console.print(f"Occurrences: {case.occurrence_count}")
+    console.print(f"Evidence SHA-256: {case.evidence_sha256}")
+    console.print(f"Detail: {case.summary}")
+    console.print("Old value:")
+    console.print_json(json.dumps(case.old_value, sort_keys=True))
+    console.print("New value:")
+    console.print_json(json.dumps(case.new_value, sort_keys=True))
+    console.print("Source-bound evidence:")
+    console.print_json(json.dumps(case.evidence, sort_keys=True))
+    console.print("Suggested checks:")
+    for check in case.suggested_checks:
+        console.print(f"  • {check}")
+    event_table = Table(title="Review lifecycle")
+    event_table.add_column("time")
+    event_table.add_column("event")
+    event_table.add_column("actor")
+    event_table.add_column("note")
+    for event in events:
+        event_table.add_row(
+            str(event.get("created_at") or ""),
+            str(event.get("event_type") or ""),
+            str(event.get("owner") or ""),
+            str(event.get("note") or ""),
+        )
+    console.print(event_table)
+    if case.state in {"open", "acknowledged"}:
+        console.print(
+            "Use this exact evidence SHA-256 with `aios anomaly-ack` or "
+            "`aios anomaly-resolve`; stale evidence is refused."
+        )
+
+
+@app.command("anomaly-acceptance-check")
+def anomaly_acceptance_check(
+    case_id: Annotated[
+        str,
+        typer.Argument(help="Unresolved data-quality case reference."),
+    ],
+    evidence_sha256: Annotated[
+        str,
+        typer.Option(
+            "--evidence-sha256",
+            help="Exact evidence hash shown by `aios anomaly-show`.",
+        ),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the validated contract as JSON."),
+    ] = False,
+) -> None:
+    """Validate accepted-missingness evidence without changing case state."""
+
+    from aios.alerts import get_alert_store
+
+    try:
+        contract = get_alert_store(read_only=True).review_anomaly_acceptance(
+            case_id,
+            expected_evidence_sha256=evidence_sha256,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Case acceptance check refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if json_output:
+        console.print_json(json.dumps(contract, sort_keys=True))
+        return
+    console.print(
+        "[green]Accepted-missingness contract verified:[/green] "
+        f"{contract['contract_id']}"
+    )
+    console.print(
+        "Coverage, readiness, score state, and predecessor facts remain unchanged."
+    )
+
+
+@app.command("anomaly-ack")
+def anomaly_ack(
+    case_id: Annotated[
+        str,
+        typer.Argument(help="Unresolved data-quality case reference."),
+    ],
+    owner: Annotated[
+        str,
+        typer.Option("--owner", help="Human owner responsible for this review."),
+    ],
+    note: Annotated[
+        str,
+        typer.Option("--note", help="Required audit note describing the first review."),
+    ],
+    evidence_sha256: Annotated[
+        str,
+        typer.Option(
+            "--evidence-sha256",
+            help="Exact evidence hash shown by `aios anomaly-show`.",
+        ),
+    ],
+) -> None:
+    """Assign and acknowledge one review case without changing research data."""
+    from aios.alerts import get_alert_store
+
+    try:
+        case = get_alert_store().acknowledge_anomaly(
+            case_id,
+            owner=owner,
+            note=note,
+            expected_evidence_sha256=evidence_sha256,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Case acknowledgement refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Data-quality case acknowledged:[/green] {case.case_id} ({case.owner})")
+
+
+@app.command("anomaly-resolve")
+def anomaly_resolve(
+    case_id: Annotated[
+        str,
+        typer.Argument(help="Data-quality case reference to disposition."),
+    ],
+    outcome: Annotated[
+        str,
+        typer.Option(
+            "--outcome",
+            help=("accepted, source_corrected, mapping_corrected, false_positive, or deferred."),
+        ),
+    ],
+    note: Annotated[
+        str,
+        typer.Option("--note", help="Required evidence-based resolution note."),
+    ],
+    evidence_sha256: Annotated[
+        str,
+        typer.Option(
+            "--evidence-sha256",
+            help="Exact evidence hash shown by `aios anomaly-show`.",
+        ),
+    ],
+    owner: Annotated[
+        str | None,
+        typer.Option(
+            "--owner",
+            help="Resolution owner; optional only when the case is already assigned.",
+        ),
+    ] = None,
+    next_review: Annotated[
+        datetime | None,
+        typer.Option(
+            "--next-review",
+            formats=["%Y-%m-%d"],
+            help="Required future review date when outcome is deferred.",
+        ),
+    ] = None,
+    verification_scan: Annotated[
+        str | None,
+        typer.Option(
+            "--verification-scan",
+            help=(
+                "Later same-scope scan with a distinct non-earlier source "
+                "boundary, exact-rule execution, fingerprint absence, and "
+                "source-provenanced clearance; required for source or mapping "
+                "correction."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Record one explicit disposition; never repair or waive a data gate."""
+    from aios.alerts import get_alert_store
+
+    try:
+        case = get_alert_store().resolve_anomaly(
+            case_id,
+            outcome=outcome,
+            note=note,
+            expected_evidence_sha256=evidence_sha256,
+            owner=owner,
+            next_review_at=(
+                f"{next_review.date().isoformat()}T00:00:00Z" if next_review is not None else None
+            ),
+            verification_scan_id=verification_scan,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Case disposition refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    state_label = "deferred" if case.state == "deferred" else "resolved"
+    console.print(
+        f"[green]Data-quality case {state_label}:[/green] {case.case_id} "
+        f"({case.resolution_outcome})"
+    )
+    console.print("Research data and readiness gates were not changed.")
 
 
 @app.command("alert-test")
@@ -1386,7 +2531,13 @@ def alert_test() -> None:
                 notify=False,
             )
         )
-        store.resolve(incident.incident_id)
+        store.resolve(
+            incident.incident_id,
+            actor="aios alert-test",
+            note="Resolve the bounded local lifecycle test incident.",
+            outcome="verified_recovery",
+            expected_evidence_sha256=incident.evidence_sha256,
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         console.print(f"[red]Local alert test failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -1478,9 +2629,7 @@ def notifications_command(
     console.print(table)
     if not messages:
         console.print("No matching notification messages are recorded.")
-    console.print(
-        "Use `aios notification-show NOTIFICATION_REF` for message and attempt history."
-    )
+    console.print("Use `aios notification-show NOTIFICATION_REF` for message and attempt history.")
 
 
 @app.command("notification-show")
@@ -1504,8 +2653,7 @@ def notification_show(
     console.print(f"Notification: {message.notification_id}")
     console.print(f"Incident: {message.incident_id or 'none (local test)'}")
     console.print(
-        f"Event/severity/state: {message.event_type} / "
-        f"{message.severity} / {message.state}"
+        f"Event/severity/state: {message.event_type} / {message.severity} / {message.state}"
     )
     console.print(f"Source: {message.source_job}")
     console.print(f"Created/available: {message.created_at} / {message.available_at}")
@@ -1573,8 +2721,7 @@ def notification_test() -> None:
         console.print("[red]Local notification test did not reach a delivered state.[/red]")
         raise typer.Exit(code=1)
     console.print(
-        f"[bold green]Local notification lifecycle passed:[/bold green] "
-        f"{message.notification_id}"
+        f"[bold green]Local notification lifecycle passed:[/bold green] {message.notification_id}"
     )
     console.print(
         "The message was enqueued, leased, attempted, and completed locally. "
@@ -1628,15 +2775,8 @@ def email_status() -> None:
         and route is not None
         and route.config_fingerprint == config.fingerprint
     )
-    tested = (
-        config is not None
-        and _successful_email_test_exists(store, config.fingerprint)
-    )
-    configuration_label = (
-        "[green]complete[/green]"
-        if configured
-        else "[yellow]incomplete[/yellow]"
-    )
+    tested = config is not None and _successful_email_test_exists(store, config.fingerprint)
+    configuration_label = "[green]complete[/green]" if configured else "[yellow]incomplete[/yellow]"
     console.print(f"SMTP configuration: {configuration_label}")
     console.print(config_detail)
     console.print(
@@ -1648,9 +2788,7 @@ def email_status() -> None:
             "[green]enabled[/green]"
             if timer_enabled and timer_verified
             else (
-                "[yellow]runtime not verified[/yellow]"
-                if timer_enabled
-                else "[yellow]off[/yellow]"
+                "[yellow]runtime not verified[/yellow]" if timer_enabled else "[yellow]off[/yellow]"
             )
         )
     )
@@ -1704,9 +2842,7 @@ def email_test(
                 event_type="test",
                 severity=AlertSeverity.INFO,
                 title="AIOS external email receipt test",
-                body=(
-                    "This is a deliberate delivery test. It does not enable future alerts."
-                ),
+                body=("This is a deliberate delivery test. It does not enable future alerts."),
                 source_job="aios email-test",
                 payload={
                     "config_fingerprint": config.fingerprint,
@@ -1753,8 +2889,7 @@ def email_test(
         console.print(f"[red]Email receipt test was refused safely:[/red] {exc}")
         raise typer.Exit(code=1) from exc
     console.print(
-        f"[bold green]External email receipt accepted:[/bold green] "
-        f"{message.notification_id}"
+        f"[bold green]External email receipt accepted:[/bold green] {message.notification_id}"
     )
     console.print(
         "Future incident email is still off. Confirm receipt in your mailbox, then run "
@@ -1783,8 +2918,7 @@ def email_enable(
 
     if not confirm_enable:
         console.print(
-            "[yellow]Email remains off.[/yellow] Enabling future alerts requires "
-            "--confirm-enable."
+            "[yellow]Email remains off.[/yellow] Enabling future alerts requires --confirm-enable."
         )
         raise typer.Exit(code=1)
     try:
@@ -1809,9 +2943,7 @@ def email_enable(
     except (OSError, RuntimeError, ValueError) as exc:
         console.print(f"[red]Email enable was refused safely:[/red] {exc}")
         raise typer.Exit(code=1) from exc
-    console.print(
-        f"[bold green]Future incident email enabled:[/bold green] {route.enabled_at}"
-    )
+    console.print(f"[bold green]Future incident email enabled:[/bold green] {route.enabled_at}")
     console.print(
         f"{summary['held']} existing held message(s) remain held and will not be sent. "
         "Only new incident opens, escalations, reopenings, and eligible recoveries can "
@@ -1836,9 +2968,7 @@ def email_disable(
     from aios.scheduler import set_email_scheduler_active
 
     if not confirm_disable:
-        console.print(
-            "[yellow]Email state was not changed.[/yellow] Use --confirm-disable."
-        )
+        console.print("[yellow]Email state was not changed.[/yellow] Use --confirm-disable.")
         raise typer.Exit(code=1)
     try:
         store = get_alert_store()
@@ -1960,6 +3090,11 @@ def alert_service_recovered(
         raise typer.Exit(code=1) from exc
     if incident is not None and incident.state == "resolved":
         console.print(f"[green]Prior system failure resolved:[/green] {incident.incident_id}")
+    else:
+        console.print(
+            "[yellow]Prior system failure retained:[/yellow] a successful unit "
+            "name alone is not sufficient recovery evidence."
+        )
 
 
 @app.command("dashboard")
@@ -1981,6 +3116,19 @@ def dashboard(
     ] = True,
 ) -> None:
     """Open the research dashboard without requiring Streamlit knowledge."""
+    normalized_host = host.strip().lower()
+    try:
+        is_loopback = (
+            normalized_host == "localhost" or ip_address(normalized_host.strip("[]")).is_loopback
+        )
+    except ValueError:
+        is_loopback = False
+    if not is_loopback:
+        console.print(
+            "[red]Dashboard start refused:[/red] AIOS has no authentication or HTTPS "
+            "boundary, so --host must be localhost or a loopback address."
+        )
+        raise typer.Exit(code=1)
     if importlib.util.find_spec("streamlit") is None:
         console.print(
             "[red]Dashboard support is not installed.[/red] Run "
@@ -2043,10 +3191,7 @@ def readiness(
         Path | None,
         typer.Option(
             "--json-output",
-            help=(
-                "Optional write-once .json path under "
-                "data/reports/readiness."
-            ),
+            help=("Optional write-once .json path under data/reports/readiness."),
         ),
     ] = None,
 ) -> None:
@@ -2266,6 +3411,545 @@ def forward_status(
     raise typer.Exit(code=1)
 
 
+def _run_forward_rollover_preview(
+    *,
+    as_of: str | None,
+    account: Path,
+    trial: Path,
+    json_output: bool,
+    write_plan: bool,
+) -> None:
+    """Build or persist one read-only prospective rollover plan."""
+    from aios.forward_rollover import (
+        persist_forward_rollover_plan,
+        preview_forward_rollover,
+    )
+    from aios.operator_preflight import assess_operator_preflight
+    from aios.paper import latest_paper_decision_date
+
+    try:
+        output_guard = redirect_stdout(sys.stderr) if json_output else nullcontext()
+        with output_guard:
+            checked = datetime.now(UTC)
+            preflight = assess_operator_preflight(now=checked)
+            with store_scope(read_only=True) as store:
+                decision_date = (
+                    date.fromisoformat(as_of)
+                    if as_of
+                    else latest_paper_decision_date(store)
+                )
+                readiness = assess_us_readiness(
+                    decision_date,
+                    purpose="paper",
+                    store=store,
+                )
+                preview = preview_forward_rollover(
+                    settings.project_root,
+                    _project_path(trial),
+                    _project_path(account),
+                    store=store,
+                    successor_decision_date=decision_date,
+                    readiness_evidence=readiness.to_dict(),
+                    operator_preflight_evidence=preflight.to_envelope(),
+                    now=checked,
+                )
+            plan_artifact = (
+                persist_forward_rollover_plan(settings.project_root, preview)
+                if write_plan
+                else None
+            )
+    except (OSError, RuntimeError, TypeError, ValueError, duckdb.Error) as exc:
+        if json_output:
+            typer.echo(
+                json.dumps(
+                    {
+                        "document_kind": "aios.forward-rollover-preview",
+                        "read_only": True,
+                        "error": str(exc),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        else:
+            console.print(f"[red]Forward rollover preview refused:[/red] {exc}")
+            console.print(
+                "[dim]No account, proposal, trial, database, incident, or broker "
+                "state was changed.[/dim]"
+            )
+        raise typer.Exit(code=1) from exc
+
+    if json_output:
+        if plan_artifact is None:
+            typer.echo(preview.canonical_json())
+        else:
+            output = preview.to_envelope()
+            output["plan_artifact_path"] = plan_artifact.relative_to(
+                settings.project_root.resolve()
+            ).as_posix()
+            typer.echo(
+                json.dumps(
+                    output,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+            )
+        if not preview.source_eligible:
+            raise typer.Exit(code=1)
+        return
+
+    plan = preview.plan
+    successor = plan["successor"]
+    console.rule("[bold]Prospective forward rollover preview[/bold]")
+    console.print(f"Plan SHA-256: {preview.plan_sha256}")
+    console.print(
+        f"Expired proposal: {plan['predecessor']['proposal_id']}"
+        if plan["predecessor"]["proposal_id"] is not None
+        else "Expired proposal: unavailable"
+    )
+    console.print(f"Successor decision close: {successor['decision_date']}")
+    console.print(
+        f"Successor proposal deadline: {successor['must_be_generated_before'] or 'unavailable'}"
+    )
+    if preview.source_eligible and preview.activation_available:
+        console.print(
+            "[bold green]ELIGIBLE FOR EXPLICIT REVIEWED ACTIVATION.[/bold green] "
+            "Persist and independently review the write-once plan before activation."
+        )
+    elif preview.source_eligible:
+        console.print(
+            "[bold yellow]SOURCE ELIGIBLE; ACTIVATION DISABLED IN THIS BUILD.[/bold yellow] "
+            "The write-once plan is available for independent review only."
+        )
+    else:
+        console.print("[bold red]NOT ELIGIBLE.[/bold red]")
+        for blocker in preview.observation["blockers"]:
+            console.print(f"[red]• {blocker}[/red]")
+    console.print(
+        "[dim]Read-only proof: no account, proposal, trial, database, incident, "
+        "fill, or broker state was changed.[/dim]"
+    )
+    if plan_artifact is not None:
+        console.print(
+            "[cyan]Stable write-once review plan:[/cyan] "
+            f"{plan_artifact.relative_to(settings.project_root.resolve())}"
+        )
+    if not preview.source_eligible:
+        raise typer.Exit(code=1)
+
+
+def _forward_rollover_display_path(path: Path) -> str:
+    """Display governed output paths relative to the project when possible."""
+
+    absolute = _absolute_without_symlink_resolution(path)
+    root = _absolute_without_symlink_resolution(settings.project_root)
+    try:
+        return absolute.relative_to(root).as_posix()
+    except ValueError:
+        return absolute.as_posix()
+
+
+def _valid_lower_sha256(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _emit_forward_rollover_contract_error(
+    message: str,
+    *,
+    json_output: bool,
+    document_kind: str,
+) -> None:
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "document_kind": document_kind,
+                    "status": "refused",
+                    "state_change_started": False,
+                    "error": message,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        console.print(f"[red]Forward rollover refused:[/red] {message}")
+    raise typer.Exit(code=1)
+
+
+@app.command("forward-rollover")
+def forward_rollover(
+    as_of: Annotated[
+        str | None,
+        typer.Option(
+            "--as-of",
+            help="Later certified decision close; defaults to the latest safe close.",
+        ),
+    ] = None,
+    account: Annotated[
+        Path | None,
+        typer.Option(
+            "--account",
+            help="Preview-only local paper-account JSON path.",
+        ),
+    ] = None,
+    trial: Annotated[
+        Path | None,
+        typer.Option(
+            "--trial",
+            help="Preview-only active checksum-protected forward-trial path.",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the canonical result as JSON."),
+    ] = False,
+    write_plan: Annotated[
+        bool,
+        typer.Option(
+            "--write-plan",
+            help=(
+                "Publish the stable plan once under "
+                "data/reports/forward_rollovers/plans; never writes paper state."
+            ),
+        ),
+    ] = False,
+    plan: Annotated[
+        Path | None,
+        typer.Option(
+            "--plan",
+            help=(
+                "Dormant future activation contract: canonical content-addressed "
+                "plan artifact. Current builds refuse activation."
+            ),
+        ),
+    ] = None,
+    plan_sha256: Annotated[
+        str | None,
+        typer.Option(
+            "--plan-sha256",
+            help=(
+                "Dormant future activation contract: exact lowercase SHA-256. "
+                "Current builds refuse activation."
+            ),
+        ),
+    ] = None,
+    confirm_rollover: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-rollover",
+            help=(
+                "Dormant future activation confirmation. Current builds refuse "
+                "activation."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Preview/publish a plan; activation is dormant and disabled in this build."""
+
+    activation_fields = (plan is not None, plan_sha256 is not None, confirm_rollover)
+    activation_requested = any(activation_fields)
+    if activation_requested and not all(activation_fields):
+        _emit_forward_rollover_contract_error(
+            "activation requires --plan, --plan-sha256, and --confirm-rollover together",
+            json_output=json_output,
+            document_kind="aios.forward-rollover-activation",
+        )
+    if not activation_requested:
+        _run_forward_rollover_preview(
+            as_of=as_of,
+            account=account or Path("data/paper/us_qv_sandbox.json"),
+            trial=trial or Path("data/paper/us_qv_forward_trial.json"),
+            json_output=json_output,
+            write_plan=write_plan,
+        )
+        return
+
+    assert plan is not None
+    assert plan_sha256 is not None
+    if as_of is not None or write_plan or account is not None or trial is not None:
+        _emit_forward_rollover_contract_error(
+            "activation rejects preview-only --as-of, --write-plan, --account, and --trial",
+            json_output=json_output,
+            document_kind="aios.forward-rollover-activation",
+        )
+    if not _valid_lower_sha256(plan_sha256):
+        _emit_forward_rollover_contract_error(
+            "--plan-sha256 must be exactly 64 lowercase hexadecimal characters",
+            json_output=json_output,
+            document_kind="aios.forward-rollover-activation",
+        )
+
+    from aios.forward_rollover import ROLLOVER_ACTIVATION_ENABLED
+
+    if not ROLLOVER_ACTIVATION_ENABLED:
+        _emit_forward_rollover_contract_error(
+            "activation is disabled in this build pending owner-approved policy "
+            "constants and a prospective market window",
+            json_output=json_output,
+            document_kind="aios.forward-rollover-activation",
+        )
+
+    from aios.forward_rollover import execute_forward_rollover_from_plan
+
+    plan_file = _project_path(plan)
+    try:
+        result = execute_forward_rollover_from_plan(
+            settings.project_root,
+            plan_file,
+            plan_sha256,
+            database_path=_project_path(settings.duckdb_path),
+            operations_database_path=_project_path(settings.operations_db_path),
+            application_version=__version__,
+            confirm=True,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError, duckdb.Error) as exc:
+        if json_output:
+            typer.echo(
+                json.dumps(
+                    {
+                        "document_kind": "aios.forward-rollover-activation",
+                        "status": "failed",
+                        "state_change_started": "unknown",
+                        "plan_sha256": plan_sha256,
+                        "recovery_required_if_attempt_exists": True,
+                        "error": str(exc),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        else:
+            console.print(f"[red]Forward rollover activation failed:[/red] {exc}")
+            console.print(
+                "[yellow]Do not assume that no state changed. If an attempt journal "
+                "exists, run forward-rollover-recover with this exact plan and SHA "
+                "before retrying.[/yellow]"
+            )
+        raise typer.Exit(code=1) from exc
+
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "document_kind": "aios.forward-rollover-activation",
+                    "schema_version": "forward-rollover-activation.v1",
+                    "status": "verified",
+                    "plan_sha256": result.plan_sha256,
+                    "attempt_id": result.attempt_id,
+                    "predecessor_trial_id": result.predecessor_trial_id,
+                    "successor_trial_id": result.successor_trial_id,
+                    "active_trial": _forward_rollover_display_path(result.active_trial),
+                    "archived_trial": _forward_rollover_display_path(
+                        result.archived_trial
+                    ),
+                    "archived_proposal": _forward_rollover_display_path(
+                        result.archived_proposal
+                    ),
+                    "successor_proposal": _forward_rollover_display_path(
+                        result.successor_proposal
+                    ),
+                    "backup": {
+                        "path": _forward_rollover_display_path(result.backup.path),
+                        "files": result.backup.files,
+                        "bytes": result.backup.bytes,
+                        "manifest_sha256": result.backup.manifest_sha256,
+                    },
+                    "journal_directory": _forward_rollover_display_path(
+                        result.journal_directory
+                    ),
+                    "verified_receipt": _forward_rollover_display_path(
+                        result.verified_receipt
+                    ),
+                    "account_mutated": False,
+                    "fill_recorded": False,
+                    "broker_order_sent": False,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        )
+    else:
+        console.rule("[bold green]Verified prospective forward rollover[/bold green]")
+        console.print(f"Plan SHA-256: {result.plan_sha256}")
+        console.print(f"Attempt: {result.attempt_id}")
+        console.print(
+            f"Trial: {result.predecessor_trial_id} → {result.successor_trial_id}"
+        )
+        console.print(f"Active trial: {_forward_rollover_display_path(result.active_trial)}")
+        console.print(f"Verified receipt: {result.verified_receipt}")
+        console.print(
+            "[dim]The predecessor was archived unchanged. No account mutation, fill, "
+            "or broker order was performed.[/dim]"
+        )
+
+
+@app.command("forward-rollover-recover")
+def forward_rollover_recover(
+    plan: Annotated[
+        Path,
+        typer.Option(
+            "--plan",
+            help="Canonical content-addressed plan artifact used by the attempt.",
+        ),
+    ],
+    plan_sha256: Annotated[
+        str,
+        typer.Option(
+            "--plan-sha256",
+            help="Exact lowercase SHA-256 reviewed by the operator.",
+        ),
+    ],
+    confirm_recovery: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-recovery",
+            help="Explicitly approve deterministic reconciliation of the attempt.",
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the canonical recovery result as JSON."),
+    ] = False,
+) -> None:
+    """Reconcile interrupted attempts without constructing a new successor."""
+
+    if not confirm_recovery:
+        _emit_forward_rollover_contract_error(
+            "recovery requires --confirm-recovery",
+            json_output=json_output,
+            document_kind="aios.forward-rollover-recovery",
+        )
+    if not _valid_lower_sha256(plan_sha256):
+        _emit_forward_rollover_contract_error(
+            "--plan-sha256 must be exactly 64 lowercase hexadecimal characters",
+            json_output=json_output,
+            document_kind="aios.forward-rollover-recovery",
+        )
+
+    from aios.forward_rollover import recover_forward_rollover_from_plan
+
+    try:
+        recovered = recover_forward_rollover_from_plan(
+            settings.project_root,
+            _project_path(plan),
+            plan_sha256,
+            confirm=True,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError, duckdb.Error) as exc:
+        if json_output:
+            typer.echo(
+                json.dumps(
+                    {
+                        "document_kind": "aios.forward-rollover-recovery",
+                        "status": "failed",
+                        "plan_sha256": plan_sha256,
+                        "manual_investigation_required": True,
+                        "error": str(exc),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        else:
+            console.print(f"[red]Forward rollover recovery failed:[/red] {exc}")
+            console.print(
+                "[yellow]Do not retry activation. Preserve the plan and attempt "
+                "journal for investigation.[/yellow]"
+            )
+        raise typer.Exit(code=1) from exc
+
+    output = [
+        {
+            "attempt_id": item.attempt_id,
+            "terminal_phase": item.terminal_phase,
+            "active_trial": _forward_rollover_display_path(item.active_trial),
+            "journal_directory": _forward_rollover_display_path(
+                item.journal_directory
+            ),
+            "terminal_receipt": _forward_rollover_display_path(
+                item.terminal_receipt
+            ),
+        }
+        for item in recovered
+    ]
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "document_kind": "aios.forward-rollover-recovery",
+                    "schema_version": "forward-rollover-recovery.v1",
+                    "status": "verified",
+                    "plan_sha256": plan_sha256,
+                    "attempts": output,
+                    "new_successor_constructed": False,
+                    "fill_recorded": False,
+                    "broker_order_sent": False,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        )
+        return
+
+    console.rule("[bold green]Forward rollover recovery verified[/bold green]")
+    console.print(f"Plan SHA-256: {plan_sha256}")
+    for item in output:
+        console.print(f"{item['attempt_id']}: {item['terminal_phase']}")
+    console.print(
+        "[dim]Recovery constructed no new successor, fill, or broker order.[/dim]"
+    )
+
+
+@app.command("forward-rollover-preview", hidden=True)
+def forward_rollover_preview(
+    as_of: Annotated[
+        str | None,
+        typer.Option(
+            "--as-of",
+            help="Later certified decision close; defaults to the latest safe close.",
+        ),
+    ] = None,
+    account: Annotated[
+        Path,
+        typer.Option("--account", help="Local paper-account JSON path."),
+    ] = Path("data/paper/us_qv_sandbox.json"),
+    trial: Annotated[
+        Path,
+        typer.Option("--trial", help="Active checksum-protected forward-trial path."),
+    ] = Path("data/paper/us_qv_forward_trial.json"),
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the canonical read-only plan as JSON."),
+    ] = False,
+    write_plan: Annotated[
+        bool,
+        typer.Option(
+            "--write-plan",
+            help=(
+                "Publish the stable plan once under "
+                "data/reports/forward_rollovers/plans; never writes paper state."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Deprecated read-only alias for ``aios forward-rollover``."""
+
+    _run_forward_rollover_preview(
+        as_of=as_of,
+        account=account,
+        trial=trial,
+        json_output=json_output,
+        write_plan=write_plan,
+    )
+
+
 @app.command("forward-restart")
 @_exclusive_project_operation("forward-restart")
 def forward_restart(
@@ -2310,8 +3994,7 @@ def forward_restart(
 
     if not confirm_restart:
         console.print(
-            "[red]Forward restart refused:[/red] explicit --confirm-restart approval "
-            "is required"
+            "[red]Forward restart refused:[/red] explicit --confirm-restart approval is required"
         )
         raise typer.Exit(code=1)
 
@@ -2442,16 +4125,10 @@ def paper_propose(
                     account_path,
                     expected_kind=ACCOUNT_DOCUMENT_KIND,
                 )
-                if existing.payload.get("account_id") != current_account.payload.get(
-                    "account_id"
-                ):
-                    raise ValueError(
-                        "existing proposal belongs to a different paper account"
-                    )
+                if existing.payload.get("account_id") != current_account.payload.get("account_id"):
+                    raise ValueError("existing proposal belongs to a different paper account")
                 if existing.payload.get("decision_date") != decision_date.isoformat():
-                    raise ValueError(
-                        "existing proposal belongs to a different decision date"
-                    )
+                    raise ValueError("existing proposal belongs to a different decision date")
             trial_path = settings.project_root / DEFAULT_FORWARD_RELATIVE_PATH
             if trial_path.exists():
                 status = assess_forward_trial(
@@ -2460,12 +4137,23 @@ def paper_propose(
                     account_path,
                 )
                 if not status.ready:
-                    raise ValueError(
-                        "active forward trial drifted: " + "; ".join(status.issues)
-                    )
+                    raise ValueError("active forward trial drifted: " + "; ".join(status.issues))
                 trial = read_forward_trial(trial_path)
                 if top_n != int(trial.payload["frozen_configuration"]["top_n"]):
                     raise ValueError("top_n differs from the active forward trial")
+                current_account = read_paper_document(
+                    account_path,
+                    expected_kind=ACCOUNT_DOCUMENT_KIND,
+                )
+                if _has_unresolved_registered_proposal(
+                    trial.payload,
+                    current_account.payload,
+                ):
+                    raise ValueError(
+                        "a registered forward proposal remains unresolved; do not "
+                        "create or replace another proposal until the governed "
+                        "proposal lifecycle closes it"
+                    )
                 if replace and destination.exists():
                     raise ValueError("registered forward proposals cannot be replaced")
             document = create_paper_proposal(
@@ -2491,9 +4179,7 @@ def paper_propose(
                             expected_kind=PROPOSAL_DOCUMENT_KIND,
                         )
                         if current.payload_sha256 != document.payload_sha256:
-                            raise RuntimeError(
-                                "new proposal changed before registration rollback"
-                            )
+                            raise RuntimeError("new proposal changed before registration rollback")
                         document.path.unlink()
                     except Exception as cleanup_error:
                         raise RuntimeError(
@@ -2638,9 +4324,7 @@ def stress_review(
         summary = analysis["summary"]
         calculation_coverage = str(analysis["calculation_coverage"]).replace("_", " ")
         selected_policy_count = summary["selected_numerical_policy_count"]
-        selected_policy_label = (
-            "policy" if selected_policy_count == 1 else "policies"
-        )
+        selected_policy_label = "policy" if selected_policy_count == 1 else "policies"
         console.print(
             "Report generation: "
             f"[bold]{payload['report_generation_status']}[/bold] · "
@@ -2696,9 +4380,7 @@ def stress_review(
         )
 
         calculated_results = [
-            result
-            for result in analysis["scenarios"]
-            if result["status"] == "calculated"
+            result for result in analysis["scenarios"] if result["status"] == "calculated"
         ]
         if calculated_results:
             console.print("[bold]Assumptions and advisory findings[/bold]")
@@ -2846,13 +4528,9 @@ def paper_review(
     console.print(f"Scheduled simulated close: {result['execution_date']}")
     console.print(f"State: [{color}]{labels.get(status, status)}[/{color}]")
     console.print(str(result["detail"]))
-    console.print(
-        f"Allowed window (UTC): {result['executable_after']} to {result['expires_at']}."
-    )
+    console.print(f"Allowed window (UTC): {result['executable_after']} to {result['expires_at']}.")
     if result.get("missing_count"):
-        console.print(
-            f"Missing reviewed execution evidence: {result['missing_count']} item(s)."
-        )
+        console.print(f"Missing reviewed execution evidence: {result['missing_count']} item(s).")
         for item in result["missing"][:6]:
             console.print(f"  • {item}")
         if result["missing_count"] > 6:
@@ -2873,9 +4551,7 @@ def paper_review(
                 "--confirm-simulated",
             ]
         )
-        console.print(
-            "If you accept this local simulation before the window expires, run:"
-        )
+        console.print("If you accept this local simulation before the window expires, run:")
         console.print(f"[bold]{execute_command}[/bold]")
     console.print(
         "[yellow]Read-only simulation preflight — the account was not changed and no "
@@ -3199,9 +4875,7 @@ def refresh_us_current_command(
     if summary_destination is not None and summary_error is None:
         console.print(f"Run summary written to {summary_destination}.")
     for warning in result.warnings[:25]:
-        console.print(
-            f"  [yellow]{warning.kind} {warning.identity}:[/yellow] {warning.error}"
-        )
+        console.print(f"  [yellow]{warning.kind} {warning.identity}:[/yellow] {warning.error}")
     if len(result.warnings) > 25:
         console.print(
             f"  [yellow]... {len(result.warnings) - 25} additional warnings are in "
@@ -3226,16 +4900,13 @@ def refresh_us_current_command(
             )
         )
         for failure in result.failures[:25]:
-            console.print(
-                f"  [red]{failure.kind} {failure.identity}:[/red] {failure.error}"
-            )
+            console.print(f"  [red]{failure.kind} {failure.identity}:[/red] {failure.error}")
         if len(result.failures) > 25:
             console.print(
                 f"  [red]... {len(result.failures) - 25} additional failures are in "
                 "the JSON summary and ingest audit.[/red]"
             )
         raise typer.Exit(code=1)
-    _resolve_operational_alert(failure_fingerprint)
     if result.warnings:
         from aios.alerts import Alert, AlertSeverity
 
@@ -3254,8 +4925,6 @@ def refresh_us_current_command(
                 },
             )
         )
-    else:
-        _resolve_operational_alert(partial_fingerprint)
     console.print(
         "[bold green]Refresh completed.[/bold green] Run `aios health` before creating "
         "or recording a paper proposal."
@@ -3331,6 +5000,8 @@ def refresh_us_daily_command(
         )
         raise typer.Exit(code=1) from exc
 
+    _record_daily_cycle_recovery(result.run_id)
+
     summary_error: Exception | None = None
     if summary_destination is not None:
         try:
@@ -3352,17 +5023,6 @@ def refresh_us_daily_command(
             payload={"recovered_run_ids": list(result.interrupted_run_ids)},
         )
         _emit_operational_alert(incident)
-        _resolve_operational_alert(incident.dedup_key)
-
-    for fingerprint in (
-        "daily:us-cycle:failure",
-        "refresh:prices-macro:failure",
-        "universe:coverage:execution",
-        "readiness:paper",
-        "systemd:aios-us-current.service",
-        "systemd:aios-universe-review.service",
-    ):
-        _resolve_operational_alert(fingerprint)
 
     table = Table(title=f"Daily U.S. update — {result.target_session}")
     table.add_column("stage")
@@ -3529,8 +5189,7 @@ def build_universe_membership(
         console.print(f"[red]Universe build refused:[/red] {exc}")
         raise typer.Exit(code=1) from exc
     console.print(
-        f"[green]Universe build done:[/green] "
-        f"{len(rows)} intervals written to {destination}."
+        f"[green]Universe build done:[/green] {len(rows)} intervals written to {destination}."
     )
     console.print(
         f"Certified window: {coverage_start} through {coverage_end}; "
@@ -4061,7 +5720,10 @@ def ingest_reference_batch(
         Path | None,
         typer.Option(
             "--companyfacts-zip",
-            help="Optional local official SEC companyfacts.zip for bulk facts reads.",
+            help=(
+                "Reserved and currently refused until bulk archive members have "
+                "governed immutable-source lineage."
+            ),
         ),
     ] = None,
 ) -> None:
@@ -4088,8 +5750,6 @@ def ingest_reference_batch(
         f"{summary['fundamental_rows']} fundamental rows and "
         f"{summary['price_rows']} price rows."
     )
-    if companyfacts_zip is not None:
-        console.print(f"  Company Facts source: {summary['companyfacts_source']}")
     if summary["failures"]:
         for failure in summary["failures"]:
             console.print(f"  [red]{failure['kind']} {failure['id']}:[/red] {failure['error']}")

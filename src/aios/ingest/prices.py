@@ -26,7 +26,7 @@ from uuid import uuid4
 import pandas as pd
 from structlog import get_logger
 
-from aios.config import settings
+from aios.config import secret_value, settings
 from aios.ingest.http_client import RawSnapshotContext, get_http
 from aios.market_calendar import latest_completed_us_equity_session
 from aios.raw_snapshots import (
@@ -480,7 +480,7 @@ def fetch_tiingo(
     project_root: Path | None = None,
 ) -> list[dict]:
     """Fetch Tiingo EOD history without placing its token in evidence metadata."""
-    token = settings.tiingo_api_key.strip()
+    token = secret_value(settings.tiingo_api_key).strip()
     if not token:
         raise ValueError("TIINGO_API_KEY is required for the Tiingo provider")
     params: dict[str, str] = {}
@@ -642,7 +642,7 @@ def fetch_prices(
         rows = []
     if rows:
         return rows
-    if settings.tiingo_api_key.strip():
+    if secret_value(settings.tiingo_api_key).strip():
         log.warning("prices.fallback_to_tiingo", ticker=ticker)
         try:
             rows = fetch_tiingo(

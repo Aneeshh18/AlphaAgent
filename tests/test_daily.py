@@ -212,11 +212,11 @@ def test_daily_cycle_cli_reports_exact_certified_session(
         interrupted_run_ids=(),
     )
     monkeypatch.setattr(daily_module, "run_us_daily_cycle", lambda **_kwargs: result)
-    monkeypatch.setattr(cli, "_resolve_operational_alert", recovered.append)
+    monkeypatch.setattr(cli, "_record_daily_cycle_recovery", recovered.append)
 
     cli_result = CliRunner().invoke(cli.app, ["refresh-us-daily"])
 
     assert cli_result.exit_code == 0
     assert "2026-07-23" in cli_result.output
     assert "benchmark, universe, member data" in cli_result.output
-    assert "daily:us-cycle:failure" in recovered
+    assert recovered == ["job-test"]

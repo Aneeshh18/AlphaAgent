@@ -18,68 +18,100 @@ implement a later milestone before its listed dependencies and exit gates. Use
   personal buy/sell advice exists.
 - Normal operation must not require DuckDB or Streamlit knowledge.
 
-## Verified checkpoint — 2026-07-29
+## Verified checkpoint — 2026-07-30
 
-Current U.S. decision close: **2026-07-28**.
+Current U.S. decision close: **2026-07-29**.
 
 - `aios health --report-only`: healthy for supervised research and paper
   monitoring; database integrity is 0 failures/3 warnings and the active
   forward policy is unchanged.
 - 503 dated S&P 500 members; 503/503 stable security identities.
 - 500/503 members have PIT fundamentals; 503/503 have identity-safe prices.
+- Company Facts v3 remains a blocked candidate. Its reviewed replay processes
+  500 payloads, emits 1,119,730 rows, rejects 42 future-period rows, withholds
+  17,860 unsupported-context rows and 26,152 ambiguous storage keys, and emits
+  zero duplicate keys. The disposable candidate makes 394/503 QV scores
+  structurally computable only before freshness and lineage gates.
+- All 1,270,623 live fundamental rows and all candidate rows remain unlineaged.
+  Zero issuers are currently eligible for governed v3 activation; do not
+  promote the parser or its structural score count until lineage, freshness,
+  candidate-diff, and restore gates pass.
+- `aios companyfacts-v3-plan --as-of YYYY-MM-DD` now classifies already-captured
+  exact v2 evidence and optionally publishes a content-addressed review plan.
+  It is read-only, performs no provider fetch or governed-state mutation, and
+  exposes no v3 activation path.
 - 503/503 have recent prices with reviewed dividend/split fields.
-- SPY benchmark/calendar is reviewed through 2026-07-28. The current raw source
-  clocks are prices 2026-07-28, filings 2026-07-24, and macro releases
-  2026-07-28.
-- The immutable archive verifier checks 3,738 unique payloads and replays 3,900
+- SPY benchmark/calendar is reviewed through 2026-07-29. The current raw source
+  clocks are prices 2026-07-29, filings 2026-07-24, and macro releases
+  2026-07-29.
+- The immutable archive verifier checks 4,252 unique payloads and replays 4,424
   parsed artifacts.
-- The replay-aware AAPL SEC ingest linked 4,102 canonical Company Facts rows
+- A prior replay-aware AAPL SEC ingest proved that the transport can link 4,102
+  canonical Company Facts rows
   (parsed SHA-256
   `4aa426f42980401992c7b6f28659d9cc5b3ecd6ebb19bdb865e0b4ff2110665b`)
   and one Submissions metadata row (parsed SHA-256
   `5b0495ce0bc6f27cc5147cc63617a6423ed53ef52b49ab1626d99c0dd39c7cde`)
-  to one successful reviewed-issuer run.
+  to one successful reviewed-issuer run. That transport proof is not current
+  live-row lineage and does not make AAPL or any other issuer v3-eligible.
 - Database quality: zero hard failures, three visible warning categories.
-- Full regression baseline: 494 passed; Ruff, bytecode compilation, and
-  `git diff --check` are clean. Repository-wide Ruff formatting is not a
-  current gate because existing files intentionally predate that formatter
-  baseline.
-- `aios preflight --review-paper` passed read-only and returned a
-  `human_decision` with no command. Account, proposal, trial, DuckDB, and
-  operations hashes were unchanged; no simulation was recorded.
+- The last certified release checkpoint passed the full suite,
+  repository-wide Ruff, bytecode compilation, reproducible wheel builds, exact
+  source-to-wheel verification, and clean-install smoke. That result is
+  historical checkpoint evidence only; regenerate the complete proof for every
+  release candidate after source stabilization.
+- `aios preflight --review-paper` passed read-only and returned only
+  `aios forward-rollover` as the next safe command. That command defaults to
+  preview. The v4 activation mechanism exists, but current live gates block it.
+  Account, proposal, trial, DuckDB, and operations hashes were unchanged; no
+  simulation was recorded.
 - Host scheduler verification found the daily, filings, and backup timers
-  active and waiting; the guarded daily service passed at 13:12 IST and the
-  normal scheduler-status lifecycle resolved its stale sandbox-visibility
-  warning. One non-critical fundamentals-coverage incident remains open for
-  three SEC issuers that returned no fundamental rows.
+  active and waiting with successful latest results and linger enabled. The
+  July 30 naturally triggered daily service completed with status 0. A current
+  normal-session check reverified that runtime; `current_refresh_partial` is
+  the only open operating incident. FDXF and HONA are resolved as explicit
+  zero-row gaps with withholding preserved. XOM remains acknowledged pending
+  predecessor-successor evidence; it is not an operating incident.
+- Governed anomaly-review v1 compares reviewed membership with accepted SEC
+  fundamentals, fails closed on missing or conflicting source evidence, and
+  makes explicit `--record` append an immutable scan and lifecycle events while
+  reconciling the deduplicated current-case projection, all within the
+  independent operations ledger. Preview, case listing, case detail, and the
+  dashboard are read-only; no case transition repairs DuckDB or waives
+  readiness.
 - Every supported CLI writer of backup-covered DuckDB, raw, paper, proposal,
   and forward state shares one fail-visible project maintenance lease.
   Caller-selected generated outputs cannot target or alias governed state;
   normal files publish atomically without replacement. Read-only incident and
   notification inspection uses an immutable exact-schema SQLite connection and
   leaves the live operations ledger byte-for-byte unchanged.
-- Live operations ledger schema v4 preserves all 11 incidents, 50 incident
-  events, five job records, three outbox rows, and one local-test delivery;
-  SQLite integrity is `ok`, foreign-key check is empty, and no external route
-  exists. New routable messages bind to immutable activations, old route state
-  is quarantined, and ambiguous/expired outcomes are terminal. Migration,
-  concurrency, TLS, exact-config, dependency, CLI, scheduler, and dashboard
-  tests pass.
+- The live schema-v6 operations migration preserves the previously verified v4
+  contract. At the verified `aios-20260729T192830Z` checkpoint, the ledger
+  contains 12 incidents, 100 incident events, 12 job records, 26 outbox rows,
+  one local-test delivery, three immutable anomaly scans, three current cases,
+  and nine append-only case events. SQLite integrity is `ok`, the foreign-key
+  check is empty, and no external route exists. The migration did not change
+  the incident/notification rules. New
+  routable messages bind to immutable
+  activations, old route state is quarantined, and ambiguous/expired outcomes
+  are terminal.
 - Pre-v4-migration backup `backups/aios-20260727T115222Z` verified 1,542 files
   (378,754,847 bytes; manifest SHA-256
   `a038652296c4947d27ba757768802e7c6c6dea06f23b37ca6788c7620eb5fd0c`).
   `.env`, logs, caches, and backtest artifacts are excluded.
-- Latest checkpoint backup `backups/aios-20260728T082412Z` verified 2,622 files
-  (380,408,599 bytes; manifest SHA-256
-  `cd4ce6e3c8256013483eee438b3167cf8ef12815b7ffbb04e03b3e4ea629d25b`)
-  and passed a non-destructive restore drill.
+- Recovery-tested checkpoint `backups/aios-20260728T082412Z` verified 2,622
+  files and passed a non-destructive restore drill. The later July 29
+  schema-v6 checkpoint `backups/aios-20260729T192830Z` verifies 3,748 files
+  (410,397,206 bytes; manifest SHA-256
+  `5d445e301153832bd6bffd2bad7c375b9e05583806d0d47d7edf4e3ee461ee5e`).
 
 Stabilization note for 2026-07-29: `aios preflight` is now the canonical
 read-only operator entrypoint. It keeps research, proposal creation, stress
 review, paper recording, unattended operations, and real capital independent,
 then returns exactly one safe next action. `--review-paper` performs the full
-governed paper review but stops at a human decision and generates no
-state-changing command; repeatable `--require` flags provide a machine gate.
+governed read-only paper review but stops at a human decision and produces or
+executes no order or state-changing command; repeatable `--require` flags
+provide a machine gate.
 Readiness without `--as-of` resolves the newest reviewed U.S. decision-date
 candidate rather than the wall date. `health --report-only` no longer changes
 the incident ledger. Dashboard incident and notification reads use the same
@@ -111,15 +143,17 @@ Current local row counts:
 | security_ticker_extensions | 2 |
 | factor_price_provenance | 543 |
 | factor_prices | 131,252 |
-| prices | 524,350 |
+| prices | 524,854 |
 | fundamentals | 1,270,623 |
 | fundamentals_quarantine | 42 |
-| macro | 733,934 |
+| macro | 733,945 |
 | universe_membership | 568 |
-| universe_coverage_attestations | 6 |
-| raw_payloads | 3,738 |
-| raw_snapshots | 4,914 |
-| ingest_raw_snapshots | 4,914 |
+| universe_coverage_attestations | 7 |
+| raw_payloads | 4,252 |
+| raw_snapshots | 5,440 |
+| ingest_raw_snapshots | 5,440 |
+
+All 1,270,623 rows in `fundamentals` are currently unlineaged.
 
 Operational note for 2026-07-22: the naturally triggered weekday refresh first
 failed on transient FRED DNS resolution and isolated Yahoo empty responses. A
@@ -198,15 +232,15 @@ for restore. Judge EOD freshness against the latest completed New York session
 plus the 30-minute provider-finalization delay, never India midnight. All EOD
 adapters enforce that boundary, including manual and startup catch-up runs.
 
-The latest verified backup is `backups/aios-20260728T082412Z` (2,622 files,
-380,408,599 bytes; manifest SHA-256
-`cd4ce6e3c8256013483eee438b3167cf8ef12815b7ffbb04e03b3e4ea629d25b`).
-It contains the live database, both forward-trial histories, paper/operations
-state, and all registered immutable provider evidence. A non-destructive
-`aios restore-drill` restored it through the real restore path into a disposable
-project, opened the recovered DuckDB, passed hard data-quality checks, verified
-all 2,612 payloads, replayed 2,111 parsed artifacts, and left the live files
-untouched.
+The latest verified backup is `backups/aios-20260730T092832Z` (4,262 files,
+397,657,272 bytes; manifest SHA-256
+`a3081e23103997e3f94b0f9066cbc8ed6c446b1b9958fb75b8dad73ed5afabce`).
+It captures the governed database, both forward-trial histories,
+paper/operations state, and registered immutable provider evidence at backup
+time. That exact checkpoint passed the non-destructive restore drill through
+the real restore path into a disposable project, opened the recovered
+DuckDB, passed hard data-quality checks, verified every registered payload and
+reviewed replay at that checkpoint, and left the live files untouched.
 
 The three quality warnings are historical audit debt: old action-incomplete
 price rows plus retained failed/zero-row ingest records. They do not override
@@ -217,6 +251,9 @@ the dated current-use checks. Never describe all historical rows as action-safe.
 Ready now:
 
 - supervised U.S. research in the CLI/dashboard;
+- governed, supervised SEC fundamentals-coverage anomaly review in the
+  CLI/dashboard and independent operations ledger; it is a review workflow,
+  never an analytical repair or readiness override;
 - a `Today` dashboard that separates Research, Paper Trial, and Operations
   status before one safe next action; detailed gates and incidents are
   progressively disclosed;
@@ -231,7 +268,15 @@ Ready now:
 - stateful PIT engineering backtests with costs, holdings, lots, daily curves,
   corporate actions, security conversions, and SPY.
 - plain-language health plus checksum-verified backup/verify/confirmed-restore
-  commands; restore always creates a pre-restore safety snapshot.
+  commands. Restore stages the complete candidate first and requires matching
+  application version, an openable zero-hard-failure DuckDB, valid
+  account/proposal/active-or-archived-forward envelopes, consistent active
+  cross-references, complete raw replay, and no immutable merge conflict before
+  it creates the pre-restore safety snapshot or changes governed live state.
+  The later publication phase is not a cross-filesystem transaction: paper
+  rollback and the safety backup are its recovery boundary, while published
+  immutable raw additions and the operations stale-evidence incident remain
+  forward-only audit evidence.
 - a fail-visible benchmark-first U.S. daily workflow plus a fail-closed
   free-source no-change universe review. AIOS manages three user timers for the
   recoverable daily workflow, filings, and backups. Startup catch-up and
@@ -269,6 +314,8 @@ Not approved:
 
 - personalized buy/hold/sell instructions;
 - broker or real-money execution;
+- Company Facts v3 activation or use of its 394/503 structural count as a
+  freshness-qualified or source-lineaged score claim;
 - after-tax claims (jurisdiction and account type are unset);
 - alpha/performance claims from short in-sample artifacts;
 - Indian-market rankings (NSE/BSE data is not loaded);
@@ -356,7 +403,8 @@ period is neither long nor an untouched holdout.
 | `src/aios/universe_rollforward.py` | free no-change certification and drift stop |
 | `src/aios/operations.py` | backup verification and confirmed restore |
 | `src/aios/scheduler.py` | bounded systemd-user timer lifecycle |
-| `src/aios/alerts.py` | independent incidents, job lifecycle, and SQLite notification outbox |
+| `src/aios/alerts.py` | independent incidents, jobs, anomaly cases, and SQLite notification outbox |
+| `src/aios/anomalies.py` | source-bound, fail-closed data-quality detectors |
 | `src/aios/notifications.py` | channel boundary and bounded local dispatcher |
 | `src/aios/dashboard.py` | decision-first, read-only Streamlit control room |
 | `src/aios/dashboard_ui.py` | pure scoped-status and next-action presentation model |
@@ -467,6 +515,49 @@ manual.
   Independent calculations may remain visible only as a visibly partial report.
   The Paper Trial panel is not a fifth workflow stage and must never relabel
   proposal targets as holdings.
+- Keep data-quality cases separate from operational incidents and analytical
+  evidence. `anomaly-scan --preview` persists nothing, acquires no maintenance
+  lease, and creates or updates no lock file. `--record` may change only the
+  operations ledger: it writes an immutable scan, appends lifecycle events, and
+  reconciles the deduplicated current-case projection. Its first run against
+  schema v4 performs the supported additive schema-v6 migration with empty
+  anomaly tables and no historical backfill. A v5-to-v6 upgrade retains every
+  anomaly scan, case, and event and deterministically fills only a missing
+  `event_sequence` from the existing append row order. It does not infer any
+  historical lifecycle event. Read-only anomaly views fail closed until the
+  required migration occurs.
+  Coverage is proved either by complete run/snapshot/row-set/row lineage or by
+  exact legacy response replay plus decision-date row-set equality; legacy
+  lineage is never guessed or backfilled. A warning can establish coverage only
+  when it stored positive rows and rejected exclusively rows whose `period_end`
+  followed the filing date. Zero-row and other warnings remain missing.
+  SEC source-boundary policy v2 sets the boundary to the maximum receipt time
+  among only the exact SEC snapshots consumed for accepted coverage and
+  selected missing-issuer evidence, not the newest global ingest. Exactly one
+  audited legacy implicit-global-v1 to consumed-v2 transition may use an
+  earlier corrected boundary when the SEC bundle/scope, exact v1/v2 signatures,
+  consumed-snapshot proof, and zero-write safety contract match. V2-to-v2
+  regressions remain blocked.
+  Acknowledgement-first is recommended, but direct disposition is permitted;
+  either transition requires an owner, note, and the current evidence SHA-256
+  shown by `anomaly-show`. Stale hashes fail instead of overwriting newer review
+  evidence.
+  Resolution is limited to `accepted`, `source_corrected`,
+  `mapping_corrected`, `false_positive`, or `deferred`; correction outcomes
+  require a complete same-scope scan recorded after the finding, a distinct
+  source-boundary hash, non-earlier source-boundary time, exact-rule execution,
+  fingerprint absence, and clearance from a source-provenanced accepted SEC
+  ingest with positive verified rows. Deferral requires a future review time.
+  Every case read or mutation replays the immutable ordered lifecycle and
+  verifies the mutable projection. This local structural check trusts the
+  released AIOS code and OS/filesystem access controls; it is not cryptographic
+  attestation against an actor who can replace both code and evidence.
+  The one-time policy transition is not a correction-clearance exception:
+  `source_corrected` and `mapping_corrected` verification scans still require
+  a non-earlier source boundary than the finding.
+- An anomaly disposition never repairs DuckDB, advances readiness, changes
+  paper/proposal/trial state, creates a broker action, or substitutes for the
+  underlying evidence correction and normal certification path.
 - `forward-freeze` fingerprints the QV, macro-regime, risk, cost/tax, calendar,
   readiness, and paper-policy source plus the reviewed operating configuration.
 - The forward freeze never hashes DuckDB: new public data must advance. Every
@@ -474,6 +565,14 @@ manual.
 - `forward-restart --confirm-restart` is the only normal replacement path after
   genuine drift. It archives the predecessor unchanged, atomically activates a
   later baseline, refuses an unchanged trial, and does not execute a proposal.
+- `forward-rollover` defaults to the read-only path for an unchanged trial with
+  one expired, unexecuted proposal. Its v4 plan hash binds exact state,
+  readiness, normalized proposal intent, policy, paths, deadline, and no-fill
+  requirements while volatile preflight/operations observations stay outside
+  the hash. `--write-plan` explicitly publishes the content-addressed plan only
+  under `data/reports/forward_rollovers/plans`. Activation requires that exact
+  artifact, its exact SHA, explicit confirmation, fresh gates, verified backup,
+  final CAS, and crash-recoverable journal evidence.
 
 ## Safe working procedure
 
@@ -487,21 +586,36 @@ manual.
    certified.
 6. Update this file and the relevant canonical doc when contracts change.
 7. Never print `.env`, secrets, or externalize private repository code.
-8. DuckDB is single-process. Run DB commands sequentially and close the
+8. Keep `.env`, DuckDB, and paper state owner-only. Supported mutation commands
+   enforce a private creation umask, and the unauthenticated dashboard must
+   remain on a loopback address.
+9. DuckDB is single-process. Run DB commands sequentially and close the
    dashboard before writes. A lock collision is transient concurrency; retry
    after the other process exits.
+10. Before accepting any release candidate, run
+   `.venv/bin/python scripts/verify_release_wheel.py DIST_WHEEL`. It must match
+   the reviewed source contents and bytes, console entry point, `METADATA`
+   name/version/Python/dependency/extra contract, pure-Python `WHEEL`, and every
+   `RECORD` SHA-256/size entry, then pass its default new-temporary-environment
+   install/import/resource/`aios --help` smoke. The verifier's presence does
+   not certify a stale or not-yet-built artifact.
 
 ## Immediate plan
 
-1. Start with `aios preflight`. The 2026-07-29 full read-only review for
-   `data/paper/proposals/us-qv-2026-07-27.json` passed and stopped at explicit
-   human confirmation; no simulation was recorded. Use the Paper Trial stress
-   panel or `stress-review` when proposal-risk evidence is needed. If timing
-   later expires, create a new prospective proposal rather than forcing a
-   retrospective fill. Do not restart the unchanged active forward trial.
-2. Observe the next naturally triggered guarded daily workflow. Installed units
-   and prior controlled/systemd runs are evidence, but they do not substitute
-   for this current naturally triggered runtime observation.
+1. Start with `aios preflight`. As of 2026-07-30, supervised research is
+   certified through 2026-07-29, while the registered 2026-07-27 proposal's
+   simulation window is expired and no simulation was recorded. Never force a
+   retrospective fill, delete or overwrite the registered proposal, or claim a
+   replacement can be created: that active proposal currently blocks proposal
+   creation. Read-only status, stress review, checksum-bound rollover preview,
+   and optional stable plan publication are usable. The v4 activation mechanism
+   is implemented, but live activation remains gate-blocked while operations
+   evidence is unresolved. Do not restart the unchanged active forward trial.
+2. The durable ledger records one successful July 30 job for the July 29
+   session, and a current normal-session check verifies all three timers.
+   Complete the acknowledged XOM evidence review, reconcile the fundamentals
+   warning only through governed evidence, and accumulate repeated natural
+   guarded cycles plus one bounded recovery exercise.
 3. Observe normal use of the completed institutional dashboard and keep visual
    regression screenshots with any Streamlit upgrade. Ranked-row navigation,
    failure-first System Health, four-stage Paper Trial, responsive stacking, and
@@ -525,15 +639,24 @@ manual.
    write-once export, distinct deterministic/statistical semantics, fail-closed
    partial withholding, and a Paper Trial panel over the same registered-proposal
    service. The Federal Reserve 2026 supervisory calibration is an approximately
-   58% hypothetical equity decline, not a forecast. Next add anomaly review
-   cases, then experiment registration and versioned configuration boundaries.
+   58% hypothetical equity decline, not a forecast.
+7. Completed on 2026-07-29: governed anomaly-review v1 for SEC fundamentals
+   coverage, immutable source-bound scans, preview-versus-record separation,
+   deduplicated case/event history, explicit owner/disposition controls, and
+   read-only dashboard visibility. The 2026-07-27 and current certified
+   2026-07-29 boundaries are recorded in operations schema v6. FDXF/HONA are
+   accepted explicit gaps; XOM remains under human review. The stale-proposal
+   v3 stable plan contract is implemented; next design the fixed operations
+   gate, atomic active-pointer cutover, and crash reconciliation after XOM is
+   genuinely reviewed, then add the remaining anomaly rule families,
+   experiment registration, and versioned configuration boundaries.
    Current-holdings stress, multifactor/Monte Carlo risk, and owner-authored
    scenarios remain future work.
-7. Extend pre-August-2023 announcement and delisting provenance as a separate
+8. Extend pre-August-2023 announcement and delisting provenance as a separate
    long-history track.
-8. Follow `INDIA_BUILD_PLAN.md`: Nifty 50 first, no NSE/BSE ingest before the
+9. Follow `INDIA_BUILD_PLAN.md`: Nifty 50 first, no NSE/BSE ingest before the
    portable schema and source/licensing gates pass.
-9. Ask the user for jurisdiction, account type, broker, and final risk limits
+10. Ask the user for jurisdiction, account type, broker, and final risk limits
    only before after-tax or controlled-capital certification.
 
 The historical U.S. technical gate, exact-date daily workflow, native systemd
@@ -553,7 +676,7 @@ controlled-capital gates.
 .venv/bin/aios audit
 .venv/bin/aios validate
 .venv/bin/aios preflight
-# Full governed review with no simulation write:
+# Full governed read-only review; produces/executes no order or simulation:
 .venv/bin/aios preflight --review-paper
 .venv/bin/aios readiness --as-of 2026-07-28 --purpose paper --report-only
 .venv/bin/aios health --report-only
@@ -567,6 +690,15 @@ controlled-capital gates.
 # recommended install: aios scheduler-install --confirm-install --keep-running-after-logout
 .venv/bin/aios alert-test
 .venv/bin/aios alerts --unresolved
+.venv/bin/aios anomaly-scan --preview
+# after reviewing the preview: aios anomaly-scan --record
+.venv/bin/aios anomalies --unresolved
+.venv/bin/aios anomaly-show CASE_REF
+.venv/bin/aios anomaly-ack CASE_REF --owner OWNER --note NOTE --evidence-sha256 HASH
+.venv/bin/aios anomaly-resolve CASE_REF --outcome OUTCOME --owner OWNER --note NOTE --evidence-sha256 HASH
+.venv/bin/aios companyfacts-v3-plan --as-of 2026-07-29
+# optional read-only review artifact; still no provider fetch or v3 activation
+.venv/bin/aios companyfacts-v3-plan --as-of 2026-07-29 --write-plan --json
 .venv/bin/aios notifications
 .venv/bin/aios notification-test
 .venv/bin/aios email-status
@@ -576,6 +708,7 @@ controlled-capital gates.
 
 .venv/bin/aios paper-status
 .venv/bin/aios forward-status
+.venv/bin/aios forward-rollover --as-of 2026-07-29 --write-plan --json
 # only after a future genuine drift: aios forward-restart --confirm-restart
 .venv/bin/aios paper-propose
 .venv/bin/aios stress-review --proposal data/paper/proposals/us-qv-2026-07-27.json

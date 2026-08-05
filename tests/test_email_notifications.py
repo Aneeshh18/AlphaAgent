@@ -341,6 +341,10 @@ def test_route_activation_never_releases_history_and_orders_recovery(tmp_path) -
     )
     historical_recovery = store.resolve(
         historical.incident_id,
+        actor="ops@example.test",
+        note="Historical recovery remains local-only.",
+        outcome="verified_recovery",
+        expected_evidence_sha256=historical.evidence_sha256,
         now=BASE_TIME + timedelta(minutes=2),
     )
     assert historical_recovery.state == "resolved"
@@ -351,7 +355,14 @@ def test_route_activation_never_releases_history_and_orders_recovery(tmp_path) -
     )
 
     current = store.emit(_alert("current"), now=BASE_TIME + timedelta(minutes=3))
-    store.resolve(current.incident_id, now=BASE_TIME + timedelta(minutes=4))
+    store.resolve(
+        current.incident_id,
+        actor="ops@example.test",
+        note="Current incident recovered after route activation.",
+        outcome="verified_recovery",
+        expected_evidence_sha256=current.evidence_sha256,
+        now=BASE_TIME + timedelta(minutes=4),
+    )
     current_messages = sorted(
         (
             message
@@ -537,7 +548,14 @@ def test_failed_active_message_prevents_recovery_only_delivery(tmp_path) -> None
         now=BASE_TIME,
     )
     incident = store.emit(_alert("failure"), now=BASE_TIME + timedelta(minutes=1))
-    store.resolve(incident.incident_id, now=BASE_TIME + timedelta(minutes=2))
+    store.resolve(
+        incident.incident_id,
+        actor="ops@example.test",
+        note="Producer reported a later clean run.",
+        outcome="verified_recovery",
+        expected_evidence_sha256=incident.evidence_sha256,
+        now=BASE_TIME + timedelta(minutes=2),
+    )
     claim = store.claim_notifications(
         EMAIL_CHANNEL_NAME,
         route_alias=EMAIL_ROUTE_ALIAS,

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from datetime import date, timedelta
 from zipfile import ZipFile
 
 import pytest
 from typer.testing import CliRunner
 
+import aios.cli as cli_module
 from aios.cli import app
 from aios.ingest import reference_batch
 from aios.ingest.reference_batch import (
@@ -424,7 +426,7 @@ def test_all_rejected_batch_writes_review_without_refetching_sec(tmp_path):
         store.close()
 
 
-def test_ingest_reviewed_batch_imports_then_runs_identity_ingests(monkeypatch, tmp_path):
+def test_ingest_reviewed_batch_refuses_unlineaged_bulk_archive(tmp_path):
     store = Store(tmp_path / "ingest.duckdb")
     try:
         _setup_stable_security(store)
@@ -457,36 +459,20 @@ def test_ingest_reviewed_batch_imports_then_runs_identity_ingests(monkeypatch, t
                 ),
             )
 
-        captured_payloads = []
-
-        def fake_ingest_issuer(_issuer_id, *, store, facts_payload):
-            assert store is not None
-            captured_payloads.append(facts_payload)
-            return 12
-
-        monkeypatch.setattr("aios.ingest.edgar.ingest_issuer", fake_ingest_issuer)
-        monkeypatch.setattr(
-            reference_batch,
-            "ingest_security_prices",
-            lambda *_a, **_k: 8,
-        )
-        summary = ingest_reviewed_reference_batch(
-            paths["issuer_ciks"],
-            paths["security_issuers"],
-            paths["provider_symbols"],
-            start="2024-01-01",
-            end="2024-01-11",
-            store=store,
-            companyfacts_zip_path=archive_path,
-        )
-        assert summary["fundamental_rows"] == 12
-        assert summary["price_rows"] == 8
-        assert summary["failures"] == []
-        assert summary["companyfacts_source"] == str(archive_path)
-        assert captured_payloads[0]["cik"] == 1
-        assert store.issuer_id_for_security(SECURITY_ID, "2024-01-05") == (
-            "aios:issuer:sec:0000000001"
-        )
+        with pytest.raises(
+            RuntimeError,
+            match="ZIP ingestion is disabled.*immutable-source lineage",
+        ):
+            ingest_reviewed_reference_batch(
+                paths["issuer_ciks"],
+                paths["security_issuers"],
+                paths["provider_symbols"],
+                start="2024-01-01",
+                end="2024-01-11",
+                store=store,
+                companyfacts_zip_path=archive_path,
+            )
+        assert store.issuer_reference("aios:issuer:sec:0000000001") is None
     finally:
         store.close()
 
@@ -515,7 +501,7 @@ def test_bulk_archive_is_validated_before_reference_import(tmp_path):
         with ZipFile(archive_path, "w"):
             pass
 
-        with pytest.raises(ValueError, match="no member for CIK 0000000001"):
+        with pytest.raises(RuntimeError, match="ZIP ingestion is disabled"):
             ingest_reviewed_reference_batch(
                 paths["issuer_ciks"],
                 paths["security_issuers"],
@@ -819,9 +805,7 @@ def test_anchored_extension_accepts_retired_ticker_without_live_sec_map(tmp_path
                 "cik": "1",
                 "name": "Test Corporation",
                 "tickers": [],
-                "filings": {
-                    "recent": {"filingDate": ["2023-12-01", "2024-01-31"]}
-                },
+                "filings": {"recent": {"filingDate": ["2023-12-01", "2024-01-31"]}},
             }
 
         result = build_anchored_reference_extension_batch(
@@ -1214,6 +1198,11 @@ def test_reference_window_cli_writes_manifests_and_exits_nonzero_on_rejection(
         reference_batch,
         "build_stable_reference_window_batch",
         fake_builder,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "store_scope",
+        lambda **_kwargs: nullcontext(object()),
     )
     output_dir = tmp_path / "cli-output"
     result = CliRunner().invoke(

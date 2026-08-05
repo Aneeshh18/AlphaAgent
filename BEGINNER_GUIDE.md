@@ -98,6 +98,23 @@ public.
 - `tests/`: small checks that protect the important behavior.
 - `data/aios.duckdb`: local database; it is generated data, not source code.
 
+## How a release package is checked
+
+Building a `.whl` file is not enough to call it a release. Run
+`.venv/bin/python scripts/verify_release_wheel.py DIST_WHEEL` against the source
+tree that was reviewed. The check refuses missing, extra, duplicate, unsafe,
+linked, or stale package files. It also proves that the package name, version,
+supported Python versions, dependencies, optional extras, command-line entry
+point, wheel type, and the `RECORD` file's SHA-256 hashes and byte sizes match
+the project contract.
+
+Unless its optional install smoke is explicitly disabled, the verifier creates
+a new temporary virtual environment, installs the candidate with `--no-deps`,
+then checks that AIOS imports, bundled dashboard and risk files load, and
+`aios --help` runs. The result applies only to the candidate that was actually
+checked; an older wheel in `dist/` is not certified merely because the verifier
+exists.
+
 ## What gets calculated
 
 ### Quality
@@ -347,29 +364,26 @@ PYTHONPATH=src .venv/bin/python -m aios.cli ingest-reference-batch \
 PYTHONPATH=src .venv/bin/python -m aios.cli validate
 ```
 
-For a large reviewed batch, you can reuse the SEC's nightly Company Facts ZIP
-instead of making one Company Facts request per issuer. This is optional and
-does not help with ticker identity, prices, or announcement dates:
+Do not add `--companyfacts-zip` to this command. That option is reserved and
+currently refuses the entire operation before reference import because bulk
+archive members do not yet have governed, immutable, run-bound source lineage.
+Use the normal per-CIK SEC capture path shown above.
+
+You can safely inspect whether already-captured Company Facts v2 evidence could
+support a future v3 replay:
 
 ```bash
-mkdir -p data/sec
-curl --fail --location \
-  https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip \
-  --output data/sec/companyfacts.zip
+# Preview only: reads local reviewed identities and exact captured evidence
+.venv/bin/aios companyfacts-v3-plan --as-of 2026-07-29
 
-PYTHONPATH=src .venv/bin/python -m aios.cli ingest-reference-batch \
-  --issuer-ciks examples/sp500_reference_batch_02_issuer_ciks.csv \
-  --security-issuers examples/sp500_reference_batch_02_security_issuers.csv \
-  --provider-symbols examples/sp500_reference_batch_02_provider_symbols.csv \
-  --companyfacts-zip data/sec/companyfacts.zip \
-  --start 2023-08-01 --end 2025-01-01
+# Optional content-addressed review report; still no activation
+.venv/bin/aios companyfacts-v3-plan --as-of 2026-07-29 --write-plan --json
 ```
 
-The download is large and the archive is refreshed nightly, so keep the normal
-command for small or freshness-sensitive runs. AIOS does not download it
-automatically. It reads only the reviewed CIK files and rejects missing,
-duplicate, malformed, or wrong-CIK members. The whole `data/` directory is
-gitignored, so the archive cannot accidentally become part of the repository.
+Repeat `--issuer-id ISSUER_ID` to restrict the review. The planner replays v2
+and candidate v3 against the current issuer relation, but it does not fetch a
+provider, mutate DuckDB or raw evidence, change paper state, contact a broker,
+or activate v3. Activation is deliberately unavailable in this build.
 
 This second batch accepted 25 of 25 candidates. Together with the controlled
 corporate-action batch, it brought the local reference layer to 31 issuers, 31
@@ -731,6 +745,10 @@ Open the dashboard:
 .venv/bin/aios dashboard
 ```
 
+The current dashboard is deliberately local-only. AIOS refuses `0.0.0.0`, LAN
+addresses, and public hostnames because this build does not yet have an
+authentication or HTTPS boundary.
+
 For ordinary use, you do not need to open DuckDB or run Streamlit yourself.
 These are the five main checks:
 
@@ -778,16 +796,26 @@ account, incident history, or raw archive.
 The dashboard may remain open for normal backups because it now releases its
 short read-only database connection after each cached load. Close it before a
 restore because restore replaces the database file. Restore first verifies
-every checksum, automatically backs up the current database and paper state,
-and then replaces the snapshot only after an explicit confirmation:
+every checksum and requires the backup's AIOS application version to match.
+It copies the candidate into a temporary project and, before changing governed
+live state, opens its database, requires zero hard data-quality failures,
+validates the checksum and schema of every account/proposal/forward-trial
+document, checks active trial/account/proposal links, and replays every
+registered raw snapshot. It also refuses any conflict with an existing
+immutable raw file.
 
 ```bash
 .venv/bin/aios restore backups/aios-YYYYMMDDTHHMMSSZ --confirm-restore
 ```
 
-If restored data has any hard validation failure, the command returns an error
-and prints the automatic pre-restore backup path. Never replace DuckDB files by
-hand.
+If any candidate check fails, the command returns an error before creating the
+safety snapshot, marking operations evidence stale, publishing raw files, or
+replacing the live paper/database state. Only a candidate that passes all
+checks reaches the automatic pre-restore backup and confirmed live swap. Never
+replace DuckDB files by hand. The later publication phase is not one
+all-or-nothing filesystem transaction: if it fails, recover with the automatic
+safety backup and paper rollback. Any immutable raw additions and the
+stale-evidence incident already published remain in the audit trail.
 
 Refresh current U.S. data with:
 
@@ -887,6 +915,117 @@ message. `notification-test` separately proves the complete local message
 lifecycle without using the internet. It creates one harmless audit row marked
 **Sent**, but that means sent to the built-in local test receiver—not email,
 Slack, a phone, or a broker.
+
+Data-quality review cases are separate from operational incidents. An incident
+says that a job or safeguard needs attention; an anomaly case preserves a
+specific old/new data comparison and its exact source evidence until a human
+reviews it. The first rule checks whether every active reviewed U.S. issuer has
+accepted point-in-time SEC fundamentals. The current reference universe has
+503 securities mapped to 500 issuers, so the queue deduplicates at issuer
+level instead of opening several cases for one company.
+
+Start with a preview:
+
+```bash
+# Full source-bound comparison; saves no scan/case and touches no lock file
+.venv/bin/aios anomaly-scan --preview
+
+# After reviewing the preview, reconcile deduplicated cases in operations only
+.venv/bin/aios anomaly-scan --record
+
+# Read-only queue and evidence detail
+.venv/bin/aios anomalies --unresolved
+.venv/bin/aios anomaly-show CASE_REF
+```
+
+The detector uses the exact reviewed universe, issuer identity, ingest run,
+snapshot, payload checksum, parser provenance, and rule version. If required
+evidence is missing, conflicting, or changed on disk, the scan stops safely
+instead of guessing. A covered issuer must have either complete lineage on
+every accepted row or exact legacy replay evidence whose decision-date rows
+equal the stored issuer rows. The legacy path reads and proves old evidence; it
+does not write guessed lineage back into DuckDB. A positive-row SEC warning is
+accepted only for the known case where rows after their filing date were
+rejected. Zero-row and all other warnings remain missing coverage.
+
+Preview changes nothing: it does not acquire the project maintenance lease or
+create/update its lock file. Record mode writes an immutable scan, appends
+lifecycle events, and reconciles the deduplicated current-case projection only
+within the independent operations ledger. If that ledger is still schema v4,
+the first recorded scan
+performs the supported additive migration to schema v6, creates empty anomaly
+tables, and never backfills historical incidents or inferred cases. If anomaly
+tables already exist in schema v5, the v6 upgrade keeps their scans, cases, and
+events and deterministically assigns a missing `event_sequence` from the
+existing append order. That schema upgrade does not invent a historical event.
+The read-only anomaly screens fail closed until migration occurs. Recording
+does not update DuckDB, fill missing fundamentals, change readiness, record a
+simulated trade, or contact a broker. Under SEC source-boundary policy v2, the
+source time is the latest receipt time among only the exact SEC snapshots used
+for covered issuers and the selected missing-issuer warning evidence; unrelated
+recent ingests cannot advance it. One compatibility exception lets AIOS replace
+an old implicit-global v1 boundary with that exact consumed-snapshot v2
+boundary, even when the corrected time is earlier. This is allowed exactly once
+and only when the old and new policy signatures, rule, scope, snapshot proof,
+and zero-write safety facts all match. Later v2 scans still cannot move the
+boundary backward.
+
+The recommended workflow starts by assigning a human owner and explaining the
+first check:
+
+```bash
+.venv/bin/aios anomaly-ack CASE_REF \
+  --owner "OWNER_NAME" \
+  --evidence-sha256 "HASH_FROM_ANOMALY_SHOW" \
+  --note "Reviewed the bound SEC payload and issuer identity."
+```
+
+Then choose an evidence-based disposition. A direct disposition without a
+separate acknowledgement is also allowed, but it still requires a named owner,
+audit note, and the current evidence hash:
+
+```bash
+# Example: the observed source state is understood and accepted as-is
+.venv/bin/aios anomaly-resolve CASE_REF \
+  --outcome accepted \
+  --owner "OWNER_NAME" \
+  --evidence-sha256 "HASH_FROM_ANOMALY_SHOW" \
+  --note "Accepted after source and identity review."
+
+# Example: keep the case unresolved until a future review
+.venv/bin/aios anomaly-resolve CASE_REF \
+  --outcome deferred \
+  --owner "OWNER_NAME" \
+  --evidence-sha256 "HASH_FROM_ANOMALY_SHOW" \
+  --next-review YYYY-MM-DD \
+  --note "Awaiting the next reviewed SEC filing cycle."
+```
+
+The evidence hash is a compare-and-set guard: if a newer scan changes the case
+after inspection, acknowledgement or disposition stops and asks for a fresh
+review. The complete outcome list is `accepted`, `source_corrected`,
+`mapping_corrected`, `false_positive`, and `deferred`. Source or mapping
+corrections require a complete same-scope scan recorded after the finding. That
+scan must carry a distinct source-boundary hash and a non-earlier source time,
+declare that it ran the exact case rule, omit the case fingerprint, and include
+clearance evidence from a source-provenanced accepted SEC ingest with positive
+verified rows. A deferred case needs a future date and remains unresolved. On
+every case read or mutation, AIOS replays the immutable ordered lifecycle
+events and checks that the current case row is the same projection. A
+disposition records review history only; it never edits the underlying
+analytical data or bypasses a research gate. This integrity model trusts the
+installed AIOS code and the computer's filesystem/access controls; it detects
+inconsistent database edits, but it cannot prove integrity after a privileged
+actor replaces both the local code and its evidence.
+
+The one-time legacy boundary conversion does not weaken this correction rule:
+a scan used to prove that a source or mapping was corrected must still be
+non-earlier than the finding it clears.
+
+The **Operations & System Health** page shows the case queue and latest scan
+beside incidents and pipeline state. That screen is read-only: acknowledgement
+and resolution remain deliberate CLI actions with required owner and note
+fields.
 
 The notification screen uses five plain-language states:
 
@@ -988,16 +1127,20 @@ invalid or unavailable, AIOS falls back to the slower fail-closed scalar path.
 
 ### Is it ready to use?
 
-It is ready **today for supervised U.S. research, governed proposal stress
-review, and the local paper workflow**. The active forward-policy baseline is
+It is ready **today for supervised U.S. research, governed anomaly review, and
+read-only proposal stress review**. The active forward-policy baseline is
 unchanged and its one saved proposal is separate from holdings. You can stress
 that proposal now without changing the account: open **Paper Trial** to see the
 Proposal Downside Review under the targets, or run the CLI command below. The
-separate `paper-review` command decides whether its simulation timing window is
-currently valid; if the window expired, create a new prospective proposal
-instead of inventing an old fill.
-You can explore rankings, inspect factor evidence, create a reviewed model
-portfolio proposal, and monitor simulated holdings. It cannot place a broker
+registered proposal's simulation window is expired and the proposal remains
+active, so both retrospective simulation and ordinary replacement proposal
+creation are blocked. `forward-rollover` provides a checksum-bound read-only
+preview for this exact case. Its activation mode exists, but it still refuses
+unless the exact persisted plan, reviewed SHA, current readiness, operations,
+deadline, backup, and compare-and-set gates all pass.
+The rollover mechanism is implemented, but current live gates still block its
+activation. You can explore rankings, inspect factor evidence, review the
+registered proposal, and monitor simulated holdings. It cannot place a broker
 order and it cannot decide what you personally should buy or sell.
 
 There is now a separate current-use check:
@@ -1014,17 +1157,17 @@ market close. For one consolidated operator decision, run:
 # Fast timing and capability view
 .venv/bin/aios preflight
 
-# Full governed paper review; still does not record the simulation
+# Full governed read-only paper review; produces/executes no order or simulation
 .venv/bin/aios preflight --review-paper
 
 # Machine gate: non-zero exit unless both scopes are usable
 .venv/bin/aios preflight --json --require research --require stress_review
 ```
 
-At the 2026-07-29 live read-only checkpoint the latest reviewed decision close
-is 2026-07-28. The current snapshot has 503 S&P 500 members, stable identities for
+At the 2026-07-30 live read-only checkpoint the latest reviewed decision close
+is 2026-07-30. The current snapshot has 503 S&P 500 members, stable identities for
 all 503, PIT filings for 500, action-safe prices for all 503, and SPY through
-the same close. The latest required macro release is dated 2026-07-28.
+the same close. The latest required macro release is dated 2026-07-30.
 Validation has zero hard failures and three visible warnings, and readiness is
 `READY`.
 
@@ -1039,7 +1182,8 @@ The normal paper-simulation sequence is:
 # Already created in this checkout; use only for a brand-new account
 .venv/bin/aios paper-init
 
-# Create a reviewable plan; this does not buy anything
+# Create a reviewable plan only when preflight says proposal creation is available;
+# this does not buy anything. An unresolved registered proposal blocks this command.
 .venv/bin/aios paper-propose
 .venv/bin/aios paper-status
 
@@ -1064,9 +1208,17 @@ A proposal must be created before its scheduled U.S. session opens, so an
 operator cannot watch that day's market move before choosing whether to count
 it. It can be recorded only after that session closes and before the next U.S.
 session opens. If the window expires, the system refuses a made-up historical
-fill and asks for a new prospective proposal. `paper-review` is safe to run
-repeatedly: it does not change the account, send a broker order, or count a
-performance observation.
+fill. In the current build the expired registered proposal also blocks a
+replacement; do not delete or overwrite it. `paper-review` and `stress-review`
+remain safe read-only surfaces. `forward-rollover --as-of YYYY-MM-DD`
+adds a deterministic inspection surface. Its v4 plan hash stays stable when
+only the check time or current operations observation changes. Adding
+`--write-plan` explicitly creates one content-addressed review report under
+`data/reports`; that preview invocation archives nothing and changes no account.
+Only a later invocation with the exact persisted `--plan`, exact
+`--plan-sha256`, and `--confirm-rollover` may attempt activation. The mechanism
+exists in code; the current live state remains blocked until every fresh gate
+passes in a naturally prospective market window.
 
 `stress-review` is also safe to repeat. It first proves that the proposal belongs
 to the unchanged forward trial, then reads the evidence database without writing
@@ -1096,6 +1248,21 @@ The untouched forward test has a separate policy lock:
 
 # Safe to run at any time
 .venv/bin/aios forward-status
+
+# Safe read-only plan for the unchanged-trial/expired-proposal case
+.venv/bin/aios forward-rollover --as-of 2026-07-29
+# Optional immutable review artifact; this invocation is still read-only
+.venv/bin/aios forward-rollover --as-of 2026-07-29 --write-plan --json
+# After independent review and only while every fresh gate remains green:
+# .venv/bin/aios forward-rollover \
+#   --plan data/reports/forward_rollovers/plans/SHA.json \
+#   --plan-sha256 SHA \
+#   --confirm-rollover
+# If that attempt is interrupted, reconcile it before retrying:
+# .venv/bin/aios forward-rollover-recover \
+#   --plan data/reports/forward_rollovers/plans/SHA.json \
+#   --plan-sha256 SHA \
+#   --confirm-recovery
 
 # Only after status reports real policy drift: create a current proposal,
 # archive the old trial unchanged, and atomically activate its replacement.
@@ -1146,8 +1313,10 @@ Run tests:
 PYTHONPATH=src .venv/bin/pytest -q
 ```
 
-The current regression baseline is 494 passing tests; Ruff, bytecode
-compilation, and the whitespace diff check are clean.
+Do not use a fixed test count or an old wheel checksum as release proof. Every
+candidate must freshly pass the complete test suite, repository-wide Ruff,
+bytecode compilation, the whitespace diff check, reproducible wheel builds,
+exact source-to-wheel verification, and clean-install smoke.
 
 `audit` shows whether a recent ingest succeeded, how many rows it wrote, and
 the error text when it failed. Older data was loaded before this audit trail
@@ -1208,7 +1377,7 @@ corrections; a first-time ticker download still requests its full history.
 The foundation, QV/QVML factors, release-aware macro layer, reviewed membership
 and identities, action-safe current prices, costs, persistent holdings, FIFO
 tax lots, daily account values, benchmark comparison, risk gates, paper monitor,
-and current U.S. readiness path are working through the 2026-07-28 close.
+and current U.S. readiness path are working through the 2026-07-30 close.
 Proposal Stress Review v1 is implemented for pending proposal targets. A
 separate stress workflow for current simulated holdings, multifactor or Monte
 Carlo risk models, and owner-authored scenario policies remains future work.
@@ -1245,20 +1414,24 @@ yfinance now has an honest normalized-export path:
 it stores the library-returned rows, links them to the ingest, hashes the parsed
 prices, and replays them during verification. FRED has the equivalent
 normalized-vintage path. After the July 24 full-universe recovery and July 25
-provider proof, verification passes for 2,612 unique payloads and 2,111 parsed
-replays. The latest verified backup is
-`backups/aios-20260728T082412Z`: 2,622 files, 380,408,599 bytes, manifest
+provider proof, the checkpoint verified every registered payload and reviewed
+replay without treating those daily-growing counts as a release constant. The
+latest verified backup is
+`backups/aios-20260730T092832Z`: 4,262 files, 397,657,272 bytes, manifest
 SHA-256
-`cd4ce6e3c8256013483eee438b3167cf8ef12815b7ffbb04e03b3e4ea629d25b`.
-It passed a disposable restore drill through the real recovery path. Stooq remains
+`a3081e23103997e3f94b0f9066cbc8ed6c446b1b9958fb75b8dad73ed5afabce`.
+That exact checkpoint passed a disposable restore drill through the real
+recovery path. Stooq remains
 explicitly unavailable instead of silently falling back through an HTML page;
 future market adapters must add the same evidence contract. The retry-safe
 notification outbox, no-network local proof, and selected SMTP adapter are
 implemented; private SMTP configuration plus one owner-confirmed mailbox receipt
 are the remaining transport activation steps.
-Proposal Stress Review v1 is implemented. Anomaly review cases, experiment
-registration, and the India schema foundation follow; the broader holdings and
-advanced-risk extensions remain governed future work.
+Proposal Stress Review v1 is implemented. You can also use governed anomaly
+review now for the first SEC fundamentals-coverage rule; it is a supervised
+review queue, not a repair or readiness-bypass mechanism. Additional anomaly
+rules, experiment registration, and the India schema foundation follow. The
+broader holdings and advanced-risk extensions remain governed future work.
 
 The India sequence is in [`INDIA_BUILD_PLAN.md`](./INDIA_BUILD_PLAN.md). It
 starts with a bounded Nifty 50 research beta and explains the official NSE,

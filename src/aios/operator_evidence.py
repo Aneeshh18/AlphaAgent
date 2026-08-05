@@ -7,7 +7,13 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from aios.alerts import ALERT_SCHEMA_VERSION, NOTIFICATION_STATES
+from aios.alerts import (
+    ALERT_SCHEMA_VERSION,
+    NOTIFICATION_STATES,
+    REQUIRED_INCIDENT_TRIGGERS,
+    incident_resolution_projection,
+    verify_anomaly_case_evidence,
+)
 from aios.daily import DAILY_JOB_NAME
 from aios.forward import (
     DEFAULT_FORWARD_RELATIVE_PATH,
@@ -267,12 +273,18 @@ def _operations_unavailable(path: Path, error: str) -> dict[str, Any]:
         "ledger_path": str(path),
         "schema_version": None,
         "incidents": [],
-        "incident_summary": {},
+        "incident_summary": _empty_incident_summary(),
+        "incident_page": _page_metadata(limit=0, returned=0, total=0),
+        "anomaly_cases": [],
+        "anomaly_case_summary": _empty_anomaly_case_summary(),
+        "anomaly_case_page": _page_metadata(limit=0, returned=0, total=0),
+        "latest_anomaly_scan": None,
         "daily_cycle": None,
         "notifications": [],
         "notification_summary": {
             state: 0 for state in sorted(NOTIFICATION_STATES)
         },
+        "notification_page": _page_metadata(limit=0, returned=0, total=0),
         "notification_route": None,
         "error": error,
     }
@@ -283,6 +295,51 @@ def _read_json_object(raw: Any, *, field: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{field} must contain a JSON object")
     return value
+
+
+def _read_json_array(raw: Any, *, field: str) -> list[Any]:
+    value = json.loads(str(raw))
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must contain a JSON array")
+    return value
+
+
+def _empty_anomaly_case_summary() -> dict[str, int]:
+    return {
+        "open": 0,
+        "acknowledged": 0,
+        "deferred": 0,
+        "resolved": 0,
+        "unresolved": 0,
+        "critical_unresolved": 0,
+        "high_unresolved": 0,
+        "total": 0,
+        "affected_subjects": 0,
+    }
+
+
+def _empty_incident_summary() -> dict[str, int]:
+    return {
+        "open": 0,
+        "acknowledged": 0,
+        "resolved": 0,
+        "unresolved": 0,
+        "critical_unresolved": 0,
+        "unproven_resolved": 0,
+        "invalid_resolution_proof": 0,
+        "operational_blocking": 0,
+        "critical_operational_blocking": 0,
+        "total": 0,
+    }
+
+
+def _page_metadata(*, limit: int, returned: int, total: int) -> dict[str, Any]:
+    return {
+        "limit": limit,
+        "returned": returned,
+        "total": total,
+        "truncated": returned < total,
+    }
 
 
 def _file_identity(path: Path) -> tuple[int, int, int, int, int]:
@@ -300,6 +357,7 @@ def load_operations_evidence_read_only(
     path: Path,
     *,
     incident_limit: int = 100,
+    anomaly_case_limit: int = 100,
     notification_limit: int = 100,
     notification_channel: str = "smtp-email",
     notification_route_alias: str = "primary",
@@ -315,6 +373,8 @@ def load_operations_evidence_read_only(
     source = Path(path).expanduser()
     if incident_limit < 1 or incident_limit > 1000:
         raise ValueError("incident limit must be between 1 and 1000")
+    if anomaly_case_limit < 1 or anomaly_case_limit > 1000:
+        raise ValueError("anomaly case limit must be between 1 and 1000")
     if notification_limit < 1 or notification_limit > 1000:
         raise ValueError("notification limit must be between 1 and 1000")
     if source.is_symlink():
@@ -348,46 +408,173 @@ def load_operations_evidence_read_only(
                         f"{ALERT_SCHEMA_VERSION}; run a normal health command to migrate it"
                     ),
                 )
-            rows = connection.execute(
+            incident_triggers = {
+                str(row["name"])
+                for row in connection.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_schema
+                    WHERE type = 'trigger' AND name LIKE 'incident_events_%'
+                    """
+                ).fetchall()
+            }
+            missing_incident_triggers = sorted(
+                REQUIRED_INCIDENT_TRIGGERS - incident_triggers
+            )
+            if missing_incident_triggers:
+                return _operations_unavailable(
+                    resolved,
+                    "operations incident proof schema is incomplete: "
+                    + ", ".join(missing_incident_triggers),
+                )
+            incident_rows = connection.execute(
+                "SELECT * FROM incidents ORDER BY incident_id"
+            ).fetchall()
+            summary = _empty_incident_summary()
+            all_incidents: list[dict[str, Any]] = []
+            for row in incident_rows:
+                projection = incident_resolution_projection(connection, row)
+                state = str(row["state"])
+                severity = str(row["severity"])
+                summary[state] += 1
+                summary["total"] += 1
+                if state != "resolved":
+                    summary["unresolved"] += 1
+                    if severity == "critical":
+                        summary["critical_unresolved"] += 1
+                proof_status = str(projection["resolution_proof_status"])
+                if proof_status == "legacy_unproven":
+                    summary["unproven_resolved"] += 1
+                elif proof_status == "invalid":
+                    summary["invalid_resolution_proof"] += 1
+                operationally_blocking = bool(
+                    projection["operationally_blocking"]
+                )
+                if operationally_blocking:
+                    summary["operational_blocking"] += 1
+                    if severity == "critical":
+                        summary["critical_operational_blocking"] += 1
+                all_incidents.append(
+                    {
+                        "incident_id": str(row["incident_id"]),
+                        "fingerprint": str(row["fingerprint"]),
+                        "code": str(row["code"]),
+                        "severity": severity,
+                        "title": str(row["title"]),
+                        "body": str(row["body"]),
+                        "source_job": str(row["source_job"]),
+                        "state": state,
+                        "first_seen_at": str(row["first_seen_at"]),
+                        "last_seen_at": str(row["last_seen_at"]),
+                        "occurrence_count": int(row["occurrence_count"]),
+                        "payload": _read_json_object(
+                            row["payload_json"],
+                            field="incident payload",
+                        ),
+                        "acknowledged_at": (
+                            str(row["acknowledged_at"])
+                            if row["acknowledged_at"] is not None
+                            else None
+                        ),
+                        "resolved_at": (
+                            str(row["resolved_at"])
+                            if row["resolved_at"] is not None
+                            else None
+                        ),
+                        "notifications_enabled": bool(
+                            row["notifications_enabled"]
+                        ),
+                        **projection,
+                    }
+                )
+            severity_rank = {"critical": 0, "warning": 1, "info": 2}
+            state_rank = {"open": 0, "acknowledged": 1, "resolved": 2}
+            all_incidents.sort(key=lambda incident: str(incident["incident_id"]))
+            all_incidents.sort(
+                key=lambda incident: str(incident["last_seen_at"]),
+                reverse=True,
+            )
+            all_incidents.sort(
+                key=lambda incident: (
+                    not bool(incident["operationally_blocking"]),
+                    incident["state"] == "resolved",
+                    severity_rank.get(str(incident["severity"]), 3),
+                    state_rank.get(str(incident["state"]), 3),
+                )
+            )
+            incidents = all_incidents[:incident_limit]
+            incident_page = _page_metadata(
+                limit=incident_limit,
+                returned=len(incidents),
+                total=summary["total"],
+            )
+            anomaly_rows = connection.execute(
                 """
                 SELECT *
-                FROM incidents
+                FROM anomaly_cases
                 ORDER BY
+                    CASE WHEN state = 'resolved' THEN 1 ELSE 0 END,
+                    CASE severity
+                        WHEN 'critical' THEN 0
+                        WHEN 'high' THEN 1
+                        WHEN 'medium' THEN 2
+                        WHEN 'low' THEN 3
+                        ELSE 4
+                    END,
                     CASE state
                         WHEN 'open' THEN 0
                         WHEN 'acknowledged' THEN 1
-                        ELSE 2
+                        WHEN 'deferred' THEN 2
+                        ELSE 3
                     END,
-                    CASE severity
-                        WHEN 'critical' THEN 0
-                        WHEN 'warning' THEN 1
-                        ELSE 2
-                    END,
-                    last_seen_at DESC
+                    last_seen_at DESC,
+                    case_id
                 LIMIT ?
                 """,
-                (incident_limit,),
+                (anomaly_case_limit,),
             ).fetchall()
-            incidents = [
+            for anomaly_row in anomaly_rows:
+                verify_anomaly_case_evidence(connection, anomaly_row)
+            anomaly_cases = [
                 {
-                    "incident_id": str(row["incident_id"]),
+                    "case_id": str(row["case_id"]),
                     "fingerprint": str(row["fingerprint"]),
-                    "code": str(row["code"]),
+                    "rule_id": str(row["rule_id"]),
+                    "rule_version": str(row["rule_version"]),
+                    "scope": str(row["scope"]),
+                    "subject_type": str(row["subject_type"]),
+                    "subject_id": str(row["subject_id"]),
                     "severity": str(row["severity"]),
+                    "confidence": str(row["confidence"]),
                     "title": str(row["title"]),
-                    "body": str(row["body"]),
-                    "source_job": str(row["source_job"]),
+                    "summary": str(row["summary"]),
                     "state": str(row["state"]),
+                    "owner": str(row["owner"]) if row["owner"] is not None else None,
                     "first_seen_at": str(row["first_seen_at"]),
                     "last_seen_at": str(row["last_seen_at"]),
                     "occurrence_count": int(row["occurrence_count"]),
-                    "payload": _read_json_object(
-                        row["payload_json"],
-                        field="incident payload",
+                    "current_evidence_sha256": str(row["current_evidence_sha256"]),
+                    "evidence": _read_json_object(
+                        row["evidence_json"],
+                        field="anomaly case evidence",
                     ),
-                    "acknowledged_at": (
-                        str(row["acknowledged_at"])
-                        if row["acknowledged_at"] is not None
+                    "suggested_checks": _read_json_array(
+                        row["suggested_checks_json"],
+                        field="anomaly case suggested checks",
+                    ),
+                    "disposition": (
+                        str(row["disposition"])
+                        if row["disposition"] is not None
+                        else None
+                    ),
+                    "resolution_note": (
+                        str(row["resolution_note"])
+                        if row["resolution_note"] is not None
+                        else None
+                    ),
+                    "resolution_actor": (
+                        str(row["resolution_actor"])
+                        if row["resolution_actor"] is not None
                         else None
                     ),
                     "resolved_at": (
@@ -395,31 +582,92 @@ def load_operations_evidence_read_only(
                         if row["resolved_at"] is not None
                         else None
                     ),
-                    "notifications_enabled": bool(row["notifications_enabled"]),
+                    "next_review_at": (
+                        str(row["next_review_at"])
+                        if row["next_review_at"] is not None
+                        else None
+                    ),
+                    "last_scan_id": str(row["last_scan_id"]),
                 }
-                for row in rows
+                for row in anomaly_rows
             ]
-            summary = {
-                "open": 0,
-                "acknowledged": 0,
-                "resolved": 0,
-                "unresolved": 0,
-                "critical_unresolved": 0,
-                "total": 0,
-            }
+            anomaly_case_summary = _empty_anomaly_case_summary()
             for row in connection.execute(
-                "SELECT state, severity, COUNT(*) AS count FROM incidents "
-                "GROUP BY state, severity"
+                """
+                SELECT state, severity, COUNT(*) AS count
+                FROM anomaly_cases
+                GROUP BY state, severity
+                """
             ).fetchall():
                 state = str(row["state"])
+                severity = str(row["severity"])
                 count = int(row["count"])
-                if state in summary:
-                    summary[state] += count
-                summary["total"] += count
+                if state in anomaly_case_summary:
+                    anomaly_case_summary[state] += count
+                anomaly_case_summary["total"] += count
                 if state != "resolved":
-                    summary["unresolved"] += count
-                    if row["severity"] == "critical":
-                        summary["critical_unresolved"] += count
+                    anomaly_case_summary["unresolved"] += count
+                    if severity == "critical":
+                        anomaly_case_summary["critical_unresolved"] += count
+                    if severity == "high":
+                        anomaly_case_summary["high_unresolved"] += count
+            affected_subjects = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM (
+                    SELECT DISTINCT subject_type, subject_id
+                    FROM anomaly_cases
+                    WHERE state != 'resolved'
+                )
+                """
+            ).fetchone()
+            anomaly_case_summary["affected_subjects"] = int(
+                affected_subjects["count"]
+            )
+            anomaly_case_page = _page_metadata(
+                limit=anomaly_case_limit,
+                returned=len(anomaly_cases),
+                total=anomaly_case_summary["total"],
+            )
+            anomaly_scan = connection.execute(
+                """
+                SELECT *
+                FROM anomaly_scans
+                ORDER BY recorded_sequence DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            latest_anomaly_scan = (
+                {
+                    "scan_id": str(anomaly_scan["scan_id"]),
+                    "payload_sha256": str(anomaly_scan["payload_sha256"]),
+                    "rule_bundle_version": str(
+                        anomaly_scan["rule_bundle_version"]
+                    ),
+                    "scope": str(anomaly_scan["scope"]),
+                    "source_boundary_sha256": str(
+                        anomaly_scan["source_boundary_sha256"]
+                    ),
+                    "source_boundary_at": str(
+                        anomaly_scan["source_boundary_at"]
+                    ),
+                    "recorded_at": str(anomaly_scan["recorded_at"]),
+                    "recorded_sequence": int(
+                        anomaly_scan["recorded_sequence"]
+                    ),
+                    "observation_count": int(anomaly_scan["observation_count"]),
+                    "evidence": _read_json_object(
+                        anomaly_scan["evidence_json"],
+                        field="anomaly scan evidence",
+                    ),
+                    "observed_fingerprints": _read_json_array(
+                        anomaly_scan["observed_fingerprints_json"],
+                        field="anomaly scan observed fingerprints",
+                    ),
+                }
+                if anomaly_scan is not None
+                else None
+            )
             job = connection.execute(
                 """
                 SELECT *
@@ -545,6 +793,11 @@ def load_operations_evidence_read_only(
                 """
             ).fetchall():
                 notification_summary[str(row["state"])] = int(row["count"])
+            notification_page = _page_metadata(
+                limit=notification_limit,
+                returned=len(notifications),
+                total=sum(notification_summary.values()),
+            )
             route = connection.execute(
                 """
                 SELECT *
@@ -596,9 +849,15 @@ def load_operations_evidence_read_only(
         "schema_version": ALERT_SCHEMA_VERSION,
         "incidents": incidents,
         "incident_summary": summary,
+        "incident_page": incident_page,
+        "anomaly_cases": anomaly_cases,
+        "anomaly_case_summary": anomaly_case_summary,
+        "anomaly_case_page": anomaly_case_page,
+        "latest_anomaly_scan": latest_anomaly_scan,
         "daily_cycle": daily_cycle,
         "notifications": notifications,
         "notification_summary": notification_summary,
+        "notification_page": notification_page,
         "notification_route": notification_route,
         "error": None,
     }

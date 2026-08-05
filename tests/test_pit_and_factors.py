@@ -450,7 +450,11 @@ def test_edgar_extract_rejects_fact_filed_before_period_end(monkeypatch):
     monkeypatch.setattr(
         edgar,
         "fetch_submissions",
-        lambda cik: {"name": "Test Corp", "exchanges": ["NYSE"]},
+        lambda cik, **_kwargs: {
+            "cik": cik,
+            "name": "Test Corp",
+            "exchanges": ["NYSE"],
+        },
     )
     payload = {
         "cik": 1,
@@ -1063,7 +1067,11 @@ def test_fred_fetch_preserves_observation_and_release_dates(monkeypatch):
                 }
             )
 
-    monkeypatch.setattr(fred_ingest.settings, "fred_api_key", "test-key")
+    monkeypatch.setattr(
+        fred_ingest,
+        "settings",
+        SimpleNamespace(fred_api_key="test-key"),
+    )
     monkeypatch.setitem(sys.modules, "fredapi", SimpleNamespace(Fred=FakeFred))
 
     rows = fred_ingest.fetch_series_fred("GDP", realtime_start="2020-01-01")
@@ -1099,7 +1107,11 @@ def test_fred_normalized_export_is_linked_and_replay_verified(
                 }
             )
 
-    monkeypatch.setattr(fred_ingest.settings, "fred_api_key", "test-key")
+    monkeypatch.setattr(
+        fred_ingest,
+        "settings",
+        SimpleNamespace(fred_api_key="test-key"),
+    )
     monkeypatch.setitem(sys.modules, "fredapi", SimpleNamespace(Fred=FakeFred))
     store = Store(tmp_path / "data" / "test.duckdb")
     try:
@@ -1160,7 +1172,11 @@ def test_fred_fetch_chunks_oversized_vintage_histories(monkeypatch):
                 }
             )
 
-    monkeypatch.setattr(fred_ingest.settings, "fred_api_key", "test-key")
+    monkeypatch.setattr(
+        fred_ingest,
+        "settings",
+        SimpleNamespace(fred_api_key="test-key"),
+    )
     monkeypatch.setattr(fred_ingest, "FRED_VINTAGE_CHUNK_SIZE", 2)
     monkeypatch.setitem(sys.modules, "fredapi", SimpleNamespace(Fred=FakeFred))
 
@@ -1201,7 +1217,11 @@ def test_fred_fetch_retries_truncated_responses(monkeypatch):
                 }
             )
 
-    monkeypatch.setattr(fred_ingest.settings, "fred_api_key", "test-key")
+    monkeypatch.setattr(
+        fred_ingest,
+        "settings",
+        SimpleNamespace(fred_api_key="test-key"),
+    )
     monkeypatch.setattr(
         fred_ingest,
         "_fetch_release_window",
@@ -1260,7 +1280,11 @@ def test_macro_ingest_accepts_treasury_for_a_failed_fred_yield(
     def failed_fred(*_args, **_kwargs):
         raise ConnectionError("FRED unavailable")
 
-    monkeypatch.setattr(fred_ingest.settings, "fred_api_key", "test-key")
+    monkeypatch.setattr(
+        fred_ingest,
+        "settings",
+        SimpleNamespace(fred_api_key="test-key"),
+    )
     monkeypatch.setattr(fred_ingest, "fetch_series_fred", failed_fred)
     monkeypatch.setattr(
         fred_ingest,
@@ -1409,7 +1433,7 @@ def test_old_macro_schema_is_migrated_and_excluded_from_pit(tmp_path):
     finally:
         con.close()
 
-    store = Store(db_path)
+    store = Store(db_path, allow_schema_upgrade=True)
     try:
         columns = {row["column_name"] for row in store.query("DESCRIBE macro")}
         assert "release_date" in columns

@@ -17,7 +17,6 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Iterable, Mapping
-from contextlib import nullcontext
 from datetime import date, timedelta
 from io import StringIO
 from pathlib import Path
@@ -28,7 +27,6 @@ from aios.artifacts import publish_text_write_once
 from aios.ingest.edgar import (
     SUBMISSIONS_FILE_URL,
     SUBMISSIONS_URL,
-    CompanyFactsArchive,
     fetch_company_ticker_records,
     fetch_submission_file,
     fetch_submissions,
@@ -1183,8 +1181,9 @@ def ingest_reviewed_reference_batch(
 ) -> dict[str, Any]:
     """Import one reviewed batch, then ingest every issuer and verified security.
 
-    A local official Company Facts ZIP may replace per-CIK facts requests for
-    larger batches. Submissions metadata remains a separate per-CIK request.
+    Fundamentals use the governed per-CIK SEC capture path. The bulk ZIP
+    parameter is retained only to fail closed with an explicit migration
+    message; archive members do not yet have immutable run-bound lineage.
     """
     from aios.ingest.edgar import ingest_issuer
 
@@ -1193,6 +1192,11 @@ def ingest_reviewed_reference_batch(
     window_end = _as_date(end, "end")
     if window_end <= window_start:
         raise ValueError("end must follow start")
+    if companyfacts_zip_path is not None:
+        raise RuntimeError(
+            "Company Facts ZIP ingestion is disabled until archive members have "
+            "a governed immutable-source lineage contract."
+        )
     issuers, cik_history = load_issuer_cik_csv(issuer_cik_path)
     providers = load_provider_symbol_csv(provider_symbol_path)
     latest_cik_by_issuer: dict[str, dict] = {}
@@ -1205,35 +1209,23 @@ def ingest_reviewed_reference_batch(
     fundamental_rows = 0
     price_rows = 0
     failures: list[dict[str, str]] = []
-    archive_context = (
-        CompanyFactsArchive(companyfacts_zip_path)
-        if companyfacts_zip_path is not None
-        else nullcontext(None)
+    counts = ingest_reference_identity_csvs(
+        issuer_cik_path,
+        security_issuer_path,
+        provider_symbol_path,
+        store=db,
     )
-    with archive_context as facts_archive:
-        if facts_archive is not None:
-            facts_archive.validate_ciks([int(row["cik"]) for row in latest_cik_by_issuer.values()])
-        counts = ingest_reference_identity_csvs(
-            issuer_cik_path,
-            security_issuer_path,
-            provider_symbol_path,
-            store=db,
-        )
-        for row in issuers:
-            try:
-                ingest_kwargs: dict[str, Any] = {"store": db}
-                if facts_archive is not None:
-                    cik = int(latest_cik_by_issuer[row["issuer_id"]]["cik"])
-                    ingest_kwargs["facts_payload"] = facts_archive.read(cik)
-                fundamental_rows += ingest_issuer(row["issuer_id"], **ingest_kwargs)
-            except Exception as exc:
-                failures.append(
-                    {
-                        "kind": "fundamentals",
-                        "id": row["issuer_id"],
-                        "error": str(exc),
-                    }
-                )
+    for row in issuers:
+        try:
+            fundamental_rows += ingest_issuer(row["issuer_id"], store=db)
+        except Exception as exc:
+            failures.append(
+                {
+                    "kind": "fundamentals",
+                    "id": row["issuer_id"],
+                    "error": str(exc),
+                }
+            )
     security_ids = sorted(
         {row["security_id"] for row in providers if row["mapping_status"] == "verified"}
     )
@@ -1255,9 +1247,7 @@ def ingest_reviewed_reference_batch(
         "fundamental_rows": fundamental_rows,
         "price_rows": price_rows,
         "failures": failures,
-        "companyfacts_source": (
-            str(companyfacts_zip_path) if companyfacts_zip_path is not None else "sec-api"
-        ),
+        "companyfacts_source": "sec-api",
     }
 
 

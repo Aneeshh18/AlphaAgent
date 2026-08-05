@@ -8,7 +8,13 @@ import httpx
 import pytest
 
 from aios.ingest import edgar, fred, prices
-from aios.ingest.http_client import HttpClient, RawSnapshotContext, _secret_free_url
+from aios.ingest import http_client as http_client_module
+from aios.ingest.http_client import (
+    HttpClient,
+    RawSnapshotContext,
+    ResponseTooLargeError,
+    _secret_free_url,
+)
 from aios.raw_snapshots import verify_raw_snapshots
 from aios.storage.store import Store
 
@@ -64,9 +70,7 @@ def test_http_json_capture_keeps_exact_bytes_and_ingest_link(tmp_path) -> None:
         assert snapshot["artifact_kind"] == "exact_response"
         assert snapshot["parser_version"] == "test-parser-v1"
         assert snapshot["parsed_row_count"] is None
-        assert store.query(
-            "SELECT run_id, snapshot_id, role FROM ingest_raw_snapshots"
-        ) == [
+        assert store.query("SELECT run_id, snapshot_id, role FROM ingest_raw_snapshots") == [
             {
                 "run_id": "run-1",
                 "snapshot_id": snapshot["snapshot_id"],
@@ -100,6 +104,27 @@ def test_malformed_json_is_captured_before_parse_failure(tmp_path) -> None:
         store.close()
 
 
+def test_http_response_is_bounded_before_snapshot_capture(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(http_client_module, "_MAX_RESPONSE_BYTES", 4)
+    store = Store(tmp_path / "data" / "test.duckdb")
+    client = _client(b"12345")
+    try:
+        with pytest.raises(ResponseTooLargeError, match="ingest byte limit"):
+            client.get_bytes(
+                "https://data.sec.gov/oversized",
+                raw_snapshot=_context(tmp_path, store),
+            )
+
+        assert store.query("SELECT COUNT(*) AS n FROM raw_snapshots")[0]["n"] == 0
+        assert not (tmp_path / "data" / "raw").exists()
+    finally:
+        client.close()
+        store.close()
+
+
 def test_request_description_redacts_secret_query_values_and_fragments() -> None:
     safe = _secret_free_url(
         "https://example.test/data?series=GDP&api_key=super-secret#local-fragment"
@@ -109,6 +134,43 @@ def test_request_description_redacts_secret_query_values_and_fragments() -> None
     assert "super-secret" not in safe
     assert "local-fragment" not in safe
     assert "%3Credacted%3E" in safe
+
+
+def test_http_transport_forces_identity_encoding_before_snapshot_decode() -> None:
+    observed: list[str | None] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        encoding = request.headers.get("accept-encoding")
+        observed.append(encoding)
+        if encoding != "identity":
+            return httpx.Response(
+                200,
+                content=b'{"ok":true}',
+                headers={
+                    "content-type": "application/json",
+                    "content-encoding": "gzip",
+                },
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            content=b'{"ok":true}',
+            headers={"content-type": "application/json"},
+            request=request,
+        )
+
+    client = HttpClient()
+    client._client.close()
+    client._client = httpx.Client(transport=httpx.MockTransport(respond))
+    try:
+        assert client.get_json(
+            "https://data.sec.gov/test",
+            headers={"Accept-Encoding": "gzip"},
+        ) == {"ok": True}
+    finally:
+        client.close()
+
+    assert observed == ["identity"]
 
 
 def test_sec_companyfacts_fetch_passes_reviewed_snapshot_context(monkeypatch, tmp_path) -> None:
@@ -200,6 +262,10 @@ def test_sec_issuer_responses_attach_canonical_replay_evidence(
         assert len(rows) == 1
         assert rows[0]["metric"] == "revenue"
         assert rows[0]["as_of_date"] == "2024-05-01"
+        assert rows[0]["ingest_run_id"] == "issuer-run"
+        assert rows[0]["source_snapshot_id"].startswith("raw-")
+        assert len(rows[0]["source_rowset_sha256"]) == 64
+        assert len(rows[0]["source_row_sha256"]) == 64
         assert meta["name"] == "Test Corporation"
         assert meta["exchange"] == "NYSE"
         snapshots = store.query(
@@ -209,8 +275,7 @@ def test_sec_issuer_responses_attach_canonical_replay_evidence(
             """
         )
         assert [
-            (row["dataset"], row["parser_version"], row["parsed_row_count"])
-            for row in snapshots
+            (row["dataset"], row["parser_version"], row["parsed_row_count"]) for row in snapshots
         ] == [
             ("companyfacts", edgar.COMPANYFACTS_PARSER_VERSION, 1),
             ("submissions", edgar.SUBMISSIONS_PARSER_VERSION, 1),
@@ -282,11 +347,7 @@ def test_sec_companyfacts_identity_failure_keeps_byte_only_capture(
 
 
 def test_treasury_fetch_passes_snapshot_context_and_parses_rows(monkeypatch, tmp_path) -> None:
-    payload = (
-        b"Date,2 Yr,10 Yr,30 Yr\n"
-        b"07/25/2026,4.0,4.1,4.2\n"
-        b"07/24/2026,4.1,4.2,4.3\n"
-    )
+    payload = b"Date,2 Yr,10 Yr,30 Yr\n07/25/2026,4.0,4.1,4.2\n07/24/2026,4.1,4.2,4.3\n"
     client = _client(payload, "text/csv")
     store = Store(tmp_path / "data" / "test.duckdb")
     try:
@@ -319,9 +380,9 @@ def test_treasury_fetch_passes_snapshot_context_and_parses_rows(monkeypatch, tmp
         # excluded from the still-open decision boundary.
         assert snapshot["parsed_row_count"] == 6
         assert snapshot["parsed_rows_sha256"]
-        assert store.query(
-            "SELECT run_id, role FROM ingest_raw_snapshots"
-        ) == [{"run_id": "macro-run", "role": "treasury-yields:2026"}]
+        assert store.query("SELECT run_id, role FROM ingest_raw_snapshots") == [
+            {"run_id": "macro-run", "role": "treasury-yields:2026"}
+        ]
         assert (
             verify_raw_snapshots(
                 store=store,
@@ -380,9 +441,7 @@ def test_exact_stooq_and_tiingo_responses_are_replayable(
             ingest_run_id="stooq-run",
             project_root=tmp_path,
         )
-        assert [(row["date"], row["close"]) for row in stooq_rows] == [
-            ("2026-07-24", 12.0)
-        ]
+        assert [(row["date"], row["close"]) for row in stooq_rows] == [("2026-07-24", 12.0)]
 
         monkeypatch.setattr(
             prices,
@@ -398,9 +457,7 @@ def test_exact_stooq_and_tiingo_responses_are_replayable(
             ingest_run_id="tiingo-run",
             project_root=tmp_path,
         )
-        assert [(row["date"], row["close"]) for row in tiingo_rows] == [
-            ("2026-07-24", 21.0)
-        ]
+        assert [(row["date"], row["close"]) for row in tiingo_rows] == [("2026-07-24", 21.0)]
 
         snapshots = store.query(
             """
@@ -409,8 +466,7 @@ def test_exact_stooq_and_tiingo_responses_are_replayable(
             """
         )
         assert [
-            (row["provider"], row["parser_version"], row["parsed_row_count"])
-            for row in snapshots
+            (row["provider"], row["parser_version"], row["parsed_row_count"]) for row in snapshots
         ] == [
             ("stooq", prices.STOOQ_PARSER_VERSION, 2),
             ("tiingo", prices.TIINGO_PARSER_VERSION, 1),
@@ -480,9 +536,7 @@ def test_stooq_html_challenge_is_retained_but_never_promoted(
 
 def test_exact_price_parsers_reject_semantically_unusable_rows() -> None:
     with pytest.raises(ValueError, match="Close must be positive"):
-        prices.parse_stooq_daily_csv(
-            b"Date,Open,High,Low,Close,Volume\n2026-07-24,10,12,9,,1000\n"
-        )
+        prices.parse_stooq_daily_csv(b"Date,Open,High,Low,Close,Volume\n2026-07-24,10,12,9,,1000\n")
 
     with pytest.raises(ValueError, match="High is below another OHLC value"):
         prices.parse_stooq_daily_csv(

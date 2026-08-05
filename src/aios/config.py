@@ -7,11 +7,24 @@ anything else should never read env vars directly — they come through here.
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from aios.security import ensure_private_directory
+
+
+def secret_value(value: SecretStr | str) -> str:
+    """Reveal a configured secret only at the provider boundary.
+
+    The ``str`` branch keeps narrow test doubles and downstream integrations
+    compatible while the real Settings model stores credentials as SecretStr.
+    """
+
+    return value.get_secret_value() if isinstance(value, SecretStr) else value
 
 
 def _looks_like_project_root(candidate: Path) -> bool:
@@ -42,6 +55,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        frozen=True,
     )
 
     # --- SEC EDGAR ---
@@ -51,17 +65,17 @@ class Settings(BaseSettings):
     )
 
     # --- FRED ---
-    fred_api_key: str = Field(default="")
+    fred_api_key: SecretStr = Field(default=SecretStr(""))
 
     # --- SimFin (optional) ---
-    simfin_api_key: str = Field(default="")
+    simfin_api_key: SecretStr = Field(default=SecretStr(""))
 
     # --- Tiingo EOD prices (optional; each user supplies their own token) ---
-    tiingo_api_key: str = Field(default="")
+    tiingo_api_key: SecretStr = Field(default=SecretStr(""))
 
     # --- LLM (reserved, unused in foundation phase) ---
-    anthropic_api_key: str = Field(default="")
-    zai_api_key: str = Field(default="")
+    anthropic_api_key: SecretStr = Field(default=SecretStr(""))
+    zai_api_key: SecretStr = Field(default=SecretStr(""))
 
     # --- External email alerts (optional; disabled until explicitly activated) ---
     smtp_host: str = Field(default="")
@@ -111,6 +125,7 @@ class Settings(BaseSettings):
 
     def ensure_dirs(self) -> None:
         """Create data/log directories if missing. Call at startup."""
+        root = self.project_root.resolve()
         for p in (
             self.duckdb_path.parent,
             self.operations_db_path.parent,
@@ -118,8 +133,14 @@ class Settings(BaseSettings):
             self.parquet_dir,
             self.log_dir,
         ):
-            p_abs = p if p.is_absolute() else self.project_root / p
-            p_abs.mkdir(parents=True, exist_ok=True)
+            requested = p if p.is_absolute() else root / p
+            destination = Path(os.path.abspath(requested))
+            if destination == root or root not in destination.parents:
+                raise ValueError(
+                    "AIOS runtime directories must be dedicated children of "
+                    f"the project root: {destination}"
+                )
+            ensure_private_directory(destination)
 
 
 @lru_cache(maxsize=1)

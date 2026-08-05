@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from typer.testing import CliRunner
 
@@ -126,6 +127,84 @@ def test_current_us_refresh_retains_each_price_failure_and_continues() -> None:
     assert [(failure.kind, failure.identity) for failure in result.failures] == [
         ("prices", "sec-b"),
         ("benchmark", "SPY"),
+    ]
+
+
+def test_fundamental_transport_circuit_stops_systemic_provider_failure() -> None:
+    members = [
+        {"ticker": f"T{index}", "security_id": f"sec-{index}"}
+        for index in range(1, 6)
+    ]
+
+    class CircuitStore(FakeStore):
+        def issuer_id_for_security(self, security_id: str, as_of: date) -> str:
+            assert as_of == date(2026, 7, 21)
+            return security_id.replace("sec-", "issuer-")
+
+    attempted: list[str] = []
+
+    def fail_transport(issuer_id: str) -> int:
+        attempted.append(issuer_id)
+        raise httpx.DecodingError(
+            "incorrect header check",
+            request=httpx.Request("GET", "https://data.sec.gov/test"),
+        )
+
+    result = refresh_us_current(
+        "2026-07-21",
+        today=date(2026, 7, 21),
+        store=CircuitStore(members),  # type: ignore[arg-type]
+        minimum_members=1,
+        maximum_members=10,
+        include_prices=False,
+        include_macro=False,
+        issuer_ingester=fail_transport,
+    )
+
+    assert attempted == ["issuer-1", "issuer-2", "issuer-3"]
+    assert result.issuers_attempted == 3
+    assert [(failure.kind, failure.identity) for failure in result.failures] == [
+        ("fundamentals", "issuer-1"),
+        ("fundamentals", "issuer-2"),
+        ("fundamentals", "issuer-3"),
+        ("fundamentals_transport_circuit", "2 issuer(s) not attempted"),
+    ]
+
+
+def test_price_transport_circuit_does_not_attempt_remaining_securities() -> None:
+    members = [
+        {"ticker": f"T{index}", "security_id": f"sec-{index}"}
+        for index in range(1, 6)
+    ]
+    attempted: list[str] = []
+
+    def fail_transport(security_id: str) -> int:
+        attempted.append(security_id)
+        raise httpx.ConnectError(
+            "provider unavailable",
+            request=httpx.Request("GET", "https://query1.finance.yahoo.com/test"),
+        )
+
+    result = refresh_us_current(
+        "2026-07-21",
+        today=date(2026, 7, 21),
+        store=FakeStore(members),  # type: ignore[arg-type]
+        minimum_members=1,
+        maximum_members=10,
+        include_benchmark=False,
+        include_fundamentals=False,
+        include_macro=False,
+        security_price_ingester=fail_transport,
+        sleeper=lambda _seconds: None,
+    )
+
+    assert attempted == ["sec-1", "sec-2", "sec-3"]
+    assert result.securities_attempted == 3
+    assert [(failure.kind, failure.identity) for failure in result.failures] == [
+        ("prices", "sec-1"),
+        ("prices", "sec-2"),
+        ("prices", "sec-3"),
+        ("prices_transport_circuit", "2 security(s) not attempted"),
     ]
 
 
@@ -270,10 +349,7 @@ def test_current_us_refresh_cli_keeps_membership_review_boundary(
     assert captured["include_fundamentals"] is False
     assert "already reviewed identities" in result.output
     assert "Run `aios health`" in result.output
-    assert recovered == [
-        "refresh:prices-macro:failure",
-        "refresh:prices-macro:partial",
-    ]
+    assert recovered == []
 
 
 def test_current_us_refresh_cli_records_zero_exit_degradation(
@@ -311,4 +387,4 @@ def test_current_us_refresh_cli_records_zero_exit_degradation(
     assert result.exit_code == 0
     assert [alert.code for alert in emitted] == ["current_refresh_partial"]
     assert emitted[0].payload["identities"] == ["ABC"]
-    assert recovered == ["refresh:prices-macro:failure"]
+    assert recovered == []

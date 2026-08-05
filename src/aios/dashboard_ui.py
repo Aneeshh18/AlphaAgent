@@ -811,6 +811,18 @@ def _unresolved_incidents(operations: Mapping[str, Any] | None) -> list[Mapping[
     ]
 
 
+def _unresolved_anomaly_cases(
+    operations: Mapping[str, Any] | None,
+) -> list[Mapping[str, Any]]:
+    if not operations:
+        return []
+    return [
+        row
+        for row in operations.get("anomaly_cases", [])
+        if isinstance(row, Mapping) and row.get("state") != "resolved"
+    ]
+
+
 def _operations_status(operations: Mapping[str, Any] | None) -> StatusCard:
     if not operations or operations.get("error"):
         return StatusCard(
@@ -821,7 +833,21 @@ def _operations_status(operations: Mapping[str, Any] | None) -> StatusCard:
         )
 
     unresolved = _unresolved_incidents(operations)
+    unresolved_cases = _unresolved_anomaly_cases(operations)
     critical = [row for row in unresolved if row.get("severity") == "critical"]
+    critical_cases = [
+        row for row in unresolved_cases if row.get("severity") == "critical"
+    ]
+    if critical_cases:
+        return StatusCard(
+            label="Operations",
+            value="Critical Attention",
+            detail=(
+                f"{len(critical_cases)} critical of {len(unresolved_cases)} unresolved "
+                f"data-review case(s); {len(unresolved)} operating incident(s)."
+            ),
+            tone="danger",
+        )
     if critical:
         return StatusCard(
             label="Operations",
@@ -839,11 +865,14 @@ def _operations_status(operations: Mapping[str, Any] | None) -> StatusCard:
             detail="The latest guarded daily workflow did not finish safely.",
             tone="danger",
         )
-    if unresolved:
+    if unresolved_cases or unresolved:
         return StatusCard(
             label="Operations",
             value="Needs Review",
-            detail=f"{len(unresolved)} unresolved operating incident(s).",
+            detail=(
+                f"{len(unresolved_cases)} data-review case(s) and "
+                f"{len(unresolved)} operating incident(s) remain unresolved."
+            ),
             tone="warning",
         )
     if daily_state == "running":
@@ -872,7 +901,8 @@ def _operations_status(operations: Mapping[str, Any] | None) -> StatusCard:
         value="No Open Incidents",
         detail=(
             "The latest recorded daily workflow succeeded and no unresolved incident "
-            "is recorded. Verify scheduler and backup detail in System Health."
+            "or data-review case is recorded. Verify scheduler and backup detail in "
+            "Operations."
         ),
         tone="success",
     )

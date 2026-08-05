@@ -89,6 +89,11 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     ticker          VARCHAR NOT NULL,
     issuer_id       VARCHAR,             -- legal/reporting entity identity
     security_id     VARCHAR,             -- optional listed-security context
+    ingest_run_id   VARCHAR,             -- successful source ingest (NULL = legacy)
+    source_snapshot_id VARCHAR,           -- exact Company Facts response
+    source_rowset_sha256 VARCHAR,         -- canonical parser output hash
+    source_row_sha256 VARCHAR,            -- canonical provider-row hash
+    source_fact_locator VARCHAR,           -- canonical taxonomy/concept/accession locator
     period_end      DATE NOT NULL,      -- fiscal period being reported
     as_of_date      DATE NOT NULL,      -- PIT key: when data became knowable
     fiscal_period   VARCHAR,            -- 'FY2024','Q1_2025', etc.
@@ -102,12 +107,52 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     PRIMARY KEY (ticker, period_end, as_of_date, metric)
 );
 
+-- Append-only system-time history for governed factor decisions. ``fundamentals``
+-- remains the current projection; a named evidence generation resolves each
+-- economic key to the latest version at or before its captured sequence.
+CREATE SEQUENCE IF NOT EXISTS fundamental_version_seq START 1;
+CREATE TABLE IF NOT EXISTS fundamental_versions (
+    version_sequence BIGINT PRIMARY KEY DEFAULT nextval('fundamental_version_seq'),
+    ticker          VARCHAR NOT NULL,
+    issuer_id       VARCHAR,
+    security_id     VARCHAR,
+    ingest_run_id   VARCHAR,
+    source_snapshot_id VARCHAR,
+    source_rowset_sha256 VARCHAR,
+    source_row_sha256 VARCHAR,
+    source_fact_locator VARCHAR,
+    period_end      DATE NOT NULL,
+    as_of_date      DATE NOT NULL,
+    fiscal_period   VARCHAR,
+    statement       VARCHAR,
+    metric          VARCHAR NOT NULL,
+    value           DOUBLE,
+    quarter_value   DOUBLE,
+    unit            VARCHAR,
+    source          VARCHAR,
+    recorded_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_deleted      BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE TABLE IF NOT EXISTS fundamental_evidence_generations (
+    generation_id  VARCHAR PRIMARY KEY,
+    version_sequence BIGINT NOT NULL,
+    purpose        VARCHAR NOT NULL,
+    decision_date  DATE,
+    captured_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Invalid source rows are moved here instead of being destroyed. They are
 -- excluded from every PIT query but remain available for provenance review.
 CREATE TABLE IF NOT EXISTS fundamentals_quarantine (
     ticker          VARCHAR NOT NULL,
     issuer_id       VARCHAR,
     security_id     VARCHAR,
+    ingest_run_id   VARCHAR,
+    source_snapshot_id VARCHAR,
+    source_rowset_sha256 VARCHAR,
+    source_row_sha256 VARCHAR,
+    source_fact_locator VARCHAR,
     period_end      DATE NOT NULL,
     as_of_date      DATE NOT NULL,
     fiscal_period   VARCHAR,
@@ -138,12 +183,19 @@ CREATE TABLE IF NOT EXISTS ingest_log (
     run_id          VARCHAR NOT NULL,
     source          VARCHAR NOT NULL,
     table_name      VARCHAR NOT NULL,
+    subject_type    VARCHAR,
+    subject_id      VARCHAR,
     rows_inserted   BIGINT,
     rows_rejected   BIGINT,
     started_at      TIMESTAMP,
     finished_at     TIMESTAMP,
     status          VARCHAR,
-    error           TEXT
+    error           TEXT,
+    rejection_codes VARCHAR,             -- canonical machine-readable JSON codes
+    CHECK (
+        (subject_type IS NULL AND subject_id IS NULL)
+        OR (subject_type IS NOT NULL AND subject_id IS NOT NULL)
+    )
 );
 
 -- Immutable provider evidence is split into content-addressed payloads and
@@ -174,6 +226,8 @@ CREATE TABLE IF NOT EXISTS raw_snapshots (
     parser_version     VARCHAR NOT NULL,
     parsed_row_count   BIGINT,
     parsed_rows_sha256 VARCHAR,
+    parsed_rows_rejected BIGINT,
+    parsed_rejection_codes VARCHAR,
     created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -218,6 +272,54 @@ CREATE TABLE IF NOT EXISTS universe_coverage_attestations (
     provider_rows_extended     BIGINT NOT NULL,
     detail                     TEXT NOT NULL,
     created_at                 TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Accepted constituent changes are append-only, content-addressed
+-- transactions.  The authoritative receipt lives beside the canonical rows
+-- that it changed so a database backup/restore cannot separate the two.
+CREATE TABLE IF NOT EXISTS universe_constituent_change_activations (
+    activation_id              VARCHAR PRIMARY KEY,
+    event_id                   VARCHAR NOT NULL UNIQUE,
+    plan_sha256                VARCHAR NOT NULL UNIQUE,
+    activation_payload_sha256  VARCHAR NOT NULL UNIQUE,
+    activation_run_id          VARCHAR NOT NULL UNIQUE,
+    fundamental_run_id         VARCHAR NOT NULL UNIQUE,
+    price_run_id               VARCHAR NOT NULL UNIQUE,
+    source_attestation_id      VARCHAR NOT NULL,
+    schema_version             INTEGER NOT NULL CHECK (schema_version = 1),
+    universe_id                VARCHAR NOT NULL,
+    announcement_date          DATE NOT NULL,
+    effective_date             DATE NOT NULL,
+    prior_coverage_through     DATE NOT NULL,
+    target_coverage_through    DATE NOT NULL,
+    official_detail_snapshot_id VARCHAR NOT NULL,
+    component_snapshot_id      VARCHAR NOT NULL,
+    before_member_set_sha256   VARCHAR NOT NULL,
+    after_member_set_sha256    VARCHAR NOT NULL,
+    before_state_sha256        VARCHAR NOT NULL,
+    after_state_sha256         VARCHAR NOT NULL,
+    change_rows_sha256         VARCHAR NOT NULL,
+    activation_payload_json    TEXT NOT NULL,
+    backup_manifest_sha256     VARCHAR NOT NULL,
+    actor                      VARCHAR NOT NULL,
+    policy_version             VARCHAR NOT NULL,
+    counts_json                TEXT NOT NULL,
+    activated_at               TIMESTAMP NOT NULL,
+    status                     VARCHAR NOT NULL CHECK (status = 'accepted'),
+    created_at                 TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CHECK (announcement_date <= effective_date),
+    CHECK (prior_coverage_through < effective_date),
+    CHECK (effective_date <= target_coverage_through),
+    CHECK (regexp_full_match(plan_sha256, '^[0-9a-f]{{64}}$')),
+    CHECK (regexp_full_match(activation_payload_sha256, '^[0-9a-f]{{64}}$')),
+    CHECK (regexp_full_match(before_member_set_sha256, '^[0-9a-f]{{64}}$')),
+    CHECK (regexp_full_match(after_member_set_sha256, '^[0-9a-f]{{64}}$')),
+    CHECK (regexp_full_match(before_state_sha256, '^[0-9a-f]{{64}}$')),
+    CHECK (regexp_full_match(after_state_sha256, '^[0-9a-f]{{64}}$')),
+    CHECK (regexp_full_match(change_rows_sha256, '^[0-9a-f]{{64}}$')),
+    CHECK (regexp_full_match(backup_manifest_sha256, '^[0-9a-f]{{64}}$')),
+    CHECK (length(trim(actor)) > 0),
+    CHECK (length(trim(policy_version)) > 0)
 );
 
 -- Durable markers distinguish an interrupted migration from an intentional
@@ -421,12 +523,15 @@ EXPECTED_TABLES = (
     "securities",
     "prices",
     "fundamentals",
+    "fundamental_versions",
+    "fundamental_evidence_generations",
     "macro",
     "ingest_log",
     "raw_payloads",
     "raw_snapshots",
     "ingest_raw_snapshots",
     "universe_coverage_attestations",
+    "universe_constituent_change_activations",
     "schema_migrations",
     "security_master",
     "security_identity_assignments",

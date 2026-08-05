@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from aios import operator_evidence
-from aios.alerts import Alert, AlertSeverity, AlertStore
+from aios.alerts import (
+    Alert,
+    AlertSeverity,
+    AlertStore,
+    AnomalyObservation,
+    AnomalyScan,
+    canonical_anomaly_fingerprint,
+)
 from aios.daily import DAILY_JOB_NAME
 from aios.operator_evidence import (
     load_operations_evidence_read_only,
@@ -128,6 +135,45 @@ def test_operations_loader_is_read_only_and_preserves_database_identity(tmp_path
         detail="complete",
         now=timestamp,
     )
+    anomaly_fingerprint = canonical_anomaly_fingerprint(
+        rule_id="fundamentals_missing",
+        rule_version="1",
+        scope="us-equity",
+        subject_type="issuer",
+        subject_id="issuer-1",
+    )
+    anomaly_case = store.record_anomaly_scan(
+        AnomalyScan(
+            scan_id="scan-review-1",
+            rule_bundle_version="dq-rules.v1",
+            scope="us-equity",
+            source_boundary_sha256="b" * 64,
+            source_boundary_at=timestamp,
+            executed_rules=("fundamentals_missing@1",),
+            observations=(
+                AnomalyObservation(
+                    fingerprint=anomaly_fingerprint,
+                    rule_id="fundamentals_missing",
+                    rule_version="1",
+                    scope="us-equity",
+                    subject_type="issuer",
+                    subject_id="issuer-1",
+                    severity="high",
+                    confidence="high",
+                    title="Issuer fundamentals need review",
+                    summary=(
+                        "No accepted facts were available at the reviewed boundary."
+                    ),
+                    old_value={"minimum_accepted_fact_count": 1},
+                    new_value={"accepted_fact_count": 0},
+                    evidence={"snapshot_ids": ["snapshot-1"]},
+                    suggested_checks=("Inspect the exact SEC response.",),
+                ),
+            ),
+            evidence={"decision_date": "2026-07-28"},
+        ),
+        now=datetime(2026, 7, 29, 10, 5, tzinfo=UTC),
+    )[0]
     with sqlite3.connect(path) as connection:
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
@@ -152,12 +198,49 @@ def test_operations_loader_is_read_only_and_preserves_database_identity(tmp_path
     assert after == before
     assert first["error"] is None
     assert first["incidents"][0]["incident_id"] == incident.incident_id
+    assert first["incidents"][0]["resolution_proof_status"] == "not_applicable"
+    assert first["incidents"][0]["operationally_blocking"] is True
+    assert first["incident_page"] == {
+        "limit": 100,
+        "returned": 1,
+        "total": 1,
+        "truncated": False,
+    }
+    assert first["anomaly_case_page"]["truncated"] is False
+    assert first["notification_page"]["truncated"] is False
     assert first["daily_cycle"]["job_name"] == DAILY_JOB_NAME
     assert first["daily_cycle"]["state"] == "success"
     assert first["notification_summary"]["pending"] == 1
     assert first["notifications"][0]["incident_id"] == incident.incident_id
     assert first["notification_route"]["route_id"] == route.route_id
     assert first["notification_route"]["state"] == "enabled"
+    assert first["anomaly_cases"][0]["case_id"] == anomaly_case.case_id
+    assert first["anomaly_cases"][0]["suggested_checks"] == [
+        "Inspect the exact SEC response."
+    ]
+    assert first["anomaly_case_summary"] == {
+        "open": 1,
+        "acknowledged": 0,
+        "deferred": 0,
+        "resolved": 0,
+        "unresolved": 1,
+        "critical_unresolved": 0,
+        "high_unresolved": 1,
+        "total": 1,
+        "affected_subjects": 1,
+    }
+    assert first["latest_anomaly_scan"]["scan_id"] == "scan-review-1"
+    assert len(first["latest_anomaly_scan"]["payload_sha256"]) == 64
+    assert first["latest_anomaly_scan"]["source_boundary_at"] == (
+        "2026-07-29T10:00:00Z"
+    )
+    assert first["latest_anomaly_scan"]["recorded_at"] == (
+        "2026-07-29T10:05:00Z"
+    )
+    assert first["latest_anomaly_scan"]["recorded_sequence"] == 1
+    assert first["latest_anomaly_scan"]["observed_fingerprints"] == [
+        anomaly_fingerprint
+    ]
 
 
 def test_operations_loader_fails_closed_when_ledger_changes_during_read(
@@ -239,6 +322,9 @@ def test_operations_loader_fails_closed_when_database_is_absent(tmp_path) -> Non
     result = load_operations_evidence_read_only(tmp_path / "missing.sqlite3")
 
     assert result["incidents"] == []
+    assert result["anomaly_cases"] == []
+    assert result["anomaly_case_summary"]["unresolved"] == 0
+    assert result["latest_anomaly_scan"] is None
     assert result["daily_cycle"] is None
     assert "not initialized" in result["error"]
 
@@ -376,3 +462,151 @@ def test_operations_loader_refuses_uncheckpointed_wal_without_changes(tmp_path) 
     assert result["incidents"] == []
     assert "uncheckpointed WAL" in result["error"]
     assert after == before
+
+
+def test_operations_loader_rejects_missing_resolution_guard_without_changes(
+    tmp_path,
+) -> None:
+    path = tmp_path / "operations.sqlite3"
+    AlertStore(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "DROP TRIGGER incident_events_resolution_proof_required"
+        )
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    before = (path.stat().st_mtime_ns, path.read_bytes())
+
+    result = load_operations_evidence_read_only(path)
+
+    assert "incident proof schema is incomplete" in result["error"]
+    assert (path.stat().st_mtime_ns, path.read_bytes()) == before
+
+
+def test_operations_loader_prioritizes_critical_cases_before_page_limit(
+    tmp_path,
+) -> None:
+    path = tmp_path / "operations.sqlite3"
+    store = AlertStore(path)
+    timestamp = datetime(2026, 7, 29, 10, 0, tzinfo=UTC)
+
+    def observation(index: int, *, severity: str) -> AnomalyObservation:
+        subject = f"issuer-{index}"
+        return AnomalyObservation(
+            fingerprint=canonical_anomaly_fingerprint(
+                rule_id="coverage",
+                rule_version="1",
+                scope="us-equity",
+                subject_type="issuer",
+                subject_id=subject,
+            ),
+            rule_id="coverage",
+            rule_version="1",
+            scope="us-equity",
+            subject_type="issuer",
+            subject_id=subject,
+            severity=severity,
+            confidence="high",
+            title=f"Coverage review for {subject}",
+            summary="One reviewed issuer needs evidence review.",
+            old_value={"covered": True},
+            new_value={"covered": False},
+            evidence={"subject": subject},
+            suggested_checks=("Inspect the exact source evidence.",),
+        )
+
+    observations = tuple(
+        observation(index, severity="low") for index in range(100)
+    ) + (observation(100, severity="critical"),)
+    cases = store.record_anomaly_scan(
+        AnomalyScan(
+            scan_id="scan-priority",
+            rule_bundle_version="coverage.v1",
+            scope="us-equity",
+            source_boundary_sha256="a" * 64,
+            source_boundary_at=timestamp,
+            executed_rules=("coverage@1",),
+            observations=observations,
+        ),
+        now=timestamp,
+    )
+    critical = next(case for case in cases if case.severity == "critical")
+    store.acknowledge_anomaly(
+        critical.case_id,
+        owner="data-ops",
+        note="Critical case is under active review.",
+        expected_evidence_sha256=critical.evidence_sha256,
+        now=datetime(2026, 7, 29, 10, 0, 1, tzinfo=UTC),
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    result = load_operations_evidence_read_only(path, anomaly_case_limit=100)
+
+    assert result["error"] is None
+    assert len(result["anomaly_cases"]) == 100
+    assert result["anomaly_cases"][0]["case_id"] == critical.case_id
+    assert result["anomaly_cases"][0]["severity"] == "critical"
+    assert result["anomaly_cases"][0]["state"] == "acknowledged"
+    assert result["anomaly_case_page"] == {
+        "limit": 100,
+        "returned": 100,
+        "total": 101,
+        "truncated": True,
+    }
+
+
+def test_operations_loader_uses_exact_incident_summary_and_severity_priority(
+    tmp_path,
+) -> None:
+    path = tmp_path / "operations.sqlite3"
+    store = AlertStore(path)
+    timestamp = datetime(2026, 7, 29, 10, 0, tzinfo=UTC)
+    for index in range(100):
+        store.emit(
+            Alert(
+                code="warning",
+                severity=AlertSeverity.WARNING,
+                title=f"Warning {index}",
+                body="One warning remains.",
+                dedup_key=f"warning:{index}",
+                source_job="test",
+                notify=False,
+            ),
+            now=timestamp + timedelta(seconds=index),
+        )
+    critical = store.emit(
+        Alert(
+            code="critical",
+            severity=AlertSeverity.CRITICAL,
+            title="Critical acknowledged incident",
+            body="This critical incident remains operationally blocking.",
+            dedup_key="critical:acknowledged",
+            source_job="test",
+            notify=False,
+        ),
+        now=timestamp,
+    )
+    store.acknowledge(
+        critical.incident_id,
+        actor="ops@example.test",
+        note="Critical evidence is under review.",
+        expected_evidence_sha256=critical.evidence_sha256,
+        now=datetime(2026, 7, 29, 10, 0, 1, tzinfo=UTC),
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    result = load_operations_evidence_read_only(path, incident_limit=100)
+
+    assert result["error"] is None
+    assert result["incident_summary"]["operational_blocking"] == 101
+    assert result["incident_summary"]["critical_operational_blocking"] == 1
+    assert result["incidents"][0]["incident_id"] == critical.incident_id
+    assert result["incidents"][0]["state"] == "acknowledged"
+    assert result["incidents"][1]["fingerprint"] == "warning:99"
+    assert result["incident_page"] == {
+        "limit": 100,
+        "returned": 100,
+        "total": 101,
+        "truncated": True,
+    }

@@ -15,10 +15,13 @@ from datetime import date, timedelta
 from functools import partial
 from typing import Any
 
+import httpx
+
 from aios.config import settings
 from aios.storage.store import Store, get_store
 
 ProgressCallback = Callable[[str, str, int, int], None]
+DEFAULT_CONSECUTIVE_TRANSPORT_FAILURE_LIMIT = 3
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,9 @@ def refresh_us_current(
     minimum_members: int = 450,
     maximum_members: int = 550,
     maximum_membership_age_days: int = 7,
+    consecutive_transport_failure_limit: int = (
+        DEFAULT_CONSECUTIVE_TRANSPORT_FAILURE_LIMIT
+    ),
     store: Store | None = None,
     macro_ingester: Callable[[], int] | None = None,
     issuer_ingester: Callable[[str], int] | None = None,
@@ -91,6 +97,8 @@ def refresh_us_current(
         raise ValueError("invalid universe member bounds")
     if maximum_membership_age_days < 0:
         raise ValueError("maximum_membership_age_days cannot be negative")
+    if consecutive_transport_failure_limit < 1:
+        raise ValueError("consecutive transport failure limit must be positive")
     current_date = today or date.today()
     db = store or get_store()
 
@@ -170,6 +178,7 @@ def refresh_us_current(
             failures.append(RefreshFailure("macro", "required-series", str(exc)))
 
     issuer_ids: list[str] = []
+    issuers_attempted = 0
     if include_fundamentals:
         for security_id in security_ids:
             try:
@@ -188,10 +197,13 @@ def refresh_us_current(
                 continue
             issuer_ids.append(issuer_id)
         issuer_ids = sorted(set(issuer_ids))
+        consecutive_transport_failures = 0
         for index, issuer_id in enumerate(issuer_ids, 1):
+            issuers_attempted = index
             _progress(progress, "fundamentals", issuer_id, index, len(issuer_ids))
             try:
                 rows = int(issuer_ingester(issuer_id))
+                consecutive_transport_failures = 0
                 if rows > 0:
                     fundamental_rows += rows
                 elif db.issuer_has_fundamentals(issuer_id):
@@ -212,8 +224,29 @@ def refresh_us_current(
                     )
             except Exception as exc:
                 failures.append(RefreshFailure("fundamentals", issuer_id, str(exc)))
+                consecutive_transport_failures = (
+                    consecutive_transport_failures + 1
+                    if isinstance(exc, httpx.RequestError)
+                    else 0
+                )
+                if (
+                    consecutive_transport_failures
+                    >= consecutive_transport_failure_limit
+                ):
+                    remaining = len(issuer_ids) - index
+                    if remaining:
+                        failures.append(
+                            RefreshFailure(
+                                "fundamentals_transport_circuit",
+                                f"{remaining} issuer(s) not attempted",
+                                "systemic provider transport failures reached the "
+                                "bounded circuit-breaker limit",
+                            )
+                        )
+                    break
 
     price_candidates: list[str] = []
+    securities_attempted = 0
     if include_prices:
         window_end = membership_date + timedelta(days=1)
         for security_id in security_ids:
@@ -237,15 +270,38 @@ def refresh_us_current(
                 continue
             price_candidates.append(security_id)
 
+        consecutive_transport_failures = 0
         for index, security_id in enumerate(price_candidates, 1):
+            securities_attempted = index
             _progress(progress, "prices", security_id, index, len(price_candidates))
             try:
                 price_rows += _positive_rows(
                     security_price_ingester(security_id),
                     f"security {security_id}",
                 )
+                consecutive_transport_failures = 0
             except Exception as exc:
                 failures.append(RefreshFailure("prices", security_id, str(exc)))
+                consecutive_transport_failures = (
+                    consecutive_transport_failures + 1
+                    if isinstance(exc, httpx.RequestError)
+                    else 0
+                )
+                if (
+                    consecutive_transport_failures
+                    >= consecutive_transport_failure_limit
+                ):
+                    remaining = len(price_candidates) - index
+                    if remaining:
+                        failures.append(
+                            RefreshFailure(
+                                "prices_transport_circuit",
+                                f"{remaining} security(s) not attempted",
+                                "systemic provider transport failures reached the "
+                                "bounded circuit-breaker limit",
+                            )
+                        )
+                    break
             if index < len(price_candidates):
                 sleeper(settings.yfinance_sleep_sec)
 
@@ -265,8 +321,8 @@ def refresh_us_current(
         as_of=current_date.isoformat(),
         universe_id=universe_id,
         members=len(members),
-        issuers_attempted=len(issuer_ids),
-        securities_attempted=len(price_candidates),
+        issuers_attempted=issuers_attempted,
+        securities_attempted=securities_attempted,
         macro_rows=macro_rows,
         fundamental_rows=fundamental_rows,
         price_rows=price_rows,

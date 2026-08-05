@@ -68,6 +68,17 @@ def _operations() -> dict:
     return {
         "error": None,
         "incidents": [],
+        "incident_summary": {
+            "operational_blocking": 0,
+            "critical_operational_blocking": 0,
+        },
+        "anomaly_cases": [],
+        "anomaly_case_summary": {
+            "unresolved": 0,
+            "critical_unresolved": 0,
+        },
+        "notification_summary": {"dead_letter": 0},
+        "notification_route": None,
         "daily_cycle": {"state": "success"},
     }
 
@@ -118,11 +129,51 @@ def test_critical_operations_preempt_an_available_paper_review() -> None:
             "title": "The daily workflow failed",
         }
     ]
+    operations["incident_summary"] = {
+        "operational_blocking": 1,
+        "critical_operational_blocking": 1,
+    }
 
     result = build_operator_preflight(_readiness(), _monitor(), operations)
 
     assert result.operations.state == "critical"
     assert result.next_action.command == "aios alert-show inc-critical"
+
+
+def test_critical_data_case_preempts_incidents_and_keeps_research_separate() -> None:
+    operations = _operations()
+    operations["incidents"] = [
+        {
+            "incident_id": "inc-critical",
+            "severity": "critical",
+            "state": "open",
+            "title": "The daily workflow failed",
+        }
+    ]
+    operations["anomaly_cases"] = [
+        {
+            "case_id": "case-critical",
+            "severity": "critical",
+            "state": "open",
+            "title": "Conflicting filing evidence",
+        }
+    ]
+    operations["incident_summary"] = {
+        "operational_blocking": 1,
+        "critical_operational_blocking": 1,
+    }
+    operations["anomaly_case_summary"] = {
+        "unresolved": 1,
+        "critical_unresolved": 1,
+    }
+
+    result = build_operator_preflight(_readiness(), _monitor(), operations)
+
+    assert result.research.available is True
+    assert result.operations.state == "critical"
+    assert result.next_action.command == "aios anomaly-show case-critical"
+    assert result.next_action.cta_label == "Open Operations"
+    assert "paper-execute" not in result.canonical_json()
 
 
 def test_noncritical_warning_does_not_hide_time_bounded_paper_review() -> None:
@@ -135,11 +186,47 @@ def test_noncritical_warning_does_not_hide_time_bounded_paper_review() -> None:
             "title": "Scheduler runtime was not verified",
         }
     ]
+    operations["incident_summary"]["operational_blocking"] = 1
 
     result = build_operator_preflight(_readiness(), _monitor(), operations)
 
     assert result.operations.state == "needs_review"
     assert result.next_action.command.startswith("aios paper-review ")
+
+
+def test_noncritical_data_case_waits_behind_time_bounded_paper_review() -> None:
+    operations = _operations()
+    operations["anomaly_cases"] = [
+        {
+            "case_id": "case-warning",
+            "severity": "warning",
+            "state": "open",
+            "title": "Coverage deterioration needs review",
+        }
+    ]
+    operations["anomaly_case_summary"]["unresolved"] = 1
+
+    result = build_operator_preflight(_readiness(), _monitor(), operations)
+
+    assert result.operations.state == "needs_review"
+    assert result.operations.available is False
+    assert result.next_action.command.startswith("aios paper-review ")
+
+
+def test_expired_registered_proposal_suggests_only_the_read_only_rollover_preview() -> None:
+    monitor = _monitor(timing="expired")
+
+    result = build_operator_preflight(_readiness(), monitor, _operations())
+
+    assert result.proposal_creation.state == "active_proposal_exists"
+    assert result.proposal_creation.available is False
+    assert result.paper_recording.state == "expired"
+    assert result.next_action.title == "Preview the governed prospective rollover"
+    assert "never fills the expired proposal or activates a successor" in (
+        result.next_action.detail
+    )
+    assert result.next_action.command == "aios forward-rollover"
+    assert "--confirm-rollover" not in result.next_action.command
 
 
 def test_research_failure_returns_a_date_pinned_readiness_command() -> None:
@@ -181,6 +268,7 @@ def test_waiting_proposal_surfaces_noncritical_operations_before_waiting() -> No
             "title": "A warning remains.",
         }
     ]
+    operations["incident_summary"]["operational_blocking"] = 1
 
     result = build_operator_preflight(
         _readiness(),
@@ -189,6 +277,94 @@ def test_waiting_proposal_surfaces_noncritical_operations_before_waiting() -> No
     )
 
     assert result.next_action.command == "aios alert-show inc-warning"
+
+
+def test_waiting_proposal_surfaces_data_case_before_waiting() -> None:
+    operations = _operations()
+    operations["anomaly_cases"] = [
+        {
+            "case_id": "case-warning",
+            "severity": "warning",
+            "state": "acknowledged",
+            "title": "Issuer facts need review",
+        }
+    ]
+    operations["anomaly_case_summary"]["unresolved"] = 1
+
+    result = build_operator_preflight(
+        _readiness(),
+        _monitor(timing="waiting_for_scheduled_close"),
+        operations,
+    )
+
+    assert result.next_action.command == "aios anomaly-show case-warning"
+
+
+def test_exact_summary_blocks_when_critical_incident_is_outside_bounded_rows() -> None:
+    operations = _operations()
+    operations["incident_summary"] = {
+        "operational_blocking": 101,
+        "critical_operational_blocking": 1,
+    }
+
+    result = build_operator_preflight(_readiness(), _monitor(), operations)
+
+    assert result.operations.state == "critical"
+    assert "1 critical operating incident" in result.operations.detail
+    assert "critical_operational_incident_not_displayed" in result.operations.blockers
+    assert result.next_action.command == "aios alerts --blocking --limit 1000"
+
+
+def test_legacy_resolved_blocker_remains_visible_to_preflight() -> None:
+    operations = _operations()
+    operations["incidents"] = [
+        {
+            "incident_id": "inc-legacy",
+            "severity": "warning",
+            "state": "resolved",
+            "resolution_proof_status": "legacy_unproven",
+            "operationally_blocking": True,
+            "title": "Legacy resolution needs later proof",
+        }
+    ]
+    operations["incident_summary"]["operational_blocking"] = 1
+
+    result = build_operator_preflight(
+        _readiness(),
+        _monitor(timing="waiting_for_scheduled_close"),
+        operations,
+    )
+
+    assert result.operations.state == "needs_review"
+    assert result.next_action.command == "aios alert-show inc-legacy"
+
+
+def test_enabled_route_dead_letter_requires_operations_review() -> None:
+    operations = _operations()
+    operations["notification_route"] = {"state": "enabled"}
+    operations["notification_summary"]["dead_letter"] = 2
+
+    result = build_operator_preflight(
+        _readiness(),
+        _monitor(timing="waiting_for_scheduled_close"),
+        operations,
+    )
+
+    assert result.operations.state == "needs_review"
+    assert "notification_delivery_dead_letter" in result.operations.blockers
+    assert result.next_action.command == (
+        "aios notifications --needs-review --limit 1000"
+    )
+
+
+def test_disabled_route_dead_letters_do_not_conflate_optional_delivery() -> None:
+    operations = _operations()
+    operations["notification_route"] = {"state": "disabled"}
+    operations["notification_summary"]["dead_letter"] = 2
+
+    result = build_operator_preflight(_readiness(), _monitor(), operations)
+
+    assert result.operations.state == "verified"
 
 
 def test_unknown_capability_and_ambiguous_actions_are_rejected() -> None:

@@ -1,6 +1,6 @@
 # S&P 500 point-in-time universe provenance
 
-## Current operating extension — reviewed through 2026-07-23
+## Current operating extension — reviewed through 2026-08-03
 
 The original bounded 2023–2024 certification described below is still the
 reproducible base. The active database now also carries a reviewed current path:
@@ -15,10 +15,10 @@ reproducible base. The active database now also carries a reviewed current path:
 - reviewed reference batches 21–42 plus the consolidated current manifests
   extend issuer, SEC CIK, security-owner, and provider-symbol evidence for the
   2025-current additions/removals.
-- on the 2026-07-23 decision close, 503/503 members have stable security IDs,
+- on the 2026-08-03 decision close, 503/503 members have stable security IDs,
   500/503 have PIT filings, and 503/503 have current action-safe prices. SPY is
   reviewed through the same close and required macro releases through
-  2026-07-23. `aios readiness` passes with zero hard integrity failures.
+  2026-08-03. `aios readiness` passes with zero hard integrity failures.
 
 This current path does **not** turn the repository into a complete
 1996-present S&P announcement archive. Pre-August-2023 provenance and broader
@@ -1106,9 +1106,35 @@ official successor lineage to CIK 2115436.
 
 Each accepted transaction extended 503 membership rows, 503 security
 assignments, 503 security-to-issuer assignments, 500 active issuer CIK rows,
-and 503 verified provider-symbol rows through its requested close. The latest
-reviewed edge is therefore 2026-07-23. A preceding deliberately blocked
+and 503 verified provider-symbol rows through its requested close. That
+transaction's reviewed edge was therefore 2026-07-23. A preceding deliberately blocked
 attestation proves the control: naive CIK equality stopped with zero date
 changes until the reviewed XOM lineage rule was applied. A real index
 announcement, missing archive coverage, parser drift, ticker-set difference,
 or unreviewed CIK lineage still stops for manual review.
+
+## July 31, 2026 future-effective event boundary
+
+The July 31 archive review found the official Ferguson / Electronic Arts
+announcement while the independent component file still matched all 503
+reviewed tickers and CIK lineages. S&P's detail table states that FERG replaces
+EA before the August 5 open. Announcement date and effective date are therefore
+separate controls: July 31 through August 4 may remain the unchanged universe,
+but August 5 cannot be certified until the FERG addition, EA deletion, stable
+identity, issuer/CIK, provider symbol, filings, and prices are formally imported.
+
+The roll-forward parser now captures the exact detail response, scopes rows to
+the named S&P 500 section, accepts full or abbreviated English month names, and
+requires a balanced set of dated addition/deletion rows. It also canonicalizes
+only same-host HTTPS S&P release URLs before deciding whether an announcement
+was previously reviewed. Parse ambiguity, transport failure, an unknown index
+section, or an unreviewed effective event remains blocking.
+
+The governed live retry accepted attestation
+`uca-e01112a2114c43cda64ef6f4858235d9` after reconciling 100 archived releases,
+503 current components, and the already-imported March 23 event. It extended
+the unchanged pre-effective universe from July 30 through August 3. A complete
+daily cycle then certified the August 3 close with 503/503 reviewed prices,
+500/503 point-in-time filing coverage, zero hard data-quality failures, and
+three warnings. FERG/EA remains a future-effective boundary: August 5 and later
+cannot be certified until that event is formally imported and validated.

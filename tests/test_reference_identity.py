@@ -3,7 +3,7 @@ from __future__ import annotations
 import gzip
 import json
 import sys
-from datetime import date
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from zipfile import ZipFile
 
@@ -17,7 +17,7 @@ from aios.ingest.reference_identity import (
     load_issuer_cik_csv,
     load_provider_symbol_csv,
 )
-from aios.raw_snapshots import verify_raw_snapshots
+from aios.raw_snapshots import canonical_parsed_rows_sha256, verify_raw_snapshots
 from aios.storage.store import Store
 
 SECURITY_ID = "aios:security:demo-common"
@@ -197,13 +197,11 @@ def test_yfinance_normalized_export_is_linked_and_replay_verified(
         assert snapshot["parser_version"] == prices.YFINANCE_PARSER_VERSION
         assert snapshot["parsed_row_count"] == 1
         assert snapshot["parsed_rows_sha256"]
-        assert store.query(
-            "SELECT run_id, role FROM ingest_raw_snapshots"
-        ) == [{"run_id": "price-run", "role": "prices:TEST"}]
+        assert store.query("SELECT run_id, role FROM ingest_raw_snapshots") == [
+            {"run_id": "price-run", "role": "prices:TEST"}
+        ]
         payload_record = store.raw_payload_record(snapshot["payload_sha256"])
-        payload = gzip.decompress(
-            (tmp_path / payload_record["relative_path"]).read_bytes()
-        )
+        payload = gzip.decompress((tmp_path / payload_record["relative_path"]).read_bytes())
         assert prices.parse_yfinance_normalized_export(payload) == rows
         verification = verify_raw_snapshots(store=store, project_root=tmp_path)
         assert verification.replayed_snapshots == 1
@@ -372,15 +370,16 @@ def test_yfinance_captures_and_replays_malformed_close_before_rejecting(
         assert snapshot["parsed_row_count"] == 1
         assert snapshot["parsed_rows_sha256"]
         payload_record = store.raw_payload_record(snapshot["payload_sha256"])
-        payload = gzip.decompress(
-            (tmp_path / payload_record["relative_path"]).read_bytes()
-        )
+        payload = gzip.decompress((tmp_path / payload_record["relative_path"]).read_bytes())
         replayed_rows = prices.parse_yfinance_normalized_export(payload)
         assert replayed_rows[0]["close"] is None
-        assert verify_raw_snapshots(
-            store=store,
-            project_root=tmp_path,
-        ).replayed_snapshots == 1
+        assert (
+            verify_raw_snapshots(
+                store=store,
+                project_root=tmp_path,
+            ).replayed_snapshots
+            == 1
+        )
     finally:
         store.close()
 
@@ -430,16 +429,17 @@ def test_yfinance_v2_captures_negative_split_before_rejecting(
         )[0]
         assert snapshot["parser_version"] == "yfinance-normalized-v2"
         payload_record = store.raw_payload_record(snapshot["payload_sha256"])
-        payload = gzip.decompress(
-            (tmp_path / payload_record["relative_path"]).read_bytes()
-        )
+        payload = gzip.decompress((tmp_path / payload_record["relative_path"]).read_bytes())
         assert prices.parse_yfinance_normalized_export(payload)[0]["split_ratio"] == -1.0
         with pytest.raises(ValueError, match="invalid yfinance split ratio"):
             prices.parse_yfinance_normalized_export_v1(payload)
-        assert verify_raw_snapshots(
-            store=store,
-            project_root=tmp_path,
-        ).replayed_snapshots == 1
+        assert (
+            verify_raw_snapshots(
+                store=store,
+                project_root=tmp_path,
+            ).replayed_snapshots
+            == 1
+        )
     finally:
         store.close()
 
@@ -568,6 +568,28 @@ def test_universe_identity_labels_use_reviewed_issuer_names(tmp_path):
         store.close()
 
 
+def test_issuer_owner_resolution_never_uses_a_future_review_date(tmp_path) -> None:
+    store = Store(tmp_path / "issuer-owner-pit.duckdb")
+    try:
+        _setup_security(store)
+        issuers, ciks, owners, providers = _reference_rows()
+        owners[0] = {**owners[0], "verified_date": "2024-07-05"}
+        store.upsert_reference_identities(issuers, ciks, owners, providers)
+
+        assert store.issuer_id_for_security(SECURITY_ID, "2024-07-04") is None
+        assert store.issuer_id_for_security(SECURITY_ID, "2024-07-05") == ISSUER_ID
+        before = store.universe_identity_labels("demo", "2024-07-04")[0]
+        after = store.universe_identity_labels("demo", "2024-07-05")[0]
+        assert before["issuer_id"] is None
+        assert after["issuer_id"] == ISSUER_ID
+        before_coverage = store.universe_data_coverage("demo", "2024-07-04")[0]
+        after_coverage = store.universe_data_coverage("demo", "2024-07-05")[0]
+        assert before_coverage["issuer_id"] is None
+        assert after_coverage["issuer_id"] == ISSUER_ID
+    finally:
+        store.close()
+
+
 def _fundamental(
     value: float,
     *,
@@ -629,7 +651,7 @@ def test_existing_price_and_fundamental_tables_migrate_additively(tmp_path):
     finally:
         con.close()
 
-    store = Store(db_path)
+    store = Store(db_path, allow_schema_upgrade=True)
     try:
         price_columns = {row["column_name"] for row in store.query("DESCRIBE prices")}
         fundamental_columns = {row["column_name"] for row in store.query("DESCRIBE fundamentals")}
@@ -641,7 +663,14 @@ def test_existing_price_and_fundamental_tables_migrate_additively(tmp_path):
             "split_normalization_factor",
             "split_normalization_through",
         } <= price_columns
-        assert {"issuer_id", "security_id"} <= fundamental_columns
+        assert {
+            "issuer_id",
+            "security_id",
+            "ingest_run_id",
+            "source_snapshot_id",
+            "source_rowset_sha256",
+            "source_row_sha256",
+        } <= fundamental_columns
         assert store.query("SELECT close, security_id FROM prices")[0] == {
             "close": 10.0,
             "security_id": None,
@@ -660,6 +689,18 @@ def test_existing_price_and_fundamental_tables_migrate_additively(tmp_path):
         assert store.query("SELECT value, issuer_id FROM fundamentals")[0] == {
             "value": 100.0,
             "issuer_id": None,
+        }
+        assert store.query(
+            """
+            SELECT ingest_run_id, source_snapshot_id, source_rowset_sha256,
+                   source_row_sha256
+            FROM fundamentals
+            """
+        )[0] == {
+            "ingest_run_id": None,
+            "source_snapshot_id": None,
+            "source_rowset_sha256": None,
+            "source_row_sha256": None,
         }
     finally:
         store.close()
@@ -711,6 +752,35 @@ def test_strict_csv_import_normalizes_cik_and_is_idempotent(tmp_path):
             }
         )
         assert store.issuer_reference(ISSUER_ID)["cik"] == "0000000001"
+    finally:
+        store.close()
+
+
+def test_issuer_reference_resolves_only_the_effective_known_cik(tmp_path) -> None:
+    store = Store(tmp_path / "issuer-reference-pit.duckdb")
+    try:
+        _setup_security(store)
+        issuers, ciks, owners, providers = _reference_rows()
+        ciks[0] = {
+            **ciks[0],
+            "effective_end": "2024-07-01",
+            "verified_date": "2024-01-01",
+        }
+        ciks.append(
+            {
+                **ciks[0],
+                "cik": "2",
+                "effective_start": "2024-07-01",
+                "effective_end": "2025-01-01",
+                "verified_date": "2024-07-05",
+            }
+        )
+        store.upsert_reference_identities(issuers, ciks, owners, providers)
+
+        assert store.issuer_reference(ISSUER_ID, as_of="2024-06-30")["cik"] == ("0000000001")
+        assert store.issuer_reference(ISSUER_ID, as_of="2024-07-02") is None
+        assert store.issuer_reference(ISSUER_ID, as_of="2024-07-05")["cik"] == ("0000000002")
+        assert store.issuer_reference(ISSUER_ID)["cik"] == "0000000002"
     finally:
         store.close()
 
@@ -834,6 +904,53 @@ def test_factor_batch_reads_match_scalar_identity_and_restatement_policy(tmp_pat
         store.close()
 
 
+def test_factor_batch_never_uses_a_future_reviewed_owner(tmp_path) -> None:
+    store = Store(tmp_path / "factor-batch-future-owner.duckdb")
+    try:
+        _setup_security(store)
+        issuers, ciks, owners, providers = _reference_rows()
+        owners[0] = {**owners[0], "verified_date": "2024-07-05"}
+        store.upsert_reference_identities(issuers, ciks, owners, providers)
+        store.upsert_fundamentals(
+            [
+                _fundamental(
+                    100,
+                    ticker="OLD",
+                    issuer_id=ISSUER_ID,
+                    security_id=SECURITY_ID,
+                )
+            ]
+        )
+
+        assert (
+            store.pit_factor_fundamentals(
+                "OLD",
+                "2024-07-04",
+                ["revenue"],
+            )
+            == []
+        )
+        assert store.pit_factor_fundamentals_batch(
+            ["OLD"],
+            "2024-07-04",
+            ["revenue"],
+        ) == {"OLD": []}
+
+        scalar = store.pit_factor_fundamentals(
+            "OLD",
+            "2024-07-05",
+            ["revenue"],
+        )
+        assert store.pit_factor_fundamentals_batch(
+            ["OLD"],
+            "2024-07-05",
+            ["revenue"],
+        ) == {"OLD": scalar}
+        assert scalar[0]["value"] == 100
+    finally:
+        store.close()
+
+
 def test_factor_batch_matches_scalar_same_day_tie_result(tmp_path):
     store = Store(tmp_path / "factor-batch-same-day-tie.duckdb")
     try:
@@ -902,6 +1019,150 @@ def test_factor_batch_preserves_ambiguous_security_failure(tmp_path):
                 "2024-06-30",
                 ["revenue"],
             )
+    finally:
+        store.close()
+
+
+def test_inactive_historical_ticker_reuse_is_ambiguous_only_for_fundamentals(
+    tmp_path,
+) -> None:
+    store = Store(tmp_path / "factor-batch-historical-ticker-reuse.duckdb")
+    try:
+        _setup_security(store)
+        store.execute(
+            """
+            INSERT INTO security_master
+            (security_id, canonical_ticker, identity_status, source)
+            VALUES ('aios:security:former-old', 'OLD', 'bounded_unverified', 'test')
+            """
+        )
+        store.execute(
+            """
+            INSERT INTO security_identity_assignments
+            (universe_id, ticker, effective_start, effective_end, security_id,
+             known_date, identity_status, source)
+            VALUES
+            ('historical', 'OLD', '2023-01-01', '2023-07-01',
+             'aios:security:former-old', '2022-12-15',
+             'bounded_unverified', 'test')
+            """
+        )
+        store.upsert_prices(
+            [
+                {
+                    "ticker": "OLD",
+                    "date": price_date,
+                    "close": close,
+                }
+                for price_date, close in [
+                    ("2024-06-27", 9.0),
+                    ("2024-06-28", 10.0),
+                ]
+            ]
+        )
+
+        with pytest.raises(ValueError, match="ambiguous security identity"):
+            store.pit_factor_fundamentals("OLD", "2024-07-05", ["revenue"])
+        with pytest.raises(ValueError, match="ambiguous security identity"):
+            store.pit_factor_fundamentals_batch(
+                ["OLD"],
+                "2024-07-05",
+                ["revenue"],
+            )
+        scalar_latest = store.latest_price("OLD", "2024-07-05")
+        batch_latest = store.pit_factor_latest_prices_batch(
+            ["OLD"],
+            "2024-07-05",
+        )["OLD"]
+        assert scalar_latest is not None
+        assert batch_latest is not None
+        assert batch_latest["close"] == scalar_latest["close"] == 10.0
+
+        scalar_history = store.pit_factor_price_history(
+            "OLD",
+            "2024-07-05",
+            observations=2,
+        )
+        assert store.pit_factor_price_histories_batch(
+            ["OLD"],
+            "2024-07-05",
+            observations=2,
+        ) == {"OLD": scalar_history}
+    finally:
+        store.close()
+
+
+def test_price_routes_never_use_a_future_verified_provider_mapping(
+    tmp_path,
+) -> None:
+    store = Store(tmp_path / "factor-price-future-provider-review.duckdb")
+    try:
+        _setup_security(store)
+        issuers, ciks, owners, providers = _reference_rows()
+        providers[0] = {**providers[0], "verified_date": "2024-07-05"}
+        store.upsert_reference_identities(issuers, ciks, owners, providers)
+        store.upsert_prices(
+            [
+                {
+                    "ticker": "NEW",
+                    "security_id": SECURITY_ID,
+                    "provider_symbol": "NEW",
+                    "date": price_date,
+                    "close": close,
+                    "actions_complete": True,
+                    "close_split_adjusted": False,
+                    "source": "yfinance",
+                }
+                for price_date, close in [
+                    ("2024-07-01", 100.0),
+                    ("2024-07-02", 101.0),
+                ]
+            ]
+        )
+
+        assert store.latest_price("NEW", "2024-07-02") is None
+        assert store.pit_factor_latest_prices_batch(
+            ["NEW"],
+            "2024-07-02",
+        ) == {"NEW": None}
+        assert (
+            store.pit_factor_price_history(
+                "NEW",
+                "2024-07-02",
+                observations=2,
+            )
+            == []
+        )
+        assert store.pit_factor_price_histories_batch(
+            ["NEW"],
+            "2024-07-02",
+            observations=2,
+        ) == {"NEW": []}
+        before = store.universe_data_coverage("demo", "2024-07-02")[0]
+        assert before["has_price_history"] is False
+        assert before["latest_price_date"] is None
+
+        scalar_latest = store.latest_price("NEW", "2024-07-05")
+        batch_latest = store.pit_factor_latest_prices_batch(
+            ["NEW"],
+            "2024-07-05",
+        )["NEW"]
+        assert scalar_latest is not None
+        assert batch_latest is not None
+        assert batch_latest["close"] == scalar_latest["close"] == 101.0
+        scalar_history = store.pit_factor_price_history(
+            "NEW",
+            "2024-07-05",
+            observations=2,
+        )
+        assert store.pit_factor_price_histories_batch(
+            ["NEW"],
+            "2024-07-05",
+            observations=2,
+        ) == {"NEW": scalar_history}
+        after = store.universe_data_coverage("demo", "2024-07-05")[0]
+        assert after["has_price_history"] is True
+        assert str(after["latest_price_date"]) == "2024-07-02"
     finally:
         store.close()
 
@@ -1064,20 +1325,20 @@ def test_tiingo_fetch_uses_header_token_and_preserves_exclusive_end(monkeypatch)
                         "volume": 1000,
                         "divCash": 0.25,
                         "splitFactor": 1,
-                        },
-                        {
-                            "date": "2024-01-03T00:00:00.000Z",
-                            "open": 11,
-                            "high": 13,
-                            "low": 10,
-                            "close": 12,
-                            "adjClose": 11.5,
-                            "volume": 1100,
-                            "divCash": 0,
-                            "splitFactor": 1,
-                        },
-                    ]
-                ).encode()
+                    },
+                    {
+                        "date": "2024-01-03T00:00:00.000Z",
+                        "open": 11,
+                        "high": 13,
+                        "low": 10,
+                        "close": 12,
+                        "adjClose": 11.5,
+                        "volume": 1100,
+                        "divCash": 0,
+                        "splitFactor": 1,
+                    },
+                ]
+            ).encode()
 
     monkeypatch.setattr(prices, "settings", SimpleNamespace(tiingo_api_key="test-token"))
     monkeypatch.setattr(prices, "get_http", lambda: FakeHttp())
@@ -1251,16 +1512,6 @@ def test_ingest_issuer_uses_reviewed_cik_and_tags_rows(monkeypatch, tmp_path):
     try:
         _setup_security(store)
         _install_reference_rows(store)
-        store.upsert_fundamentals(
-            [
-                _fundamental(
-                    50,
-                    ticker="STALE",
-                    issuer_id=ISSUER_ID,
-                    security_id=SECURITY_ID,
-                )
-            ]
-        )
 
         def fake_extract(
             ticker,
@@ -1276,15 +1527,110 @@ def test_ingest_issuer_uses_reviewed_cik_and_tags_rows(monkeypatch, tmp_path):
             assert security_id == SECURITY_ID
             assert snapshot_store is store
             assert isinstance(ingest_run_id, str) and ingest_run_id
+            observed_at = datetime(2026, 7, 30, 10, 0, tzinfo=UTC)
+            row = _fundamental(
+                123,
+                issuer_id=issuer_id,
+                security_id=security_id,
+            )
+            row.update(
+                {
+                    "source": "edgar",
+                    "ingest_run_id": ingest_run_id,
+                    "source_snapshot_id": "reference-companyfacts",
+                }
+            )
+            provider_row = {"cik": "0000000001", **row}
+            provider_row = {
+                key: provider_row[key]
+                for key in (
+                    "cik",
+                    "period_end",
+                    "as_of_date",
+                    "fiscal_period",
+                    "statement",
+                    "metric",
+                    "value",
+                    "quarter_value",
+                    "unit",
+                    "source",
+                )
+            }
+            rowset_sha256 = canonical_parsed_rows_sha256([provider_row])
+            row["source_rowset_sha256"] = rowset_sha256
+            row["source_row_sha256"] = edgar.canonical_sec_fundamental_row_sha256(provider_row)
+            submissions_row = {
+                "cik": "0000000001",
+                "name": "Demo Corporation",
+                "sic": None,
+                "sic_description": None,
+                "exchanges": [],
+            }
+            submissions_rowset_sha256 = canonical_parsed_rows_sha256([submissions_row])
+            snapshot_store.record_raw_snapshot(
+                payload={
+                    "payload_sha256": "e" * 64,
+                    "relative_path": "data/raw/sec/companyfacts/reference.json.gz",
+                    "original_bytes": 120,
+                    "stored_bytes": 80,
+                    "compression": "gzip",
+                },
+                snapshot={
+                    "snapshot_id": "reference-companyfacts",
+                    "provider": "sec-edgar",
+                    "dataset": "companyfacts",
+                    "artifact_kind": "exact_response",
+                    "requested_at": observed_at,
+                    "received_at": observed_at,
+                    "http_status": 200,
+                    "content_type": "application/json",
+                    "request_fingerprint": "f" * 64,
+                    "payload_sha256": "e" * 64,
+                    "adapter_name": "edgar",
+                    "adapter_version": "v1",
+                    "parser_version": "sec-companyfacts-v2",
+                    "parsed_row_count": 1,
+                    "parsed_rows_sha256": rowset_sha256,
+                    "parsed_rows_rejected": 0,
+                    "parsed_rejection_codes": None,
+                },
+                ingest_run_id=ingest_run_id,
+                role="companyfacts",
+            )
+            snapshot_store.record_raw_snapshot(
+                payload={
+                    "payload_sha256": "d" * 64,
+                    "relative_path": "data/raw/sec/submissions/reference.json.gz",
+                    "original_bytes": 60,
+                    "stored_bytes": 40,
+                    "compression": "gzip",
+                },
+                snapshot={
+                    "snapshot_id": "reference-submissions",
+                    "provider": "sec-edgar",
+                    "dataset": "submissions",
+                    "artifact_kind": "exact_response",
+                    "requested_at": observed_at,
+                    "received_at": observed_at,
+                    "http_status": 200,
+                    "content_type": "application/json",
+                    "request_fingerprint": "c" * 64,
+                    "payload_sha256": "d" * 64,
+                    "adapter_name": "edgar",
+                    "adapter_version": "v1",
+                    "parser_version": "sec-submissions-v2",
+                    "parsed_row_count": 1,
+                    "parsed_rows_sha256": submissions_rowset_sha256,
+                },
+                ingest_run_id=ingest_run_id,
+                role="submissions",
+            )
             return (
-                [
-                    _fundamental(
-                        123,
-                        issuer_id=issuer_id,
-                        security_id=security_id,
-                    )
-                ],
-                {"name": "Demo Corporation"},
+                [row],
+                {
+                    "name": "Demo Corporation",
+                    "submissions_row": submissions_row,
+                },
             )
 
         monkeypatch.setattr(edgar, "extract_fundamentals", fake_extract)
@@ -1299,5 +1645,9 @@ def test_ingest_issuer_uses_reviewed_cik_and_tags_rows(monkeypatch, tmp_path):
                 "security_id": SECURITY_ID,
             }
         ]
+        evidence = store.ingest_evidence(store.ingest_history(1)[0]["run_id"])
+        assert evidence is not None
+        assert evidence["subject_type"] == "issuer"
+        assert evidence["subject_id"] == ISSUER_ID
     finally:
         store.close()

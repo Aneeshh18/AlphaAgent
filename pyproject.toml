@@ -1,6 +1,6 @@
 [project]
 name = "ai-investment-os"
-version = "0.1.0"
+version = "0.3.0"
 description = "In-house, minimal-cost investment intelligence system (Path B build)."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -8,7 +8,7 @@ authors = [{ name = "Aneesh Sahu" }]
 
 dependencies = [
     # --- Data store ---
-    "duckdb>=1.1.0",          # analytical DB (point-in-time safe storage)
+    "duckdb>=1.5.4,<1.6",     # schema/constraint contract is certified on 1.5.x
     "pyarrow>=17.0.0",        # parquet I/O + arrow interop
 
     # --- HTTP / data fetching ---
@@ -45,12 +45,75 @@ dashboard = [
 aios = "aios.cli:app"        # CLI entrypoint: `aios <command>`
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.31.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build]
 artifacts = [
     "src/aios/risk/scenarios/*.json",
+    "src/aios/schemas/*.json",
+]
+exclude = [
+    "/.zcode/**",
+    "/.env",
+    "/.env.*",
+    "/data/**",
+    "/logs/**",
+    "/backups/**",
+    "/runtime/**",
+    "/snapshots/**",
+    "**/*.key",
+    "**/*.p12",
+    "**/*.pfx",
+    "**/*.jks",
+    "**/*.keystore",
+    "**/*.ppk",
+    "**/*private-key*.pem",
+    "**/*private_key*.pem",
+    "**/*-key.pem",
+    "**/*_key.pem",
+    "**/.aws/**",
+    "**/.azure/**",
+    "**/.config/gcloud/**",
+    "**/.config/gh/**",
+    "**/.docker/config.json",
+    "**/.gnupg/**",
+    "**/.kube/**",
+    "**/.password-store/**",
+    "**/.ssh/**",
+    "**/.terraform.d/**",
+    "**/.streamlit/secrets.toml",
+    "**/.streamlit/secrets.*.toml",
+    "**/.git-credentials",
+    "**/.netrc",
+    "**/_netrc",
+    "**/.npmrc",
+    "**/.pypirc",
+    "**/pip.conf",
+    "**/kubeconfig",
+    "**/credentials",
+    "**/credentials.json",
+    "**/credentials.tfrc.json",
+    "**/application_default_credentials.json",
+    "**/service-account*.json",
+    "**/service_account*.json",
+    "**/token.json",
+    "**/*.duckdb",
+    "**/*.duckdb.wal",
+    "**/*.sqlite",
+    "**/*.sqlite-shm",
+    "**/*.sqlite-wal",
+    "**/*.sqlite3",
+    "**/*.sqlite3-shm",
+    "**/*.sqlite3-wal",
+    "**/*.db",
+    "**/*.db-shm",
+    "**/*.db-wal",
+    "**/*.wal",
+    "**/*.log",
+    "**/*.bak",
+    "**/*.backup",
+    "**/*.dump",
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -52,6 +52,7 @@ def _healthy_operations() -> dict:
     return {
         "error": None,
         "incidents": [],
+        "anomaly_cases": [],
         "daily_cycle": {"state": "success"},
     }
 
@@ -188,6 +189,34 @@ def test_home_model_surfaces_critical_operations_over_green_research() -> None:
     assert model.next_action.destination == "system"
 
 
+def test_home_model_surfaces_critical_data_case_without_blocking_research() -> None:
+    operations = _healthy_operations()
+    operations["anomaly_cases"] = [
+        {
+            "case_id": "case-critical-1",
+            "state": "open",
+            "severity": "critical",
+            "title": "Conflicting issuer filing evidence",
+        },
+        {
+            "case_id": "case-warning-1",
+            "state": "acknowledged",
+            "severity": "warning",
+            "title": "Coverage deterioration needs review",
+        },
+    ]
+
+    model = build_home_view_model(_ready_report(), _waiting_monitor(), operations)
+
+    assert model.research.value == "Ready"
+    assert model.operations.value == "Critical Attention"
+    assert model.operations.detail == (
+        "1 critical of 2 unresolved data-review case(s); 0 operating incident(s)."
+    )
+    assert model.next_action.command == "aios anomaly-show case-critical-1"
+    assert model.next_action.cta_label == "Open Operations"
+
+
 def test_home_model_routes_open_window_to_read_only_review_only() -> None:
     monitor = _waiting_monitor()
     monitor["proposal"]["timing"] = {"status": "execution_window_open"}
@@ -223,16 +252,41 @@ def test_home_model_keeps_open_paper_review_ahead_of_noncritical_warning() -> No
     assert model.next_action.command.startswith("aios paper-review ")
 
 
-def test_home_model_blocks_expired_proposal_without_backfill_guidance() -> None:
+def test_home_model_keeps_open_paper_review_ahead_of_noncritical_data_case() -> None:
+    monitor = _waiting_monitor()
+    monitor["proposal"]["timing"] = {"status": "execution_window_open"}
+    operations = _healthy_operations()
+    operations["anomaly_cases"] = [
+        {
+            "case_id": "case-high-1",
+            "state": "open",
+            "severity": "warning",
+            "title": "Issuer coverage needs review",
+        }
+    ]
+
+    model = build_home_view_model(_ready_report(), monitor, operations)
+
+    assert model.operations.value == "Needs Review"
+    assert model.operations.detail == (
+        "1 data-review case(s) and 0 operating incident(s) remain unresolved."
+    )
+    assert model.next_action.command.startswith("aios paper-review ")
+
+
+def test_home_model_routes_expired_proposal_to_read_only_rollover_preview() -> None:
     monitor = _waiting_monitor()
     monitor["proposal"]["timing"] = {"status": "expired"}
 
     model = build_home_view_model(_ready_report(), monitor, _healthy_operations())
 
     assert model.paper.value == "Expired"
-    assert model.next_action.title == "Do not simulate this proposal"
-    assert "new prospective proposal" in model.next_action.detail
-    assert model.next_action.command is None
+    assert model.next_action.title == "Preview the governed prospective rollover"
+    assert "never fills the expired proposal or activates a successor" in (
+        model.next_action.detail
+    )
+    assert model.next_action.command == "aios forward-rollover"
+    assert "--confirm-rollover" not in model.next_action.command
 
 
 def test_home_model_does_not_offer_review_when_forward_policy_is_blocked() -> None:

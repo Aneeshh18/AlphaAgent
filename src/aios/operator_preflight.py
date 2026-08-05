@@ -41,13 +41,7 @@ def _blockers(values: Any) -> tuple[str, ...]:
     if not isinstance(values, (list, tuple)):
         return ()
     return tuple(
-        sorted(
-            {
-                value.strip()
-                for value in values
-                if isinstance(value, str) and value.strip()
-            }
-        )
+        sorted({value.strip() for value in values if isinstance(value, str) and value.strip()})
     )
 
 
@@ -205,9 +199,7 @@ class OperatorPreflight:
                 "proposal_payload_sha256": self.proposal_payload_sha256,
                 "trial_payload_sha256": self.trial_payload_sha256,
             },
-            "capabilities": {
-                key: self.capability(key).to_dict() for key in CAPABILITY_KEYS
-            },
+            "capabilities": {key: self.capability(key).to_dict() for key in CAPABILITY_KEYS},
             "next_action": self.next_action.to_dict(),
         }
 
@@ -245,12 +237,7 @@ def _research_state(readiness: Mapping[str, Any]) -> CapabilityState:
         if isinstance(row, Mapping) and row.get("status") == "fail"
     ]
     blockers = tuple(
-        sorted(
-            {
-                str(row.get("check") or row.get("label") or "readiness_gate")
-                for row in failed
-            }
-        )
+        sorted({str(row.get("check") or row.get("label") or "readiness_gate") for row in failed})
     )
     available = bool(readiness.get("ready")) and not failed
     return CapabilityState(
@@ -500,7 +487,12 @@ def _unresolved(
     incidents = [
         row
         for row in operations.get("incidents", ())
-        if isinstance(row, Mapping) and row.get("state") != "resolved"
+        if isinstance(row, Mapping)
+        and (
+            bool(row.get("operationally_blocking"))
+            if "operationally_blocking" in row
+            else row.get("state") != "resolved"
+        )
     ]
     return sorted(
         incidents,
@@ -509,6 +501,49 @@ def _unresolved(
             str(row.get("incident_id") or ""),
         ),
     )
+
+
+def _unresolved_anomaly_cases(
+    operations: Mapping[str, Any] | None,
+) -> list[Mapping[str, Any]]:
+    if not isinstance(operations, Mapping):
+        return []
+    cases = [
+        row
+        for row in operations.get("anomaly_cases", ())
+        if isinstance(row, Mapping) and row.get("state") != "resolved"
+    ]
+    severity_rank = {
+        "critical": 0,
+        "high": 1,
+        "warning": 2,
+        "medium": 3,
+        "info": 4,
+        "low": 5,
+    }
+    return sorted(
+        cases,
+        key=lambda row: (
+            severity_rank.get(str(row.get("severity") or "").lower(), 6),
+            str(row.get("case_id") or ""),
+        ),
+    )
+
+
+def _exact_summary_count(
+    operations: Mapping[str, Any],
+    summary_name: str,
+    count_name: str,
+    *,
+    fallback: int,
+) -> int:
+    summary = operations.get(summary_name)
+    if not isinstance(summary, Mapping):
+        return fallback
+    value = summary.get(count_name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return fallback
+    return value
 
 
 def _operations_state(
@@ -524,15 +559,72 @@ def _operations_state(
             blockers=("operations_ledger_unavailable",),
         )
     incidents = _unresolved(operations)
+    anomaly_cases = _unresolved_anomaly_cases(operations)
     critical = [row for row in incidents if row.get("severity") == "critical"]
+    critical_cases = [row for row in anomaly_cases if row.get("severity") == "critical"]
+    incident_count = _exact_summary_count(
+        operations,
+        "incident_summary",
+        "operational_blocking",
+        fallback=len(incidents),
+    )
+    critical_incident_count = _exact_summary_count(
+        operations,
+        "incident_summary",
+        "critical_operational_blocking",
+        fallback=len(critical),
+    )
+    anomaly_count = _exact_summary_count(
+        operations,
+        "anomaly_case_summary",
+        "unresolved",
+        fallback=len(anomaly_cases),
+    )
+    critical_anomaly_count = _exact_summary_count(
+        operations,
+        "anomaly_case_summary",
+        "critical_unresolved",
+        fallback=len(critical_cases),
+    )
+    notification_route = operations.get("notification_route")
+    route_enabled = (
+        isinstance(notification_route, Mapping)
+        and notification_route.get("state") == "enabled"
+    )
+    dead_letters = (
+        _exact_summary_count(
+            operations,
+            "notification_summary",
+            "dead_letter",
+            fallback=0,
+        )
+        if route_enabled
+        else 0
+    )
     daily = operations.get("daily_cycle")
     daily_state = daily.get("state") if isinstance(daily, Mapping) else None
     incident_blockers = tuple(
-        str(row.get("incident_id") or "unresolved_operating_incident")
-        for row in incidents
+        str(row.get("incident_id") or "unresolved_operating_incident") for row in incidents
     )
-    if critical or daily_state in {"failed", "interrupted"}:
-        blockers = set(incident_blockers)
+    anomaly_blockers = tuple(
+        str(row.get("case_id") or "unresolved_data_quality_case") for row in anomaly_cases
+    )
+    truncated_blockers: set[str] = set()
+    if incident_count > len(incidents):
+        truncated_blockers.add("operational_incidents_truncated")
+    if critical_incident_count > len(critical):
+        truncated_blockers.add("critical_operational_incident_not_displayed")
+    if anomaly_count > len(anomaly_cases):
+        truncated_blockers.add("data_quality_cases_truncated")
+    if critical_anomaly_count > len(critical_cases):
+        truncated_blockers.add("critical_data_quality_case_not_displayed")
+    if (
+        critical_anomaly_count
+        or critical_incident_count
+        or daily_state in {"failed", "interrupted"}
+    ):
+        blockers = {*incident_blockers, *anomaly_blockers}
+        blockers.update(truncated_blockers)
         if daily_state in {"failed", "interrupted"}:
             blockers.add("daily_workflow_not_completed")
         return CapabilityState(
@@ -540,17 +632,32 @@ def _operations_state(
             label="Unattended Operations",
             state="critical",
             available=False,
-            detail="A critical incident or failed guarded workflow requires review.",
+            detail=(
+                f"{critical_anomaly_count} critical data-review case(s), "
+                f"{critical_incident_count} critical operating incident(s), "
+                "or a failed guarded workflow requires review."
+            ),
             blockers=tuple(sorted(blockers)),
         )
-    if incidents:
+    if anomaly_count or incident_count or dead_letters:
+        blockers = {
+            *anomaly_blockers,
+            *incident_blockers,
+            *truncated_blockers,
+        }
+        if dead_letters:
+            blockers.add("notification_delivery_dead_letter")
         return CapabilityState(
             key="operations",
             label="Unattended Operations",
             state="needs_review",
             available=False,
-            detail=f"{len(incidents)} non-critical operating incident(s) remain unresolved.",
-            blockers=incident_blockers,
+            detail=(
+                f"{anomaly_count} data-review case(s), {incident_count} "
+                f"operating incident(s), and {dead_letters} enabled-route "
+                "notification dead letter(s) require review."
+            ),
+            blockers=tuple(sorted(blockers)),
         )
     if daily_state == "running":
         return CapabilityState(
@@ -574,7 +681,9 @@ def _operations_state(
         label="Unattended Operations",
         state="verified",
         available=True,
-        detail="The latest guarded workflow succeeded with no unresolved incident.",
+        detail=(
+            "The latest guarded workflow succeeded with no unresolved incident or data-review case."
+        ),
     )
 
 
@@ -614,9 +723,7 @@ def _incident_action(
     critical_only: bool,
 ) -> OperatorAction | None:
     candidates = [
-        row
-        for row in incidents
-        if not critical_only or row.get("severity") == "critical"
+        row for row in incidents if not critical_only or row.get("severity") == "critical"
     ]
     if not candidates:
         return None
@@ -635,6 +742,32 @@ def _incident_action(
     )
 
 
+def _anomaly_case_action(
+    anomaly_cases: list[Mapping[str, Any]],
+    *,
+    critical_only: bool,
+) -> OperatorAction | None:
+    candidates = [
+        row for row in anomaly_cases if not critical_only or row.get("severity") == "critical"
+    ]
+    if not candidates:
+        return None
+    case = candidates[0]
+    case_id = _text(case.get("case_id"))
+    title = _text(case.get("title")) or "A data-quality case needs review"
+    command = f"aios anomaly-show {shlex.quote(case_id)}" if case_id else None
+    severity = str(case.get("severity") or "").lower()
+    return OperatorAction(
+        kind="command" if command else "wait",
+        title="Review the data-quality case first",
+        detail=title,
+        destination="system",
+        tone="danger" if severity == "critical" else "warning",
+        command=command,
+        cta_label="Open Operations",
+    )
+
+
 def _next_action(
     readiness: Mapping[str, Any],
     monitor: Mapping[str, Any] | None,
@@ -646,13 +779,88 @@ def _next_action(
     operations: CapabilityState,
 ) -> OperatorAction:
     incidents = _unresolved(operations_evidence)
+    anomaly_cases = _unresolved_anomaly_cases(operations_evidence)
+    exact_critical_incidents = (
+        _exact_summary_count(
+            operations_evidence,
+            "incident_summary",
+            "critical_operational_blocking",
+            fallback=sum(
+                row.get("severity") == "critical" for row in incidents
+            ),
+        )
+        if isinstance(operations_evidence, Mapping)
+        else 0
+    )
+    exact_critical_anomalies = (
+        _exact_summary_count(
+            operations_evidence,
+            "anomaly_case_summary",
+            "critical_unresolved",
+            fallback=sum(
+                row.get("severity") == "critical" for row in anomaly_cases
+            ),
+        )
+        if isinstance(operations_evidence, Mapping)
+        else 0
+    )
+    exact_incidents = (
+        _exact_summary_count(
+            operations_evidence,
+            "incident_summary",
+            "operational_blocking",
+            fallback=len(incidents),
+        )
+        if isinstance(operations_evidence, Mapping)
+        else 0
+    )
+    exact_anomalies = (
+        _exact_summary_count(
+            operations_evidence,
+            "anomaly_case_summary",
+            "unresolved",
+            fallback=len(anomaly_cases),
+        )
+        if isinstance(operations_evidence, Mapping)
+        else 0
+    )
+    critical_anomaly_action = _anomaly_case_action(
+        anomaly_cases,
+        critical_only=True,
+    )
+    if critical_anomaly_action is not None:
+        return critical_anomaly_action
+    if exact_critical_anomalies:
+        return OperatorAction(
+            kind="command",
+            title="Review the critical data-quality evidence first",
+            detail=(
+                f"{exact_critical_anomalies} critical data-quality case(s) exist "
+                "outside the bounded preflight list."
+            ),
+            destination="system",
+            tone="danger",
+            command="aios anomalies --unresolved --limit 1000",
+            cta_label="Open Operations",
+        )
     critical_action = _incident_action(incidents, critical_only=True)
     if critical_action is not None:
         return critical_action
+    if exact_critical_incidents:
+        return OperatorAction(
+            kind="command",
+            title="Review the critical operating evidence first",
+            detail=(
+                f"{exact_critical_incidents} critical operational blocker(s) "
+                "exist outside the bounded preflight list."
+            ),
+            destination="system",
+            tone="danger",
+            command="aios alerts --blocking --limit 1000",
+            cta_label="Open System Health",
+        )
     daily = (
-        operations_evidence.get("daily_cycle")
-        if isinstance(operations_evidence, Mapping)
-        else None
+        operations_evidence.get("daily_cycle") if isinstance(operations_evidence, Mapping) else None
     )
     if isinstance(daily, Mapping) and daily.get("state") in {"failed", "interrupted"}:
         return OperatorAction(
@@ -671,14 +879,11 @@ def _next_action(
             if isinstance(row, Mapping) and row.get("status") == "fail"
         ]
         label = str(failed[0].get("label")) if failed else "the readiness gate"
-        decision_date = _text(
-            readiness.get("as_of") or readiness.get("certified_research_through")
-        )
+        decision_date = _text(readiness.get("as_of") or readiness.get("certified_research_through"))
         command = "aios readiness --purpose paper --report-only"
         if decision_date:
             command = (
-                f"aios readiness --as-of {shlex.quote(decision_date)} "
-                "--purpose paper --report-only"
+                f"aios readiness --as-of {shlex.quote(decision_date)} --purpose paper --report-only"
             )
         return OperatorAction(
             kind="command",
@@ -702,15 +907,12 @@ def _next_action(
     if not registered_proposal_ready:
         forward = _forward_mapping(monitor)
         proposal = _proposal_mapping(monitor)
-        if proposal is not None and (
-            not isinstance(forward, Mapping) or not forward.get("ready")
-        ):
+        if proposal is not None and (not isinstance(forward, Mapping) or not forward.get("ready")):
             title = "Keep the paper trial blocked"
             detail = "Review the missing or changed forward-policy evidence first."
             command = "aios forward-status"
         elif (
-            proposal is not None
-            and proposal.get("status") != "approved_for_supervised_simulation"
+            proposal is not None and proposal.get("status") != "approved_for_supervised_simulation"
         ):
             title = "Resolve the proposal blocker"
             detail = "The registered proposal did not pass its governed approval gates."
@@ -770,19 +972,84 @@ def _next_action(
         )
     if paper_recording.state == "expired":
         return OperatorAction(
-            kind="wait",
-            title="Do not simulate this proposal",
+            kind="command",
+            title="Preview the governed prospective rollover",
             detail=(
-                f"{paper_recording.detail} Refresh evidence and create a new "
-                "prospective proposal."
+                f"{paper_recording.detail} The recommended bare command only builds a "
+                "checksum-bound later-cycle plan; exact targets are exposed only after "
+                "every source gate passes. It never fills the expired proposal or "
+                "activates a successor."
             ),
             destination="paper",
-            tone="danger",
+            tone="warning",
+            command="aios forward-rollover",
             cta_label="Open Paper Trial",
         )
+    warning_anomaly_action = _anomaly_case_action(
+        anomaly_cases,
+        critical_only=False,
+    )
+    if warning_anomaly_action is not None:
+        return warning_anomaly_action
     warning_action = _incident_action(incidents, critical_only=False)
     if warning_action is not None:
         return warning_action
+    if exact_anomalies:
+        return OperatorAction(
+            kind="command",
+            title="Review the data-quality evidence",
+            detail=(
+                f"{exact_anomalies} unresolved data-quality case(s) exist "
+                "outside the bounded preflight list."
+            ),
+            destination="system",
+            tone="warning",
+            command="aios anomalies --unresolved --limit 1000",
+            cta_label="Open Operations",
+        )
+    if exact_incidents:
+        return OperatorAction(
+            kind="command",
+            title="Review the operating evidence",
+            detail=(
+                f"{exact_incidents} operational blocker(s) exist outside the "
+                "bounded preflight list."
+            ),
+            destination="system",
+            tone="warning",
+            command="aios alerts --blocking --limit 1000",
+            cta_label="Open System Health",
+        )
+    route = (
+        operations_evidence.get("notification_route")
+        if isinstance(operations_evidence, Mapping)
+        else None
+    )
+    enabled_dead_letters = (
+        _exact_summary_count(
+            operations_evidence,
+            "notification_summary",
+            "dead_letter",
+            fallback=0,
+        )
+        if isinstance(operations_evidence, Mapping)
+        and isinstance(route, Mapping)
+        and route.get("state") == "enabled"
+        else 0
+    )
+    if enabled_dead_letters:
+        return OperatorAction(
+            kind="command",
+            title="Review failed notification delivery",
+            detail=(
+                f"{enabled_dead_letters} enabled-route notification(s) "
+                "exhausted retry policy."
+            ),
+            destination="system",
+            tone="warning",
+            command="aios notifications --needs-review --limit 1000",
+            cta_label="Open System Health",
+        )
     if not operations.available:
         return OperatorAction(
             kind="command",
@@ -796,9 +1063,7 @@ def _next_action(
     if paper_recording.state == "waiting_for_close":
         proposal = _proposal_mapping(monitor)
         scheduled = (
-            _text(proposal.get("scheduled_simulation_date"))
-            if proposal is not None
-            else None
+            _text(proposal.get("scheduled_simulation_date")) if proposal is not None else None
         )
         detail = (
             f"The proposal targets {scheduled}. Wait for the reviewed close."
@@ -835,9 +1100,7 @@ def build_operator_preflight(
     """Compose one deterministic snapshot from already-loaded governed evidence."""
 
     research = _research_state(readiness)
-    registered_proposal_ready, proposal_blockers = _registered_proposal_gate(
-        monitor
-    )
+    registered_proposal_ready, proposal_blockers = _registered_proposal_gate(monitor)
     proposal_creation = _proposal_creation_state(
         monitor,
         registered_proposal_ready=registered_proposal_ready,
@@ -860,9 +1123,7 @@ def build_operator_preflight(
     forward_payload = _forward_mapping(monitor)
     return OperatorPreflight(
         checked_at=checked_at or "not-recorded",
-        decision_date=_text(
-            readiness.get("as_of") or readiness.get("certified_research_through")
-        ),
+        decision_date=_text(readiness.get("as_of") or readiness.get("certified_research_through")),
         raw_prices_through=_text(readiness.get("raw_prices_through")),
         fundamentals_through=_text(readiness.get("fundamentals_through")),
         macro_releases_through=_text(readiness.get("macro_releases_through")),
@@ -882,49 +1143,25 @@ def build_operator_preflight(
             operations=operations,
         ),
         account_id=(
-            _text(proposal_payload.get("account_id"))
-            if proposal_payload is not None
-            else None
+            _text(proposal_payload.get("account_id")) if proposal_payload is not None else None
         ),
         proposal_id=(
-            _text(proposal_payload.get("proposal_id"))
-            if proposal_payload is not None
-            else None
+            _text(proposal_payload.get("proposal_id")) if proposal_payload is not None else None
         ),
-        trial_id=(
-            _text(forward_payload.get("trial_id"))
-            if forward_payload is not None
-            else None
-        ),
-        account_path=(
-            _text(monitor.get("account_path"))
-            if isinstance(monitor, Mapping)
-            else None
-        ),
+        trial_id=(_text(forward_payload.get("trial_id")) if forward_payload is not None else None),
+        account_path=(_text(monitor.get("account_path")) if isinstance(monitor, Mapping) else None),
         proposal_path=(
-            _text(monitor.get("proposal_path"))
-            if isinstance(monitor, Mapping)
-            else None
+            _text(monitor.get("proposal_path")) if isinstance(monitor, Mapping) else None
         ),
-        trial_path=(
-            _text(monitor.get("trial_path"))
-            if isinstance(monitor, Mapping)
-            else None
-        ),
+        trial_path=(_text(monitor.get("trial_path")) if isinstance(monitor, Mapping) else None),
         account_payload_sha256=(
-            _text(monitor.get("account_payload_sha256"))
-            if isinstance(monitor, Mapping)
-            else None
+            _text(monitor.get("account_payload_sha256")) if isinstance(monitor, Mapping) else None
         ),
         proposal_payload_sha256=(
-            _text(monitor.get("proposal_payload_sha256"))
-            if isinstance(monitor, Mapping)
-            else None
+            _text(monitor.get("proposal_payload_sha256")) if isinstance(monitor, Mapping) else None
         ),
         trial_payload_sha256=(
-            _text(monitor.get("trial_payload_sha256"))
-            if isinstance(monitor, Mapping)
-            else None
+            _text(monitor.get("trial_payload_sha256")) if isinstance(monitor, Mapping) else None
         ),
     )
 
@@ -933,17 +1170,11 @@ def _project_path(root: Path, value: str | Path | None) -> Path | None:
     if value is None:
         return None
     requested = Path(value)
-    resolved = (
-        requested.resolve()
-        if requested.is_absolute()
-        else (root / requested).resolve()
-    )
+    resolved = requested.resolve() if requested.is_absolute() else (root / requested).resolve()
     try:
         resolved.relative_to(root)
     except ValueError as exc:
-        raise ValueError(
-            f"operator evidence path escapes project root: {requested}"
-        ) from exc
+        raise ValueError(f"operator evidence path escapes project root: {requested}") from exc
     return resolved
 
 
@@ -1014,8 +1245,7 @@ def assess_operator_preflight(
                     "ready": False,
                     "status": str(timing_status or "invalid"),
                     "detail": str(
-                        timing.get("detail")
-                        or "The proposal timing evidence is unavailable."
+                        timing.get("detail") or "The proposal timing evidence is unavailable."
                     ),
                     "missing": [],
                 }

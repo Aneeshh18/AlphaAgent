@@ -337,6 +337,9 @@ def load_system_operations() -> dict:
     operations = load_operations_evidence_read_only(operations_path)
     state["incidents"] = operations["incidents"]
     state["incident_summary"] = operations["incident_summary"]
+    state["anomaly_cases"] = operations["anomaly_cases"]
+    state["anomaly_case_summary"] = operations["anomaly_case_summary"]
+    state["latest_anomaly_scan"] = operations["latest_anomaly_scan"]
     state["daily_cycle"] = operations["daily_cycle"]
     state["incident_error"] = operations["error"]
     state["notification_summary"] = operations["notification_summary"]
@@ -951,7 +954,17 @@ def _render_overview(report: dict) -> None:
     operations = load_operating_summary()
     model = build_home_view_model(report, monitor, operations)
     unresolved = [row for row in operations.get("incidents", []) if row.get("state") != "resolved"]
-    critical_count = sum(row.get("severity") == "critical" for row in unresolved)
+    unresolved_cases = [
+        row
+        for row in operations.get("anomaly_cases", [])
+        if row.get("state") != "resolved"
+    ]
+    critical_incident_count = sum(
+        row.get("severity") == "critical" for row in unresolved
+    )
+    critical_case_count = sum(
+        row.get("severity") == "critical" for row in unresolved_cases
+    )
     proposal = monitor.get("proposal") if isinstance(monitor, dict) else None
     targets = proposal.get("targets", []) if isinstance(proposal, dict) else []
 
@@ -995,7 +1008,12 @@ def _render_overview(report: dict) -> None:
             (
                 "Operations",
                 model.operations.value,
-                f"{critical_count} critical · {len(unresolved)} unresolved",
+                (
+                    f"{len(unresolved_cases)} data case(s) "
+                    f"({critical_case_count} critical) · "
+                    f"{len(unresolved)} incident(s) "
+                    f"({critical_incident_count} critical)"
+                ),
                 model.operations.tone,
             ),
             (
@@ -1106,29 +1124,54 @@ def _render_overview(report: dict) -> None:
 
             with st.container(border=True, key="home_incidents"):
                 section_header(
-                    "Open incidents",
-                    "Current exceptions from the independent operations ledger.",
+                    "Open reviews",
+                    "Data-quality cases and operating incidents remain separate and visible.",
                 )
                 if operations.get("error"):
                     st.warning(
                         "The operations ledger is unavailable; research evidence is unchanged."
                     )
-                elif not unresolved:
-                    st.success("No unresolved operating incidents are recorded.")
+                elif not unresolved_cases and not unresolved:
+                    st.success(
+                        "No unresolved data-review cases or operating incidents are recorded."
+                    )
                 else:
-                    for row in unresolved[:4]:
+                    open_reviews = [
+                        ("Data case", row)
+                        for row in unresolved_cases
+                    ] + [
+                        ("Incident", row)
+                        for row in unresolved
+                    ]
+                    open_reviews.sort(
+                        key=lambda item: (
+                            item[1].get("severity") != "critical",
+                            item[0] != "Data case",
+                            str(
+                                item[1].get("case_id")
+                                or item[1].get("incident_id")
+                                or ""
+                            ),
+                        )
+                    )
+                    for review_kind, row in open_reviews[:4]:
                         severity = str(row.get("severity") or "unknown").title()
-                        title = str(row.get("title") or "Untitled operating incident")
+                        title = str(
+                            row.get("title")
+                            or f"Untitled {review_kind.lower()}"
+                        )
                         tone = "danger" if row.get("severity") == "critical" else "warning"
                         st.markdown(
                             f'<div class="aios-incident-row {tone}">'
-                            f"<span>{escape(severity)}</span>"
+                            f"<span>{escape(review_kind)} · {escape(severity)}</span>"
                             f"<strong>{escape(title)}</strong>"
                             "</div>",
                             unsafe_allow_html=True,
                         )
-                    if len(unresolved) > 4:
-                        st.caption(f"{len(unresolved) - 4} more incident(s) in Operations.")
+                    if len(open_reviews) > 4:
+                        st.caption(
+                            f"{len(open_reviews) - 4} more open review(s) in Operations."
+                        )
 
 
 def _render_opportunity_map(
@@ -1396,9 +1439,21 @@ def _next_operator_review(report: dict, operations: dict, monitor: dict | None) 
     unresolved_incidents = [
         row for row in operations.get("incidents", []) if row.get("state") != "resolved"
     ]
+    unresolved_cases = [
+        row
+        for row in operations.get("anomaly_cases", [])
+        if row.get("state") != "resolved"
+    ]
+    critical_cases = [
+        row for row in unresolved_cases if row.get("severity") == "critical"
+    ]
+    if critical_cases:
+        return f"Review critical data-quality case {critical_cases[0]['case_id']}."
     critical_incidents = [row for row in unresolved_incidents if row.get("severity") == "critical"]
     if critical_incidents:
         return f"Review critical incident {critical_incidents[0]['incident_id']}."
+    if unresolved_cases:
+        return f"Review data-quality case {unresolved_cases[0]['case_id']}."
 
     notification_summary = operations.get("notification_summary", {})
     if int(notification_summary.get("dead_letter", 0)) > 0:
@@ -1498,9 +1553,36 @@ def _render_system_control(report: dict) -> None:
     critical_incidents = [row for row in unresolved_incidents if row.get("severity") == "critical"]
     unresolved_count = int(incident_summary.get("unresolved", len(unresolved_incidents)))
     critical_count = int(incident_summary.get("critical_unresolved", len(critical_incidents)))
+    anomaly_cases = operations.get("anomaly_cases", [])
+    anomaly_summary = operations.get("anomaly_case_summary", {})
+    unresolved_cases = [
+        row for row in anomaly_cases if row.get("state") != "resolved"
+    ]
+    critical_cases = [
+        row for row in unresolved_cases if row.get("severity") == "critical"
+    ]
+    unresolved_case_count = int(
+        anomaly_summary.get("unresolved", len(unresolved_cases))
+    )
+    critical_case_count = int(
+        anomaly_summary.get("critical_unresolved", len(critical_cases))
+    )
 
     next_review = _next_operator_review(report, operations, monitor)
-    if critical_incidents:
+    if critical_cases:
+        first_critical_case = critical_cases[0]
+        case_label = "case" if critical_case_count == 1 else "cases"
+        review_verb = "requires" if critical_case_count == 1 else "require"
+        st.error(
+            f"{critical_case_count} critical data-quality {case_label} {review_verb} review. "
+            f"First issue: {first_critical_case.get('title') or 'Untitled data-quality case'}. "
+            "Next action: inspect its governed evidence using the command below."
+        )
+        case_id = str(first_critical_case.get("case_id") or "").strip()
+        if case_id:
+            with st.expander("Technical inspection command"):
+                st.code(f"aios anomaly-show {case_id}", language="bash")
+    elif critical_incidents:
         first_critical = critical_incidents[0]
         incident_label = "incident" if critical_count == 1 else "incidents"
         review_verb = "requires" if critical_count == 1 else "require"
@@ -1543,10 +1625,21 @@ def _render_system_control(report: dict) -> None:
                 "success" if backup.get("status") == "verified" else "warning",
             ),
             (
-                "Open incidents",
-                str(unresolved_count),
-                f"{critical_count} critical",
-                "danger" if critical_count else ("warning" if unresolved_count else "success"),
+                "Open reviews",
+                str(unresolved_case_count + unresolved_count),
+                (
+                    f"{unresolved_case_count} data case(s) · "
+                    f"{unresolved_count} incident(s)"
+                ),
+                (
+                    "danger"
+                    if critical_case_count or critical_count
+                    else (
+                        "warning"
+                        if unresolved_case_count or unresolved_count
+                        else "success"
+                    )
+                ),
             ),
         ]
     )
@@ -1762,6 +1855,59 @@ def _render_system_control(report: dict) -> None:
         st.dataframe(scheduler_table, hide_index=True, width="stretch")
     else:
         st.warning("No scheduler evidence is available.")
+
+    section_header(
+        "Data review cases",
+        "Deduplicated anomaly findings stay separate from operating incidents. "
+        "Review actions never repair source data or change paper state.",
+    )
+    latest_anomaly_scan = operations.get("latest_anomaly_scan")
+    if operations.get("incident_error"):
+        st.error("Data-review case history could not be opened.")
+    elif anomaly_cases:
+        anomaly_table = pd.DataFrame(
+            [
+                {
+                    "Last seen": pd.to_datetime(
+                        row["last_seen_at"],
+                        errors="coerce",
+                    ).strftime("%b %d, %Y %H:%M UTC"),
+                    "Severity": str(row["severity"]).title(),
+                    "State": str(row["state"]).title(),
+                    "Rule": f"{row['rule_id']} · {row['rule_version']}",
+                    "Subject": f"{row['subject_type']} · {row['subject_id']}",
+                    "Owner": row.get("owner") or "Unassigned",
+                    "Summary": row["title"],
+                    "Case ID": row["case_id"],
+                }
+                for row in anomaly_cases
+            ]
+        )
+        st.dataframe(anomaly_table, hide_index=True, width="stretch", height=360)
+        st.caption(
+            "Inspect with `aios anomaly-show CASE_REF`; acknowledge with "
+            "`aios anomaly-ack CASE_REF`. Acknowledgement and resolution require "
+            "the current evidence hash, named owner, and audit note in the CLI."
+        )
+    elif latest_anomaly_scan is None:
+        st.info("No governed anomaly scan or data-review case is recorded yet.")
+    else:
+        st.success("The latest governed anomaly scan has no recorded review cases.")
+    if latest_anomaly_scan is not None:
+        recorded_at = pd.to_datetime(
+            latest_anomaly_scan.get("recorded_at"),
+            errors="coerce",
+        ).strftime("%b %d, %Y %H:%M UTC")
+        source_boundary_at = pd.to_datetime(
+            latest_anomaly_scan.get("source_boundary_at"),
+            errors="coerce",
+        ).strftime("%b %d, %Y %H:%M UTC")
+        st.caption(
+            f"Latest scan recorded: {recorded_at} · "
+            f"source boundary: {source_boundary_at} · "
+            f"{latest_anomaly_scan.get('observation_count', 0)} observation(s) · "
+            f"rule bundle {latest_anomaly_scan.get('rule_bundle_version', 'unknown')}."
+        )
 
     section_header(
         "Data pipeline",

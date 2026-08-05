@@ -1,0 +1,216 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:aios:schema:hosted-research-snapshot:v1",
+  "title": "AIOS hosted research snapshot v1",
+  "description": "Unsigned, tenant-neutral local research artifact. Hosted promotion remains blocked until interoperable canonicalization and signing exist.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "document_kind",
+    "schema_version",
+    "unsigned",
+    "canonicalization",
+    "hosted_promotion_allowed",
+    "promotion_blocker",
+    "snapshot_id",
+    "payload_sha256",
+    "payload"
+  ],
+  "properties": {
+    "document_kind": {
+      "const": "aios.hosted-research-snapshot"
+    },
+    "schema_version": {
+      "const": "hosted-research-snapshot.v1"
+    },
+    "unsigned": {
+      "const": true
+    },
+    "canonicalization": {
+      "const": "python-json-v1-local-only"
+    },
+    "hosted_promotion_allowed": {
+      "const": false
+    },
+    "promotion_blocker": {
+      "const": "interoperable-canonicalization-and-signature-required"
+    },
+    "snapshot_id": {
+      "type": "string",
+      "pattern": "^hrs-v1-[0-9a-f]{64}$"
+    },
+    "payload_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "certified_decision_close",
+        "readiness_sha256",
+        "universe_id",
+        "universe_membership_sha256",
+        "factor_policy_sha256",
+        "source_policy_sha256",
+        "created_at",
+        "serving_expires_at",
+        "coverage",
+        "securities"
+      ],
+      "properties": {
+        "certified_decision_close": {
+          "type": "string",
+          "format": "date"
+        },
+        "readiness_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "universe_id": {
+          "const": "sp500"
+        },
+        "universe_membership_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "factor_policy_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_policy_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "serving_expires_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "coverage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "total",
+            "scored",
+            "withheld"
+          ],
+          "properties": {
+            "total": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "scored": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "withheld": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "securities": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 600,
+          "items": {
+            "$ref": "#/$defs/security"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "score": {
+      "oneOf": [
+        {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "security_id",
+        "ticker",
+        "company_name",
+        "rank",
+        "grade",
+        "qv_score",
+        "quality_score",
+        "value_score",
+        "missing_inputs"
+      ],
+      "properties": {
+        "security_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+        },
+        "ticker": {
+          "type": "string",
+          "pattern": "^[A-Z0-9][A-Z0-9.-]{0,15}$"
+        },
+        "company_name": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rank": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "grade": {
+          "enum": [
+            "A+",
+            "A",
+            "B",
+            "C",
+            "D",
+            "N/A"
+          ]
+        },
+        "qv_score": {
+          "$ref": "#/$defs/score"
+        },
+        "quality_score": {
+          "$ref": "#/$defs/score"
+        },
+        "value_score": {
+          "$ref": "#/$defs/score"
+        },
+        "missing_inputs": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$"
+          }
+        }
+      }
+    }
+  }
+}

@@ -12,9 +12,13 @@ goes through these functions. Keeps connection management in one place.
 
 from __future__ import annotations
 
+import json
+import os
+import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from math import isfinite
 from pathlib import Path
 from time import monotonic, sleep
@@ -29,6 +33,12 @@ from aios.price_provenance import (
     canonical_price_payload_hash,
     normalize_extension_price_row,
 )
+from aios.sec_rejections import (
+    SEC_FUNDAMENTAL_REJECTION_CODES,
+    accepted_sec_fundamental_outcome,
+    canonical_rejection_codes,
+    decode_rejection_codes,
+)
 from aios.storage.schema import MACRO_TABLE_SQL, SCHEMA_SQL
 
 if TYPE_CHECKING:
@@ -36,6 +46,90 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 MACRO_LEGACY_PURGED_MIGRATION = "macro_legacy_active_copies_purged"
+RAW_SNAPSHOT_REJECTION_EVIDENCE_MIGRATION = "raw_snapshot_rejection_evidence_v1"
+FUNDAMENTAL_EVIDENCE_VERSIONS_MIGRATION = "fundamental_evidence_versions_v1"
+UNIVERSE_CONSTITUENT_CHANGE_ACTIVATIONS_MIGRATION = (
+    "universe_constituent_change_activations_v1"
+)
+_RAW_SNAPSHOT_MAX_ORIGINAL_BYTES = 256 * 1024 * 1024
+_RAW_SNAPSHOT_MAX_STORED_BYTES = 64 * 1024 * 1024
+
+DatabaseFileIdentity = tuple[int, int, int, int, int, int]
+
+
+def stable_database_file_identity(database_path: Path) -> DatabaseFileIdentity:
+    """Return one no-follow identity for a regular, singly linked database."""
+
+    database = Path(os.path.abspath(Path(database_path).expanduser()))
+    for candidate in (database, *database.parents):
+        if candidate.is_symlink():
+            raise ValueError(f"database path cannot contain symbolic links: {database}")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(database, flags)
+    try:
+        opened = os.fstat(descriptor)
+        current = database.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise ValueError(f"database must be one regular unaliased file: {database}")
+        return (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_nlink,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
+    finally:
+        os.close(descriptor)
+
+
+@dataclass(frozen=True)
+class FundamentalEvidenceGeneration:
+    """Named immutable system-time boundary for fundamental factor reads."""
+
+    generation_id: str
+    version_sequence: int
+    purpose: str
+    decision_date: str | None
+    captured_at: str
+
+
+def checkpoint_database_for_backup(database_path: Path) -> None:
+    """Checkpoint an existing DuckDB without running application migrations.
+
+    Backup is a preservation boundary. Opening the database through ``Store``
+    would run additive schema migrations before the pre-migration snapshot was
+    captured, defeating that boundary. This direct engine connection performs
+    only the checkpoint needed for a consistent file copy.
+    """
+    requested = Path(database_path).expanduser()
+    database = Path(os.path.abspath(requested))
+    for candidate in (database, *database.parents):
+        if candidate.is_symlink():
+            raise ValueError(
+                f"database path cannot contain symbolic links: {database}"
+            )
+    if not database.is_file():
+        raise ValueError(f"database does not exist or is unsafe: {database}")
+    before = database.stat()
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise ValueError(f"database must be one regular, unaliased file: {database}")
+    connection = duckdb.connect(str(database), read_only=False)
+    try:
+        connection.execute("CHECKPOINT")
+    finally:
+        connection.close()
+    after = database.stat()
+    if (
+        not stat.S_ISREG(after.st_mode)
+        or after.st_nlink != 1
+        or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+    ):
+        raise RuntimeError("database identity changed during backup checkpoint")
 
 
 class Store:
@@ -47,12 +141,18 @@ class Store:
         *,
         read_only: bool = False,
         lock_wait_seconds: float | None = None,
+        allow_schema_upgrade: bool = False,
     ) -> None:
         self.db_path = db_path or _resolve(settings.duckdb_path)
         self.read_only = read_only
+        self.database_file_identity: DatabaseFileIdentity | None = None
+        self.allow_schema_upgrade = bool(allow_schema_upgrade)
+        if read_only and self.allow_schema_upgrade:
+            raise ValueError("a read-only Store cannot allow schema upgrades")
         if read_only:
             if not self.db_path.is_file():
                 raise FileNotFoundError(f"DuckDB database does not exist: {self.db_path}")
+            connection_identity = stable_database_file_identity(self.db_path)
         else:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
         wait_seconds = (
@@ -67,17 +167,427 @@ class Store:
             read_only=read_only,
             wait_seconds=wait_seconds,
         )
-        if not read_only:
-            self._init_schema()
+        if read_only:
+            try:
+                opened_identity = stable_database_file_identity(self.db_path)
+                if opened_identity != connection_identity:
+                    raise RuntimeError(
+                        "DuckDB database identity changed while it was opened"
+                    )
+                self.database_file_identity = opened_identity
+            except Exception:
+                self._con.close()
+                raise
+        else:
+            try:
+                self._init_schema()
+            except Exception:
+                self._con.close()
+                raise
 
     def _init_schema(self) -> None:
         """Run all CREATE TABLE IF NOT EXISTS statements."""
+        self._preflight_universe_constituent_change_activation_schema()
         self._con.execute(SCHEMA_SQL)
+        self._migrate_ingest_subject_schema()
+        self._migrate_ingest_rejection_schema()
+        self._migrate_raw_snapshot_rejection_schema()
         self._migrate_macro_schema()
         self._migrate_security_identity_schema()
         self._migrate_reference_identity_columns()
+        self._migrate_fundamental_provenance_schema()
+        self._migrate_fundamental_evidence_versions()
         self._migrate_price_action_schema()
+        self._migrate_universe_constituent_change_activation_schema(
+            allow_marker_insert=(
+                self.allow_schema_upgrade
+                or self._universe_change_bootstrap_allowed
+            )
+        )
         log.info("schema.initialized", db=str(self.db_path))
+
+    def _preflight_universe_constituent_change_activation_schema(self) -> None:
+        """Reject receipt loss or unmarked rows before additive DDL can hide it."""
+
+        tables = {
+            str(row["table_name"])
+            for row in self.query(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'main'
+                """
+            )
+        }
+        self._universe_change_bootstrap_allowed = not tables
+        table_exists = "universe_constituent_change_activations" in tables
+        marker_exists = False
+        if "schema_migrations" in tables:
+            marker_exists = bool(
+                self.query(
+                    "SELECT name FROM schema_migrations WHERE name = ?",
+                    (UNIVERSE_CONSTITUENT_CHANGE_ACTIVATIONS_MIGRATION,),
+                )
+            )
+        if marker_exists and not table_exists:
+            raise RuntimeError(
+                "Universe constituent-change activation receipt table is missing "
+                "after its migration marker was recorded."
+            )
+        if (
+            tables
+            and not table_exists
+            and not marker_exists
+            and not self.allow_schema_upgrade
+        ):
+            raise RuntimeError(
+                "Universe constituent-change activation capability requires the "
+                "backup-first upgrade-local-state workflow."
+            )
+        if table_exists and not marker_exists:
+            row_count = int(
+                self.query(
+                    "SELECT COUNT(*) AS n FROM universe_constituent_change_activations"
+                )[0]["n"]
+            )
+            if row_count:
+                raise RuntimeError(
+                    "Universe constituent-change activation rows exist without a "
+                    "migration marker."
+                )
+
+    def require_universe_change_activation_schema(self) -> None:
+        """Verify this database can safely plan or apply constituent changes.
+
+        This check is intentionally side-effect-free so a read-only planning
+        process cannot auto-migrate a database behind the operator's back.
+        """
+
+        tables = {
+            str(row["table_name"])
+            for row in self.query(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'main'
+                """
+            )
+        }
+        if not {
+            "schema_migrations",
+            "universe_constituent_change_activations",
+        }.issubset(tables):
+            raise RuntimeError(
+                "Universe constituent-change activation capability is not installed; "
+                "run the backup-first upgrade-local-state workflow."
+            )
+        self._preflight_universe_constituent_change_activation_schema()
+        self._migrate_universe_constituent_change_activation_schema(
+            allow_marker_insert=False
+        )
+
+    def _migrate_universe_constituent_change_activation_schema(
+        self,
+        *,
+        allow_marker_insert: bool = True,
+    ) -> None:
+        """Certify the append-only constituent-change receipt capability.
+
+        ``CREATE TABLE IF NOT EXISTS`` cannot distinguish our reviewed table
+        from a partial table left by an interrupted or foreign migration.  A
+        constituent activation is too sensitive to accept that ambiguity, so
+        writable startup validates the complete shape and constraints before
+        recording one durable capability marker.
+        """
+
+        expected_columns = (
+            ("activation_id", "VARCHAR", "NO"),
+            ("event_id", "VARCHAR", "NO"),
+            ("plan_sha256", "VARCHAR", "NO"),
+            ("activation_payload_sha256", "VARCHAR", "NO"),
+            ("activation_run_id", "VARCHAR", "NO"),
+            ("fundamental_run_id", "VARCHAR", "NO"),
+            ("price_run_id", "VARCHAR", "NO"),
+            ("source_attestation_id", "VARCHAR", "NO"),
+            ("schema_version", "INTEGER", "NO"),
+            ("universe_id", "VARCHAR", "NO"),
+            ("announcement_date", "DATE", "NO"),
+            ("effective_date", "DATE", "NO"),
+            ("prior_coverage_through", "DATE", "NO"),
+            ("target_coverage_through", "DATE", "NO"),
+            ("official_detail_snapshot_id", "VARCHAR", "NO"),
+            ("component_snapshot_id", "VARCHAR", "NO"),
+            ("before_member_set_sha256", "VARCHAR", "NO"),
+            ("after_member_set_sha256", "VARCHAR", "NO"),
+            ("before_state_sha256", "VARCHAR", "NO"),
+            ("after_state_sha256", "VARCHAR", "NO"),
+            ("change_rows_sha256", "VARCHAR", "NO"),
+            ("activation_payload_json", "VARCHAR", "NO"),
+            ("backup_manifest_sha256", "VARCHAR", "NO"),
+            ("actor", "VARCHAR", "NO"),
+            ("policy_version", "VARCHAR", "NO"),
+            ("counts_json", "VARCHAR", "NO"),
+            ("activated_at", "TIMESTAMP", "NO"),
+            ("status", "VARCHAR", "NO"),
+            ("created_at", "TIMESTAMP", "YES"),
+        )
+        described = tuple(
+            (str(row["column_name"]), str(row["column_type"]), str(row["null"]))
+            for row in self.query(
+                "DESCRIBE universe_constituent_change_activations"
+            )
+        )
+        if described != expected_columns:
+            raise RuntimeError(
+                "Universe constituent-change activation schema is incomplete or unsupported."
+            )
+
+        constraints = self.query(
+            """
+            SELECT constraint_type, constraint_column_names, expression
+            FROM duckdb_constraints()
+            WHERE schema_name = 'main'
+              AND table_name = 'universe_constituent_change_activations'
+            """
+        )
+        key_constraints = {
+            (
+                str(row["constraint_type"]),
+                tuple(str(column) for column in row["constraint_column_names"]),
+            )
+            for row in constraints
+            if row["constraint_type"] in {"PRIMARY KEY", "UNIQUE"}
+        }
+        required_keys = {
+            ("PRIMARY KEY", ("activation_id",)),
+            ("UNIQUE", ("event_id",)),
+            ("UNIQUE", ("plan_sha256",)),
+            ("UNIQUE", ("activation_payload_sha256",)),
+            ("UNIQUE", ("activation_run_id",)),
+            ("UNIQUE", ("fundamental_run_id",)),
+            ("UNIQUE", ("price_run_id",)),
+        }
+        check_expressions = {
+            "".join(str(row["expression"] or "").split()).casefold()
+            for row in constraints
+            if row["constraint_type"] == "CHECK"
+        }
+        required_checks = {
+            "(schema_version=1)",
+            "(status='accepted')",
+            "(announcement_date<=effective_date)",
+            "(prior_coverage_through<effective_date)",
+            "(effective_date<=target_coverage_through)",
+            "regexp_full_match(plan_sha256,'^[0-9a-f]{64}$')",
+            "regexp_full_match(activation_payload_sha256,'^[0-9a-f]{64}$')",
+            "regexp_full_match(before_member_set_sha256,'^[0-9a-f]{64}$')",
+            "regexp_full_match(after_member_set_sha256,'^[0-9a-f]{64}$')",
+            "regexp_full_match(before_state_sha256,'^[0-9a-f]{64}$')",
+            "regexp_full_match(after_state_sha256,'^[0-9a-f]{64}$')",
+            "regexp_full_match(change_rows_sha256,'^[0-9a-f]{64}$')",
+            "regexp_full_match(backup_manifest_sha256,'^[0-9a-f]{64}$')",
+            '(length(main."trim"(actor))>0)',
+            '(length(main."trim"(policy_version))>0)',
+        }
+        if key_constraints != required_keys or check_expressions != required_checks:
+            raise RuntimeError(
+                "Universe constituent-change activation constraints are incomplete."
+            )
+
+        marker = self.query(
+            """
+            SELECT applied_at
+            FROM schema_migrations WHERE name = ?
+            """,
+            (UNIVERSE_CONSTITUENT_CHANGE_ACTIVATIONS_MIGRATION,),
+        )
+        row_count = int(
+            self.query(
+                "SELECT COUNT(*) AS n FROM universe_constituent_change_activations"
+            )[0]["n"]
+        )
+        if marker:
+            if (
+                len(marker) != 1
+                or not isinstance(marker[0]["applied_at"], datetime)
+                or marker[0]["applied_at"]
+                > datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=18)
+            ):
+                raise RuntimeError(
+                    "Universe constituent-change activation migration marker is invalid."
+                )
+            if row_count:
+                raise RuntimeError(
+                    "Universe constituent-change activation receipts are not yet "
+                    "supported by this release's semantic verifier."
+                )
+            return
+        if row_count:
+            raise RuntimeError(
+                "Universe constituent-change activation rows exist without a migration marker."
+            )
+        if not allow_marker_insert:
+            raise RuntimeError(
+                "Universe constituent-change activation capability is not certified; "
+                "run the backup-first upgrade-local-state workflow."
+            )
+
+        self.execute("BEGIN TRANSACTION")
+        try:
+            self.execute(
+                "INSERT INTO schema_migrations (name) VALUES (?)",
+                (UNIVERSE_CONSTITUENT_CHANGE_ACTIVATIONS_MIGRATION,),
+            )
+            self.execute("COMMIT")
+        except Exception:
+            self.execute("ROLLBACK")
+            raise
+
+    def _migrate_ingest_subject_schema(self) -> None:
+        """Add optional subject identity without rewriting legacy ingest rows."""
+        columns = {row["column_name"] for row in self.query("DESCRIBE ingest_log")}
+        present = {"subject_type", "subject_id"} & columns
+        if present == {"subject_type", "subject_id"}:
+            return
+        if present:
+            raise RuntimeError(
+                "Ingest subject migration is incomplete: subject_type and "
+                "subject_id must be added together."
+            )
+        self.execute("BEGIN TRANSACTION")
+        try:
+            self.execute("ALTER TABLE ingest_log ADD COLUMN subject_type VARCHAR")
+            self.execute("ALTER TABLE ingest_log ADD COLUMN subject_id VARCHAR")
+            self.execute("COMMIT")
+        except Exception:
+            self.execute("ROLLBACK")
+            raise
+
+    def _migrate_ingest_rejection_schema(self) -> None:
+        """Add structured rejection evidence without rewriting old outcomes."""
+        columns = {row["column_name"] for row in self.query("DESCRIBE ingest_log")}
+        if "rejection_codes" not in columns:
+            self.execute("ALTER TABLE ingest_log ADD COLUMN rejection_codes VARCHAR")
+
+    def _migrate_raw_snapshot_rejection_schema(self) -> None:
+        """Add and replay-backfill parser rejection evidence."""
+
+        columns = {row["column_name"] for row in self.query("DESCRIBE raw_snapshots")}
+        expected = {
+            "parsed_rows_rejected": "BIGINT",
+            "parsed_rejection_codes": "VARCHAR",
+        }
+        present = set(expected) & columns
+        if present and present != set(expected):
+            raise RuntimeError(
+                "Raw snapshot rejection migration is incomplete: rejection "
+                "count and codes must be added together."
+            )
+        self.execute("BEGIN TRANSACTION")
+        try:
+            if not present:
+                for column, data_type in expected.items():
+                    self.execute(f"ALTER TABLE raw_snapshots ADD COLUMN {column} {data_type}")
+            self._backfill_raw_snapshot_rejection_evidence()
+            self.execute(
+                """
+                INSERT INTO schema_migrations (name)
+                VALUES (?)
+                ON CONFLICT (name) DO NOTHING
+                """,
+                (RAW_SNAPSHOT_REJECTION_EVIDENCE_MIGRATION,),
+            )
+            self.execute("COMMIT")
+        except Exception:
+            self.execute("ROLLBACK")
+            raise
+
+    def _backfill_raw_snapshot_rejection_evidence(self) -> None:
+        """Replay exact historical Company Facts bytes before certifying migration."""
+
+        candidates = self.query(
+            """
+            SELECT snapshot.snapshot_id, snapshot.parser_version,
+                   snapshot.parsed_row_count, snapshot.parsed_rows_sha256,
+                   snapshot.parsed_rows_rejected,
+                   snapshot.parsed_rejection_codes,
+                   payload.payload_sha256, payload.relative_path,
+                   payload.original_bytes, payload.stored_bytes,
+                   payload.compression
+            FROM raw_snapshots AS snapshot
+            JOIN raw_payloads AS payload USING (payload_sha256)
+            WHERE snapshot.provider = 'sec-edgar'
+              AND snapshot.dataset = 'companyfacts'
+              AND snapshot.parser_version IN (
+                  'sec-companyfacts-v2',
+                  'sec-companyfacts-v3'
+              )
+              AND snapshot.parsed_row_count IS NOT NULL
+            ORDER BY snapshot.snapshot_id
+            """
+        )
+        missing = [
+            row
+            for row in candidates
+            if row["parsed_rows_rejected"] is None
+            or (int(row["parsed_rows_rejected"]) > 0 and row["parsed_rejection_codes"] is None)
+            or (int(row["parsed_rows_rejected"]) == 0 and row["parsed_rejection_codes"] is not None)
+        ]
+        if not missing:
+            return
+
+        project_root = self._raw_snapshot_project_root()
+        if project_root is None:
+            raise RuntimeError(
+                "Historical SEC rejection evidence requires a database under "
+                "the project data directory or the configured live database."
+            )
+        from aios.ingest.edgar import replay_sec_companyfacts_response
+        from aios.raw_snapshots import (
+            _read_verified_payload,
+            _resolve_raw_root,
+            canonical_parsed_rows_sha256,
+        )
+
+        raw_root = _resolve_raw_root(project_root)
+        for row in missing:
+            payload, _stored_bytes = _read_verified_payload(
+                project_root,
+                raw_root,
+                row,
+            )
+            parsed_rows, metadata = replay_sec_companyfacts_response(
+                payload,
+                parser_version=str(row["parser_version"]),
+            )
+            if (
+                len(parsed_rows) != int(row["parsed_row_count"])
+                or canonical_parsed_rows_sha256(parsed_rows) != row["parsed_rows_sha256"]
+            ):
+                raise RuntimeError(
+                    "Historical SEC snapshot replay does not match its stored "
+                    f"parsed evidence: {row['snapshot_id']}"
+                )
+            rejected = int(metadata["rows_rejected"])
+            rejection_codes = canonical_rejection_codes(metadata["rejection_codes"])
+            self.execute(
+                """
+                UPDATE raw_snapshots
+                SET parsed_rows_rejected = ?,
+                    parsed_rejection_codes = ?
+                WHERE snapshot_id = ?
+                """,
+                (rejected, rejection_codes, row["snapshot_id"]),
+            )
+
+    def _raw_snapshot_project_root(self) -> Path | None:
+        configured_db = _resolve(settings.duckdb_path).resolve()
+        database = self.db_path.resolve()
+        if database == configured_db:
+            return settings.project_root.resolve()
+        if database.parent.name == "data":
+            return database.parent.parent
+        return None
 
     def _migrate_security_identity_schema(self) -> None:
         """Add the stable identity link to databases created before this layer."""
@@ -104,6 +614,168 @@ class Store:
             for column, data_type in expected.items():
                 if column not in columns:
                     self.execute(f"ALTER TABLE {table} ADD COLUMN {column} {data_type}")
+
+    def _migrate_fundamental_provenance_schema(self) -> None:
+        """Add nullable SEC row lineage without claiming provenance for old data."""
+        expected = {
+            "ingest_run_id": "VARCHAR",
+            "source_snapshot_id": "VARCHAR",
+            "source_rowset_sha256": "VARCHAR",
+            "source_row_sha256": "VARCHAR",
+            "source_fact_locator": "VARCHAR",
+        }
+        for table in ("fundamentals", "fundamentals_quarantine"):
+            columns = {row["column_name"] for row in self.query(f"DESCRIBE {table}")}
+            for column, data_type in expected.items():
+                if column not in columns:
+                    self.execute(f"ALTER TABLE {table} ADD COLUMN {column} {data_type}")
+
+    def _migrate_fundamental_evidence_versions(self) -> None:
+        """Seed one append-only system-time version for every current fact."""
+
+        expected = {
+            "version_sequence",
+            "ticker",
+            "issuer_id",
+            "security_id",
+            "ingest_run_id",
+            "source_snapshot_id",
+            "source_rowset_sha256",
+            "source_row_sha256",
+            "source_fact_locator",
+            "period_end",
+            "as_of_date",
+            "fiscal_period",
+            "statement",
+            "metric",
+            "value",
+            "quarter_value",
+            "unit",
+            "source",
+            "recorded_at",
+            "is_deleted",
+        }
+        columns = {
+            row["column_name"] for row in self.query("DESCRIBE fundamental_versions")
+        }
+        if not expected <= columns:
+            missing = sorted(expected - columns)
+            raise RuntimeError(
+                "Fundamental evidence version schema is incomplete: "
+                + ", ".join(missing)
+            )
+        marked = bool(
+            self.query(
+                "SELECT COUNT(*) AS n FROM schema_migrations WHERE name = ?",
+                (FUNDAMENTAL_EVIDENCE_VERSIONS_MIGRATION,),
+            )[0]["n"]
+        )
+        version_count = int(
+            self.query("SELECT COUNT(*) AS n FROM fundamental_versions")[0]["n"]
+        )
+        if not marked:
+            if version_count:
+                raise RuntimeError(
+                    "Fundamental evidence version migration is unmarked but non-empty"
+                )
+            self.execute("BEGIN TRANSACTION")
+            try:
+                self.execute(
+                    """
+                    INSERT INTO fundamental_versions
+                    (ticker, issuer_id, security_id, ingest_run_id,
+                     source_snapshot_id, source_rowset_sha256,
+                     source_row_sha256, source_fact_locator, period_end,
+                     as_of_date, fiscal_period, statement, metric, value,
+                     quarter_value, unit, source, recorded_at, is_deleted)
+                    SELECT ticker, issuer_id, security_id, ingest_run_id,
+                           source_snapshot_id, source_rowset_sha256,
+                           source_row_sha256, source_fact_locator, period_end,
+                           as_of_date, fiscal_period, statement, metric, value,
+                           quarter_value, unit, source, fetched_at, FALSE
+                    FROM fundamentals
+                    ORDER BY ticker, period_end, as_of_date, metric
+                    """
+                )
+                self.execute(
+                    """
+                    INSERT INTO schema_migrations (name)
+                    VALUES (?)
+                    ON CONFLICT (name) DO NOTHING
+                    """,
+                    (FUNDAMENTAL_EVIDENCE_VERSIONS_MIGRATION,),
+                )
+                self.execute("COMMIT")
+            except Exception:
+                self.execute("ROLLBACK")
+                raise
+        unmatched = self._fundamental_projection_version_mismatch_count()
+        if unmatched:
+            raise RuntimeError(
+                "Latest fundamental evidence versions do not reconstruct the "
+                "current projection"
+            )
+
+    def _fundamental_projection_version_mismatch_count(self) -> int:
+        """Count differences between latest versions and the current projection.
+
+        The latest version for each economic key is authoritative.  A deleted
+        latest version must have no current row; a non-deleted latest version
+        must reproduce the current row exactly.  This symmetric check catches
+        missing tombstones, stale versions, and unversioned current rows.
+        """
+
+        return int(
+            self.query(
+                """
+                WITH ranked_versions AS (
+                    SELECT version.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY ticker, period_end, as_of_date, metric
+                               ORDER BY version_sequence DESC
+                           ) AS projection_rank
+                    FROM fundamental_versions AS version
+                ), latest_versions AS (
+                    SELECT * EXCLUDE (projection_rank)
+                    FROM ranked_versions
+                    WHERE projection_rank = 1
+                )
+                SELECT COUNT(*) AS n
+                FROM latest_versions AS latest
+                FULL OUTER JOIN fundamentals AS current
+                  ON latest.ticker = current.ticker
+                 AND latest.period_end = current.period_end
+                 AND latest.as_of_date = current.as_of_date
+                 AND latest.metric = current.metric
+                WHERE latest.version_sequence IS NULL
+                   OR (current.ticker IS NULL AND latest.is_deleted = FALSE)
+                   OR (current.ticker IS NOT NULL AND latest.is_deleted = TRUE)
+                   OR (
+                       current.ticker IS NOT NULL
+                       AND latest.is_deleted = FALSE
+                       AND (
+                           latest.issuer_id IS DISTINCT FROM current.issuer_id
+                           OR latest.security_id IS DISTINCT FROM current.security_id
+                           OR latest.ingest_run_id IS DISTINCT FROM current.ingest_run_id
+                           OR latest.source_snapshot_id IS DISTINCT FROM
+                               current.source_snapshot_id
+                           OR latest.source_rowset_sha256 IS DISTINCT FROM
+                               current.source_rowset_sha256
+                           OR latest.source_row_sha256 IS DISTINCT FROM
+                               current.source_row_sha256
+                           OR latest.source_fact_locator IS DISTINCT FROM
+                               current.source_fact_locator
+                           OR latest.fiscal_period IS DISTINCT FROM current.fiscal_period
+                           OR latest.statement IS DISTINCT FROM current.statement
+                           OR latest.value IS DISTINCT FROM current.value
+                           OR latest.quarter_value IS DISTINCT FROM current.quarter_value
+                           OR latest.unit IS DISTINCT FROM current.unit
+                           OR latest.source IS DISTINCT FROM current.source
+                       )
+                   )
+                """
+            )[0]["n"]
+        )
 
     def _migrate_price_action_schema(self) -> None:
         """Track whether a provider response actually included action fields.
@@ -239,18 +911,20 @@ class Store:
         if not rows:
             return 0
         self._con.register("_tmp_sec", _rows_to_arrowable(rows))
-        n = self._con.execute(
-            """
-            INSERT OR REPLACE INTO securities
-            (ticker, cik, name, exchange, sector, industry, market_cap_bucket,
-             sic_code, is_active, first_seen, last_updated)
-            SELECT
-                ticker, cik, name, exchange, sector, industry, market_cap_bucket,
-                sic_code, TRUE, now(), now() FROM _tmp_sec
-            """.strip()
-        ).fetchone()[0]
-        self._con.unregister("_tmp_sec")
-        return int(n)
+        try:
+            n = self._con.execute(
+                """
+                INSERT OR REPLACE INTO securities
+                (ticker, cik, name, exchange, sector, industry, market_cap_bucket,
+                 sic_code, is_active, first_seen, last_updated)
+                SELECT
+                    ticker, cik, name, exchange, sector, industry, market_cap_bucket,
+                    sic_code, TRUE, now(), now() FROM _tmp_sec
+                """.strip()
+            ).fetchone()[0]
+            return int(n)
+        finally:
+            self._con.unregister("_tmp_sec")
 
     def upsert_universe_membership(self, rows: list[dict]) -> int:
         """Insert point-in-time universe intervals.
@@ -939,49 +1613,31 @@ class Store:
         clean: list[dict] = []
         seen_sources: set[str] = set()
         for row in rows:
-            source_security_id = _required_text(
-                row, "source_security_id", "security conversion"
-            )
-            target_security_id = _required_text(
-                row, "target_security_id", "security conversion"
-            )
+            source_security_id = _required_text(row, "source_security_id", "security conversion")
+            target_security_id = _required_text(row, "target_security_id", "security conversion")
             if source_security_id == target_security_id:
                 raise ValueError("security conversion cannot target the source security")
             if source_security_id in seen_sources:
-                raise ValueError(
-                    f"duplicate security conversion for {source_security_id!r}"
-                )
+                raise ValueError(f"duplicate security conversion for {source_security_id!r}")
             seen_sources.add(source_security_id)
             if not row.get("effective_date") or not row.get("known_date"):
-                raise ValueError(
-                    "security conversion requires effective_date and known_date"
-                )
+                raise ValueError("security conversion requires effective_date and known_date")
             effective_date = _as_date(row["effective_date"])
             known_date = _as_date(row["known_date"])
             if known_date > effective_date:
-                raise ValueError(
-                    "security conversion known_date cannot follow effective_date"
-                )
+                raise ValueError("security conversion known_date cannot follow effective_date")
             try:
                 share_ratio = float(row["share_ratio"])
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError("security conversion requires a numeric share_ratio") from exc
             if not isfinite(share_ratio) or share_ratio <= 0:
                 raise ValueError("security conversion share_ratio must be finite and positive")
-            basis_policy = _required_text(
-                row, "basis_policy", "security conversion"
-            )
+            basis_policy = _required_text(row, "basis_policy", "security conversion")
             if basis_policy != "carryover":
-                raise ValueError(
-                    f"unsupported security conversion basis_policy {basis_policy!r}"
-                )
-            review_status = _required_text(
-                row, "review_status", "security conversion"
-            )
+                raise ValueError(f"unsupported security conversion basis_policy {basis_policy!r}")
+            review_status = _required_text(row, "review_status", "security conversion")
             if review_status != "verified":
-                raise ValueError(
-                    f"unsupported security conversion review_status {review_status!r}"
-                )
+                raise ValueError(f"unsupported security conversion review_status {review_status!r}")
             clean.append(
                 {
                     "source_security_id": source_security_id,
@@ -993,9 +1649,7 @@ class Store:
                     "review_status": review_status,
                     "verified_date": _verified_date(row, "security conversion"),
                     "source": _required_text(row, "source", "security conversion"),
-                    "basis_source": _required_text(
-                        row, "basis_source", "security conversion"
-                    ),
+                    "basis_source": _required_text(row, "basis_source", "security conversion"),
                 }
             )
 
@@ -1020,8 +1674,7 @@ class Store:
             )
             if orphan:
                 raise ValueError(
-                    "security conversion uses unknown security_id "
-                    f"{orphan[0]['security_id']!r}"
+                    f"security conversion uses unknown security_id {orphan[0]['security_id']!r}"
                 )
             conflict = self.query(
                 """
@@ -1097,9 +1750,7 @@ class Store:
         normalized_extensions: list[dict] = []
         seen_provenance: set[str] = set()
         for row in rows:
-            provenance_id = _required_text(
-                row, "provenance_id", "liquidation extension"
-            )
+            provenance_id = _required_text(row, "provenance_id", "liquidation extension")
             if provenance_id in seen_provenance:
                 raise ValueError(f"duplicate liquidation provenance {provenance_id!r}")
             seen_provenance.add(provenance_id)
@@ -1116,16 +1767,10 @@ class Store:
             purpose = _required_text(row, "purpose", "liquidation extension")
             if purpose != "portfolio_liquidation":
                 raise ValueError(f"unsupported liquidation purpose {purpose!r}")
-            review_policy = _required_text(
-                row, "review_policy", "liquidation extension"
-            )
+            review_policy = _required_text(row, "review_policy", "liquidation extension")
             if review_policy != "adjacent_identity_provider_v1":
-                raise ValueError(
-                    f"unsupported liquidation review policy {review_policy!r}"
-                )
-            payload_sha256 = _required_text(
-                row, "payload_sha256", "liquidation extension"
-            )
+                raise ValueError(f"unsupported liquidation review policy {review_policy!r}")
+            payload_sha256 = _required_text(row, "payload_sha256", "liquidation extension")
             if len(payload_sha256) != 64 or any(
                 character not in "0123456789abcdef" for character in payload_sha256
             ):
@@ -1133,18 +1778,10 @@ class Store:
             normalized_extensions.append(
                 {
                     "provenance_id": provenance_id,
-                    "universe_id": _required_text(
-                        row, "universe_id", "liquidation extension"
-                    ),
-                    "security_id": _required_text(
-                        row, "security_id", "liquidation extension"
-                    ),
-                    "ticker": _required_text(
-                        row, "ticker", "liquidation extension"
-                    ).upper(),
-                    "provider": _required_text(
-                        row, "provider", "liquidation extension"
-                    ).lower(),
+                    "universe_id": _required_text(row, "universe_id", "liquidation extension"),
+                    "security_id": _required_text(row, "security_id", "liquidation extension"),
+                    "ticker": _required_text(row, "ticker", "liquidation extension").upper(),
+                    "provider": _required_text(row, "provider", "liquidation extension").lower(),
                     "provider_symbol": _required_text(
                         row, "provider_symbol", "liquidation extension"
                     ).upper(),
@@ -1164,9 +1801,7 @@ class Store:
             )
 
         normalized_prices = [normalize_extension_price_row(row) for row in price_rows]
-        extensions_by_id = {
-            row["provenance_id"]: row for row in normalized_extensions
-        }
+        extensions_by_id = {row["provenance_id"]: row for row in normalized_extensions}
         prices_by_id: dict[str, list[dict]] = {}
         seen_prices: set[tuple[str, str]] = set()
         for row in normalized_prices:
@@ -1183,9 +1818,7 @@ class Store:
                 raise ValueError("liquidation price falls outside its reviewed window")
             for field in ("security_id", "ticker", "provider_symbol"):
                 if row[field] != extension[field]:
-                    raise ValueError(
-                        f"liquidation price {field} disagrees with provenance"
-                    )
+                    raise ValueError(f"liquidation price {field} disagrees with provenance")
             if row["source"] != extension["provider"]:
                 raise ValueError("liquidation price provider disagrees with provenance")
             prices_by_id.setdefault(provenance_id, []).append(row)
@@ -1486,24 +2119,16 @@ class Store:
         normalized_provenance: list[dict] = []
         seen_provenance: set[str] = set()
         for row in provenance_rows:
-            provenance_id = _required_text(
-                row, "provenance_id", "factor-price provenance"
-            )
+            provenance_id = _required_text(row, "provenance_id", "factor-price provenance")
             if provenance_id in seen_provenance:
                 raise ValueError(f"duplicate factor-price provenance {provenance_id!r}")
             seen_provenance.add(provenance_id)
             normalized_provenance.append(
                 {
                     "provenance_id": provenance_id,
-                    "universe_id": _required_text(
-                        row, "universe_id", "factor-price provenance"
-                    ),
-                    "security_id": _required_text(
-                        row, "security_id", "factor-price provenance"
-                    ),
-                    "provider": _required_text(
-                        row, "provider", "factor-price provenance"
-                    ).lower(),
+                    "universe_id": _required_text(row, "universe_id", "factor-price provenance"),
+                    "security_id": _required_text(row, "security_id", "factor-price provenance"),
+                    "provider": _required_text(row, "provider", "factor-price provenance").lower(),
                     "provider_symbol": _required_text(
                         row, "provider_symbol", "factor-price provenance"
                     ).upper(),
@@ -1567,12 +2192,8 @@ class Store:
                     "actions_complete": True,
                     "close_split_adjusted": row["close_split_adjusted"],
                     "split_normalization_factor": factor,
-                    "split_normalization_through": row.get(
-                        "split_normalization_through"
-                    ),
-                    "provenance_id": _required_text(
-                        row, "provenance_id", "factor price"
-                    ),
+                    "split_normalization_through": row.get("split_normalization_through"),
+                    "provenance_id": _required_text(row, "provenance_id", "factor price"),
                 }
             )
 
@@ -1746,7 +2367,12 @@ class Store:
             self._con.unregister("_tmp_factor_provenance")
             self._con.unregister("_tmp_factor_prices")
 
-    def upsert_fundamentals(self, rows: list[dict]) -> int:
+    def upsert_fundamentals(
+        self,
+        rows: list[dict],
+        *,
+        _manage_transaction: bool = True,
+    ) -> int:
         """Upsert fundamentals. CRITICAL: as_of_date must be set per row.
 
         This is the point-in-time-critical insert. Never call with a default
@@ -1774,11 +2400,14 @@ class Store:
             as_of_date = _as_date(row["as_of_date"])
             if period_end > as_of_date:
                 invalid_periods += 1
+            provenance = _fundamental_provenance(row)
             normalized.append(
                 {
                     "ticker": str(row.get("ticker") or "").strip().upper(),
                     "issuer_id": row.get("issuer_id"),
                     "security_id": row.get("security_id"),
+                    **provenance,
+                    "source_fact_locator": row.get("source_fact_locator"),
                     "period_end": period_end,
                     "as_of_date": as_of_date,
                     "fiscal_period": row.get("fiscal_period"),
@@ -1796,33 +2425,127 @@ class Store:
                 "than as_of_date. A filing cannot report a future fiscal period."
             )
         self._con.register("_tmp_fund", _rows_to_arrowable(normalized))
-        n = self._con.execute(
-            """
-            INSERT INTO fundamentals
-            (ticker, issuer_id, security_id, period_end, as_of_date, fiscal_period,
-             statement, metric, value, quarter_value, unit, source, fetched_at)
-            SELECT
-                ticker, issuer_id, security_id, CAST(period_end AS DATE),
-                CAST(as_of_date AS DATE), fiscal_period, statement, metric,
-                value, quarter_value,
-                COALESCE(unit, 'USD'), source, now()
-            FROM _tmp_fund
-            ON CONFLICT (ticker, period_end, as_of_date, metric) DO UPDATE
-            SET issuer_id = COALESCE(EXCLUDED.issuer_id, fundamentals.issuer_id),
-                security_id = COALESCE(
-                    EXCLUDED.security_id, fundamentals.security_id
-                ),
-                fiscal_period = EXCLUDED.fiscal_period,
-                statement = EXCLUDED.statement,
-                value = EXCLUDED.value,
-                quarter_value = EXCLUDED.quarter_value,
-                unit = EXCLUDED.unit,
-                source = EXCLUDED.source,
-                fetched_at = EXCLUDED.fetched_at
-            """.strip()
-        ).fetchone()[0]
-        self._con.unregister("_tmp_fund")
-        return int(n)
+        if _manage_transaction:
+            self.execute("BEGIN TRANSACTION")
+        try:
+            duplicate = self.query(
+                """
+                SELECT ticker, CAST(period_end AS DATE) AS period_end,
+                       CAST(as_of_date AS DATE) AS as_of_date, metric,
+                       COUNT(*) AS duplicate_count
+                FROM _tmp_fund
+                GROUP BY ticker, CAST(period_end AS DATE),
+                         CAST(as_of_date AS DATE), metric
+                HAVING COUNT(*) > 1
+                LIMIT 1
+                """
+            )
+            if duplicate:
+                sample = duplicate[0]
+                raise ValueError(
+                    "upsert_fundamentals contains duplicate economic key "
+                    f"{sample['ticker']}:{sample['metric']}@"
+                    f"{sample['period_end']}/{sample['as_of_date']}"
+                )
+            lineage_conflict = self.query(
+                """
+                SELECT existing.ticker, existing.period_end, existing.as_of_date,
+                       existing.metric
+                FROM fundamentals AS existing
+                JOIN _tmp_fund AS incoming
+                  ON existing.ticker = incoming.ticker
+                 AND existing.period_end = CAST(incoming.period_end AS DATE)
+                 AND existing.as_of_date = CAST(incoming.as_of_date AS DATE)
+                 AND existing.metric = incoming.metric
+                WHERE incoming.ingest_run_id IS NULL
+                  AND (
+                      existing.ingest_run_id IS NOT NULL
+                      OR existing.source_snapshot_id IS NOT NULL
+                      OR existing.source_rowset_sha256 IS NOT NULL
+                      OR existing.source_row_sha256 IS NOT NULL
+                  )
+                LIMIT 1
+                """
+            )
+            if lineage_conflict:
+                sample = lineage_conflict[0]
+                raise ValueError(
+                    "unlineaged fundamental cannot overwrite explicitly "
+                    "lineaged evidence for "
+                    f"{sample['ticker']}:{sample['metric']}@"
+                    f"{sample['period_end']}/{sample['as_of_date']}"
+                )
+            n = self._con.execute(
+                """
+                INSERT INTO fundamentals
+                (ticker, issuer_id, security_id, ingest_run_id, source_snapshot_id,
+                 source_rowset_sha256, source_row_sha256, source_fact_locator,
+                 period_end, as_of_date, fiscal_period, statement, metric, value,
+                 quarter_value, unit, source, fetched_at)
+                SELECT
+                    ticker, issuer_id, security_id, ingest_run_id, source_snapshot_id,
+                    source_rowset_sha256, source_row_sha256, source_fact_locator,
+                    CAST(period_end AS DATE), CAST(as_of_date AS DATE),
+                    fiscal_period, statement, metric, value, quarter_value,
+                    COALESCE(unit, 'USD'), source, now()
+                FROM _tmp_fund
+                ON CONFLICT (ticker, period_end, as_of_date, metric) DO UPDATE
+                SET issuer_id = COALESCE(EXCLUDED.issuer_id, fundamentals.issuer_id),
+                    security_id = COALESCE(
+                        EXCLUDED.security_id, fundamentals.security_id
+                    ),
+                    ingest_run_id = EXCLUDED.ingest_run_id,
+                    source_snapshot_id = EXCLUDED.source_snapshot_id,
+                    source_rowset_sha256 = EXCLUDED.source_rowset_sha256,
+                    source_row_sha256 = EXCLUDED.source_row_sha256,
+                    source_fact_locator = EXCLUDED.source_fact_locator,
+                    fiscal_period = EXCLUDED.fiscal_period,
+                    statement = EXCLUDED.statement,
+                    value = EXCLUDED.value,
+                    quarter_value = EXCLUDED.quarter_value,
+                    unit = EXCLUDED.unit,
+                    source = EXCLUDED.source,
+                    fetched_at = EXCLUDED.fetched_at
+                """.strip()
+            ).fetchone()[0]
+            # Version the resolved projection, not the raw incoming row.  In
+            # particular, identity columns intentionally retain an existing
+            # non-null value when an update omits them.  Capturing before the
+            # merge would make a named evidence generation disagree with the
+            # current projection immediately after a successful transaction.
+            self.execute(
+                """
+                INSERT INTO fundamental_versions
+                (ticker, issuer_id, security_id, ingest_run_id,
+                 source_snapshot_id, source_rowset_sha256,
+                 source_row_sha256, source_fact_locator, period_end,
+                 as_of_date, fiscal_period, statement, metric, value,
+                 quarter_value, unit, source, recorded_at, is_deleted)
+                SELECT current.ticker, current.issuer_id, current.security_id,
+                       current.ingest_run_id, current.source_snapshot_id,
+                       current.source_rowset_sha256, current.source_row_sha256,
+                       current.source_fact_locator, current.period_end,
+                       current.as_of_date, current.fiscal_period,
+                       current.statement, current.metric, current.value,
+                       current.quarter_value, current.unit, current.source,
+                       current.fetched_at, FALSE
+                FROM fundamentals AS current
+                JOIN _tmp_fund AS incoming
+                  ON current.ticker = incoming.ticker
+                 AND current.period_end = CAST(incoming.period_end AS DATE)
+                 AND current.as_of_date = CAST(incoming.as_of_date AS DATE)
+                 AND current.metric = incoming.metric
+                """
+            )
+            if _manage_transaction:
+                self.execute("COMMIT")
+            return int(n)
+        except Exception:
+            if _manage_transaction:
+                self.execute("ROLLBACK")
+            raise
+        finally:
+            self._con.unregister("_tmp_fund")
 
     def refresh_issuer_fundamentals(
         self,
@@ -1831,16 +2554,381 @@ class Store:
         issuer_id: str,
         canonical_ticker: str,
     ) -> tuple[int, int]:
-        """Upsert one issuer snapshot and remove only stale canonical labels.
+        """Refresh one complete issuer relation without silent shrinkage.
 
         SEC Company Facts is fetched as a complete issuer history. Once that
-        complete payload has been extracted successfully, keeping rows for the
-        same ``issuer_id`` under an older canonical display ticker would create
-        duplicate PIT facts. The upsert and narrow cleanup are one transaction.
-        Untagged legacy rows and rows belonging to other issuers are untouched.
+        complete payload has been extracted successfully, every current key for
+        the same ``issuer_id`` must remain represented. Unexpected omissions
+        fail the transaction; a future governed replacement path must provide
+        explicit confirmation, backup, and compare-and-set evidence. Untagged
+        legacy rows and rows belonging to other issuers are untouched.
         """
+        issuer_id, canonical_ticker = self._validated_issuer_fundamental_refresh(
+            rows,
+            issuer_id=issuer_id,
+            canonical_ticker=canonical_ticker,
+        )
         if not rows:
             return 0, 0
+
+        self.execute("BEGIN TRANSACTION")
+        try:
+            result = self._refresh_issuer_fundamentals_in_transaction(
+                rows,
+                issuer_id=issuer_id,
+                canonical_ticker=canonical_ticker,
+            )
+            self.execute("COMMIT")
+            return result
+        except Exception:
+            self.execute("ROLLBACK")
+            raise
+
+    def commit_issuer_fundamental_ingest(
+        self,
+        rows: list[dict],
+        *,
+        issuer_id: str,
+        canonical_ticker: str,
+        security_rows: list[dict],
+        submissions_row: dict[str, Any],
+        run_id: str,
+        source: str,
+        rows_rejected: int,
+        started_at: datetime,
+        status: str,
+        error: str | None,
+        rejection_codes: tuple[str, ...] | list[str] | None = None,
+    ) -> tuple[int, int]:
+        """Atomically publish one accepted SEC issuer ingest outcome.
+
+        Raw provider snapshots are captured before this boundary and remain
+        immutable evidence even when this transaction fails. Accepted facts,
+        stale-label cleanup, display metadata, and the successful or warning
+        outcome become visible together.
+        """
+        if source != "edgar:issuer-cik-history":
+            raise ValueError("accepted issuer ingest requires the reviewed SEC source route")
+        if status not in {"success", "warning"}:
+            raise ValueError("accepted issuer ingest status must be success or warning")
+        if isinstance(rows_rejected, bool) or not isinstance(rows_rejected, int):
+            raise TypeError("accepted issuer ingest rows_rejected must be an integer")
+        if rows_rejected < 0:
+            raise ValueError("accepted issuer ingest rows_rejected cannot be negative")
+        encoded_rejection_codes = canonical_rejection_codes(rejection_codes)
+        decoded_rejection_codes = decode_rejection_codes(encoded_rejection_codes)
+        if decoded_rejection_codes is not None and not (
+            set(decoded_rejection_codes) <= SEC_FUNDAMENTAL_REJECTION_CODES
+        ):
+            raise ValueError("accepted issuer ingest has an unknown rejection code")
+        if status == "success" and (
+            not rows
+            or rows_rejected != 0
+            or decoded_rejection_codes is not None
+            or error is not None
+        ):
+            raise ValueError("successful issuer ingest requires rows and zero rejection evidence")
+        if status == "warning":
+            if rows_rejected > 0 and (
+                decoded_rejection_codes is None or not str(error or "").strip()
+            ):
+                raise ValueError("warning issuer ingest with rejections requires codes and detail")
+            if rows_rejected == 0 and (
+                rows
+                or decoded_rejection_codes is not None
+                or error != "SEC returned no fundamental rows"
+            ):
+                raise ValueError("zero-rejection issuer warning must be an exact zero-row outcome")
+        issuer_id, canonical_ticker = self._validated_issuer_fundamental_refresh(
+            rows,
+            issuer_id=issuer_id,
+            canonical_ticker=canonical_ticker,
+        )
+        self._validate_issuer_ingest_source_lineage(
+            rows,
+            run_id=run_id,
+            issuer_id=issuer_id,
+            canonical_ticker=canonical_ticker,
+            security_rows=security_rows,
+            submissions_row=submissions_row,
+            rows_rejected=rows_rejected,
+            rejection_codes=encoded_rejection_codes,
+        )
+        self.execute("BEGIN TRANSACTION")
+        try:
+            inserted, stale = self._refresh_issuer_fundamentals_in_transaction(
+                rows,
+                issuer_id=issuer_id,
+                canonical_ticker=canonical_ticker,
+            )
+            self.upsert_securities(security_rows)
+            self.record_ingest(
+                run_id=run_id,
+                source=source,
+                table_name="fundamentals",
+                subject_type="issuer",
+                subject_id=issuer_id,
+                rows_inserted=inserted,
+                rows_rejected=rows_rejected,
+                started_at=started_at,
+                status=status,
+                error=error,
+                rejection_codes=list(decoded_rejection_codes or ()),
+            )
+            self.execute("COMMIT")
+            return inserted, stale
+        except Exception:
+            self.execute("ROLLBACK")
+            raise
+
+    def _validate_issuer_ingest_source_lineage(
+        self,
+        rows: list[dict],
+        *,
+        run_id: str,
+        issuer_id: str,
+        canonical_ticker: str,
+        security_rows: list[dict],
+        submissions_row: dict[str, Any],
+        rows_rejected: int,
+        rejection_codes: str | None,
+    ) -> None:
+        """Require accepted issuer rows to cite one exact captured response."""
+
+        lineage_fields = (
+            "ingest_run_id",
+            "source_snapshot_id",
+            "source_rowset_sha256",
+            "source_row_sha256",
+        )
+        if rows and any(
+            not all(str(row.get(field) or "").strip() for field in lineage_fields) for row in rows
+        ):
+            raise ValueError(
+                "accepted issuer fundamentals require explicit source snapshot lineage"
+            )
+        if rows and any(str(row["ingest_run_id"]).strip() != run_id for row in rows):
+            raise ValueError("issuer fundamental lineage run does not match the outcome")
+        snapshot_ids = {str(row["source_snapshot_id"]).strip() for row in rows}
+        rowset_hashes = {str(row["source_rowset_sha256"]).strip().lower() for row in rows}
+        if rows and (len(snapshot_ids) != 1 or len(rowset_hashes) != 1):
+            raise ValueError("issuer fundamental rows cite different source evidence")
+        snapshot_id = next(iter(snapshot_ids)) if snapshot_ids else None
+        rowset_hash = next(iter(rowset_hashes)) if rowset_hashes else None
+        evidence = self.query(
+            """
+            SELECT snapshot.snapshot_id, snapshot.provider, snapshot.dataset,
+                   snapshot.artifact_kind, snapshot.http_status,
+                   snapshot.parser_version, snapshot.parsed_row_count,
+                   snapshot.parsed_rows_sha256, snapshot.parsed_rows_rejected,
+                   snapshot.parsed_rejection_codes
+            FROM ingest_raw_snapshots AS linked
+            JOIN raw_snapshots AS snapshot USING (snapshot_id)
+            WHERE linked.run_id = ?
+              AND linked.role = 'companyfacts'
+            ORDER BY snapshot.snapshot_id
+            """,
+            (run_id,),
+        )
+        if len(evidence) != 1:
+            raise ValueError(
+                "accepted issuer fundamentals require one linked Company Facts response"
+            )
+        source = evidence[0]
+        from aios.ingest.edgar import canonical_sec_fundamental_row_sha256
+        from aios.raw_snapshots import canonical_parsed_rows_sha256
+
+        reference = self.issuer_reference(issuer_id)
+        try:
+            cik = int(reference["cik"]) if reference is not None else None
+        except (KeyError, TypeError, ValueError):
+            cik = None
+        if cik is None:
+            raise ValueError("issuer fundamental lineage requires one reviewed SEC CIK")
+        security_assignments = self.query(
+            """
+            SELECT DISTINCT security_id
+            FROM security_issuer_assignments
+            WHERE issuer_id = ?
+            ORDER BY security_id
+            """,
+            (issuer_id,),
+        )
+        expected_security_id = (
+            str(security_assignments[0]["security_id"]) if len(security_assignments) == 1 else None
+        )
+        if any(
+            (str(row.get("security_id")).strip() if row.get("security_id") is not None else None)
+            != expected_security_id
+            for row in rows
+        ):
+            raise ValueError("issuer fundamental security_id does not match reviewed assignments")
+
+        provider_rows: list[dict[str, Any]] = []
+        for row in rows:
+            provider_row = {
+                "cik": f"{cik:010d}",
+                "period_end": str(row["period_end"]),
+                "as_of_date": str(row["as_of_date"]),
+                "fiscal_period": row.get("fiscal_period"),
+                "statement": row.get("statement"),
+                "metric": row["metric"],
+                "value": row.get("value"),
+                "quarter_value": row.get("quarter_value"),
+                "unit": row.get("unit") or "USD",
+                "source": row.get("source") or "edgar",
+            }
+            if row.get("source_fact_locator") is not None:
+                provider_row["source_fact_locator"] = row["source_fact_locator"]
+            if (
+                canonical_sec_fundamental_row_sha256(provider_row)
+                != str(row["source_row_sha256"]).lower()
+            ):
+                raise ValueError("issuer fundamental row hash does not match its economic content")
+            provider_rows.append(provider_row)
+        computed_rowset_hash = canonical_parsed_rows_sha256(provider_rows)
+        if (
+            (snapshot_id is not None and source.get("snapshot_id") != snapshot_id)
+            or source.get("provider") != "sec-edgar"
+            or source.get("dataset") != "companyfacts"
+            or source.get("artifact_kind") != "exact_response"
+            or not isinstance(source.get("http_status"), int)
+            or not 200 <= int(source["http_status"]) <= 299
+            or source.get("parser_version") != "sec-companyfacts-v2"
+            or not isinstance(source.get("parsed_row_count"), int)
+            or int(source["parsed_row_count"]) != len(rows)
+            or str(source.get("parsed_rows_sha256") or "").lower() != computed_rowset_hash
+            or (rowset_hash is not None and rowset_hash != computed_rowset_hash)
+            or source.get("parsed_rows_rejected") != rows_rejected
+            or source.get("parsed_rejection_codes") != rejection_codes
+        ):
+            raise ValueError(
+                "issuer fundamental lineage does not match its exact Company Facts response"
+            )
+        submissions = self.query(
+            """
+            SELECT snapshot.provider, snapshot.dataset, snapshot.artifact_kind,
+                   snapshot.http_status, snapshot.parser_version,
+                   snapshot.parsed_row_count, snapshot.parsed_rows_sha256
+            FROM ingest_raw_snapshots AS linked
+            JOIN raw_snapshots AS snapshot USING (snapshot_id)
+            WHERE linked.run_id = ?
+              AND linked.role = 'submissions'
+            ORDER BY snapshot.snapshot_id
+            """,
+            (run_id,),
+        )
+        if len(submissions) != 1:
+            raise ValueError(
+                "accepted issuer fundamentals require one linked SEC Submissions response"
+            )
+        submission = submissions[0]
+        if (
+            submission.get("provider") != "sec-edgar"
+            or submission.get("dataset") != "submissions"
+            or submission.get("artifact_kind") != "exact_response"
+            or not isinstance(submission.get("http_status"), int)
+            or not 200 <= int(submission["http_status"]) <= 299
+            or submission.get("parser_version") != "sec-submissions-v2"
+            or submission.get("parsed_row_count") != 1
+            or not str(submission.get("parsed_rows_sha256") or "").strip()
+        ):
+            raise ValueError("issuer fundamental lineage has invalid SEC Submissions evidence")
+        self._validate_issuer_security_metadata(
+            security_rows=security_rows,
+            submissions_row=submissions_row,
+            canonical_ticker=canonical_ticker,
+            reference=reference,
+            submissions_rowset_sha256=str(submission["parsed_rows_sha256"]),
+        )
+
+    @staticmethod
+    def _validate_issuer_security_metadata(
+        *,
+        security_rows: list[dict],
+        submissions_row: dict[str, Any],
+        canonical_ticker: str,
+        reference: dict[str, Any],
+        submissions_rowset_sha256: str,
+    ) -> None:
+        """Bind display metadata to the exact parsed Submissions response."""
+
+        expected_submission_fields = {
+            "cik",
+            "name",
+            "sic",
+            "sic_description",
+            "exchanges",
+        }
+        if (
+            not isinstance(submissions_row, dict)
+            or set(submissions_row) != expected_submission_fields
+        ):
+            raise ValueError("issuer security metadata requires one canonical Submissions row")
+        try:
+            cik = int(reference["cik"])
+            submitted_cik = int(submissions_row["cik"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("issuer security metadata has an invalid SEC CIK") from exc
+        if submitted_cik != cik:
+            raise ValueError("issuer security metadata CIK does not match reviewed issuer")
+
+        def optional_text(value: Any) -> str | None:
+            if value is None:
+                return None
+            if not isinstance(value, str):
+                raise ValueError("issuer Submissions metadata must use strings or null")
+            normalized = value.strip()
+            return normalized or None
+
+        exchanges_value = submissions_row["exchanges"]
+        if not isinstance(exchanges_value, list):
+            raise ValueError("issuer Submissions exchanges must be a list")
+        exchanges = [optional_text(value) for value in exchanges_value]
+        if any(value is None for value in exchanges):
+            raise ValueError("issuer Submissions exchanges must be nonblank")
+        canonical_submissions = {
+            "cik": f"{cik:010d}",
+            "name": optional_text(submissions_row["name"]),
+            "sic": optional_text(submissions_row["sic"]),
+            "sic_description": optional_text(submissions_row["sic_description"]),
+            "exchanges": exchanges,
+        }
+        if canonical_submissions != submissions_row:
+            raise ValueError("issuer Submissions metadata is not canonical")
+        from aios.raw_snapshots import canonical_parsed_rows_sha256
+
+        if canonical_parsed_rows_sha256([canonical_submissions]) != submissions_rowset_sha256:
+            raise ValueError("issuer security metadata does not match exact Submissions evidence")
+        if len(security_rows) != 1 or not isinstance(security_rows[0], dict):
+            raise ValueError("issuer ingest requires exactly one security metadata row")
+        expected_security = {
+            "ticker": canonical_ticker,
+            "cik": cik,
+            "name": canonical_submissions["name"] or str(reference["canonical_name"]),
+            "exchange": (
+                canonical_submissions["exchanges"][0]
+                if canonical_submissions["exchanges"]
+                else None
+            ),
+            "sector": canonical_submissions["sic_description"],
+            "industry": canonical_submissions["sic_description"],
+            "market_cap_bucket": None,
+            "sic_code": canonical_submissions["sic"],
+        }
+        if security_rows[0] != expected_security:
+            raise ValueError(
+                "issuer security metadata is not derived from reviewed identity "
+                "and exact Submissions evidence"
+            )
+
+    @staticmethod
+    def _validated_issuer_fundamental_refresh(
+        rows: list[dict],
+        *,
+        issuer_id: str,
+        canonical_ticker: str,
+    ) -> tuple[str, str]:
         issuer_id = issuer_id.strip()
         canonical_ticker = canonical_ticker.strip().upper()
         if not issuer_id or not canonical_ticker:
@@ -1849,28 +2937,81 @@ class Store:
             raise ValueError("issuer refresh contains a different issuer_id")
         if any(str(row.get("ticker") or "").strip().upper() != canonical_ticker for row in rows):
             raise ValueError("issuer refresh contains a non-canonical ticker")
+        return issuer_id, canonical_ticker
 
-        self.execute("BEGIN TRANSACTION")
+    def _refresh_issuer_fundamentals_in_transaction(
+        self,
+        rows: list[dict],
+        *,
+        issuer_id: str,
+        canonical_ticker: str,
+    ) -> tuple[int, int]:
+        if not rows:
+            return 0, 0
+        keys = [
+            {
+                "ticker": str(row["ticker"]).strip().upper(),
+                "period_end": _as_date(row["period_end"]),
+                "as_of_date": _as_date(row["as_of_date"]),
+                "metric": str(row["metric"]),
+            }
+            for row in rows
+        ]
+        self._con.register("_tmp_issuer_fundamental_keys", _rows_to_arrowable(keys))
         try:
-            inserted = self.upsert_fundamentals(rows)
-            stale = self.query(
+            collision = self.query(
                 """
-                SELECT COUNT(*) AS n
-                FROM fundamentals
-                WHERE issuer_id = ? AND ticker <> ?
+                SELECT existing.ticker, existing.period_end,
+                       existing.as_of_date, existing.metric,
+                       existing.issuer_id
+                FROM fundamentals AS existing
+                JOIN _tmp_issuer_fundamental_keys AS incoming
+                  ON existing.ticker = incoming.ticker
+                 AND existing.period_end = CAST(incoming.period_end AS DATE)
+                 AND existing.as_of_date = CAST(incoming.as_of_date AS DATE)
+                 AND existing.metric = incoming.metric
+                WHERE existing.issuer_id IS NOT NULL
+                  AND existing.issuer_id <> ?
+                LIMIT 1
                 """,
-                (issuer_id, canonical_ticker),
-            )[0]["n"]
-            if stale:
-                self.execute(
-                    "DELETE FROM fundamentals WHERE issuer_id = ? AND ticker <> ?",
-                    (issuer_id, canonical_ticker),
+                (issuer_id,),
+            )
+            if collision:
+                raise ValueError(
+                    "issuer fundamental relation collides with another reviewed issuer"
                 )
-            self.execute("COMMIT")
-            return inserted, int(stale)
-        except Exception:
-            self.execute("ROLLBACK")
-            raise
+            stale = int(
+                self.query(
+                    """
+                    SELECT COUNT(*) AS n
+                    FROM fundamentals AS existing
+                    WHERE existing.issuer_id = ?
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM _tmp_issuer_fundamental_keys AS incoming
+                          WHERE existing.ticker = incoming.ticker
+                            AND existing.period_end =
+                                CAST(incoming.period_end AS DATE)
+                            AND existing.as_of_date =
+                                CAST(incoming.as_of_date AS DATE)
+                            AND existing.metric = incoming.metric
+                      )
+                    """,
+                    (issuer_id,),
+                )[0]["n"]
+            )
+            if stale:
+                raise ValueError(
+                    "issuer fundamental relation would shrink; governed "
+                    "replacement confirmation is required"
+                )
+            inserted = self.upsert_fundamentals(
+                rows,
+                _manage_transaction=False,
+            )
+            return inserted, stale
+        finally:
+            self._con.unregister("_tmp_issuer_fundamental_keys")
 
     def upsert_macro(self, rows: list[dict]) -> int:
         """Upsert release-aware macro vintages.
@@ -1918,6 +3059,9 @@ class Store:
         status: str = "success",
         error: str | None = None,
         run_id: str | None = None,
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+        rejection_codes: tuple[str, ...] | list[str] | None = None,
     ) -> str:
         """Write one auditable ingest outcome and return its run id.
 
@@ -1928,23 +3072,32 @@ class Store:
         run_id = run_id or str(uuid4())
         started_at = started_at or datetime.now()
         finished_at = finished_at or datetime.now()
+        normalized_subject_type, normalized_subject_id = _ingest_subject(
+            subject_type,
+            subject_id,
+        )
+        normalized_rejection_codes = canonical_rejection_codes(rejection_codes)
         self._con.execute(
             """
             INSERT INTO ingest_log
-            (run_id, source, table_name, rows_inserted, rows_rejected,
-             started_at, finished_at, status, error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (run_id, source, table_name, subject_type, subject_id,
+             rows_inserted, rows_rejected, started_at, finished_at, status, error,
+             rejection_codes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
                 source,
                 table_name,
+                normalized_subject_type,
+                normalized_subject_id,
                 rows_inserted,
                 rows_rejected,
                 started_at,
                 finished_at,
                 status,
                 error,
+                normalized_rejection_codes,
             ),
         )
         return run_id
@@ -1958,6 +3111,7 @@ class Store:
         role: str = "source",
     ) -> None:
         """Register immutable payload metadata and one fetch observation."""
+        _validate_raw_snapshot_registration(payload, snapshot)
         self._con.execute("BEGIN TRANSACTION")
         try:
             self._con.execute(
@@ -1995,8 +3149,9 @@ class Store:
                 (snapshot_id, provider, dataset, artifact_kind, requested_at,
                  received_at, http_status, content_type, request_fingerprint,
                  payload_sha256, adapter_name, adapter_version, parser_version,
-                 parsed_row_count, parsed_rows_sha256)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 parsed_row_count, parsed_rows_sha256, parsed_rows_rejected,
+                 parsed_rejection_codes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     snapshot["snapshot_id"],
@@ -2014,6 +3169,8 @@ class Store:
                     snapshot["parser_version"],
                     snapshot.get("parsed_row_count"),
                     snapshot.get("parsed_rows_sha256"),
+                    snapshot.get("parsed_rows_rejected"),
+                    snapshot.get("parsed_rejection_codes"),
                 ),
             )
             if ingest_run_id is not None:
@@ -2053,6 +3210,63 @@ class Store:
         )
         return rows[0] if rows else None
 
+    def raw_snapshot_for_run_role(self, run_id: str, role: str) -> dict[str, Any]:
+        """Return exactly one staged snapshot without requiring an ingest outcome.
+
+        Universe-change evidence is captured before its canonical transaction,
+        so ``ingest_log`` intentionally has no success row yet.  This lookup
+        binds the preallocated run and semantic role directly to the complete
+        immutable snapshot/payload contract and refuses ambiguous linkage.
+        """
+
+        normalized_run_id = str(run_id).strip()
+        normalized_role = str(role).strip()
+        if not normalized_run_id or not normalized_role:
+            raise ValueError("raw snapshot lookup requires run_id and role")
+        link_count = int(
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM ingest_raw_snapshots
+                WHERE run_id = ? AND role = ?
+                """,
+                (normalized_run_id, normalized_role),
+            )[0]["n"]
+        )
+        if link_count != 1:
+            raise ValueError(
+                "raw snapshot run/role must resolve to exactly one observation: "
+                f"{normalized_run_id}:{normalized_role} resolved to {link_count}"
+            )
+        rows = self.query(
+            """
+            SELECT linked.run_id, linked.role, linked.linked_at,
+                   snapshot.snapshot_id, snapshot.provider, snapshot.dataset,
+                   snapshot.artifact_kind, snapshot.requested_at,
+                   snapshot.received_at, snapshot.http_status,
+                   snapshot.content_type, snapshot.request_fingerprint,
+                   snapshot.payload_sha256, snapshot.adapter_name,
+                   snapshot.adapter_version, snapshot.parser_version,
+                   snapshot.parsed_row_count, snapshot.parsed_rows_sha256,
+                   snapshot.parsed_rows_rejected,
+                   snapshot.parsed_rejection_codes, snapshot.created_at,
+                   payload.relative_path, payload.original_bytes,
+                   payload.stored_bytes, payload.compression
+            FROM ingest_raw_snapshots AS linked
+            JOIN raw_snapshots AS snapshot USING (snapshot_id)
+            JOIN raw_payloads AS payload USING (payload_sha256)
+            WHERE linked.run_id = ? AND linked.role = ?
+            ORDER BY snapshot.snapshot_id
+            """,
+            (normalized_run_id, normalized_role),
+        )
+        if len(rows) != 1:
+            raise ValueError(
+                "raw snapshot run/role has incomplete snapshot or payload linkage: "
+                f"{normalized_run_id}:{normalized_role}"
+            )
+        return rows[0]
+
     def attach_raw_snapshot_parse_evidence(
         self,
         *,
@@ -2062,6 +3276,8 @@ class Store:
         parser_version: str,
         parsed_row_count: int,
         parsed_rows_sha256: str,
+        parsed_rows_rejected: int = 0,
+        parsed_rejection_codes: tuple[str, ...] | list[str] | None = None,
     ) -> str:
         """Atomically promote one linked capture after its parser succeeds.
 
@@ -2075,6 +3291,15 @@ class Store:
         expected_version = expected_parser_version.strip()
         final_version = parser_version.strip()
         digest = parsed_rows_sha256.strip().lower()
+        if (
+            isinstance(parsed_rows_rejected, bool)
+            or not isinstance(parsed_rows_rejected, int)
+            or parsed_rows_rejected < 0
+        ):
+            raise ValueError("raw snapshot rejected row count cannot be negative")
+        encoded_rejection_codes = canonical_rejection_codes(parsed_rejection_codes)
+        if (parsed_rows_rejected == 0) != (encoded_rejection_codes is None):
+            raise ValueError("raw snapshot rejection count and codes are inconsistent")
         if not run_id or not normalized_role:
             raise ValueError("raw snapshot parse evidence requires an ingest run and role")
         if not expected_version or not final_version:
@@ -2086,57 +3311,44 @@ class Store:
         try:
             int(digest, 16)
         except ValueError as exc:
-            raise ValueError(
-                "raw snapshot parsed-row hash must be a 64-character SHA-256"
-            ) from exc
+            raise ValueError("raw snapshot parsed-row hash must be a 64-character SHA-256") from exc
 
         self._con.execute("BEGIN TRANSACTION")
         try:
-            matches = self.query(
-                """
-                SELECT snapshot.snapshot_id, snapshot.parser_version,
-                       snapshot.parsed_row_count, snapshot.parsed_rows_sha256
-                FROM ingest_raw_snapshots AS linked
-                JOIN raw_snapshots AS snapshot USING (snapshot_id)
-                WHERE linked.run_id = ? AND linked.role = ?
-                ORDER BY snapshot.snapshot_id
-                """,
-                (run_id, normalized_role),
-            )
-            if len(matches) != 1:
-                raise ValueError(
-                    "raw snapshot parse evidence requires exactly one linked "
-                    f"snapshot for run {run_id!r} role {normalized_role!r}"
-                )
-            current = matches[0]
+            current = self.raw_snapshot_for_run_role(run_id, normalized_role)
             current_count = current["parsed_row_count"]
             current_hash = current["parsed_rows_sha256"]
+            current_rejected = current["parsed_rows_rejected"]
+            current_rejection_codes = current["parsed_rejection_codes"]
             current_version = str(current["parser_version"])
             if current_count is None and current_hash is None:
                 if current_version != expected_version:
-                    raise ValueError(
-                        "raw snapshot capture parser version changed before promotion"
-                    )
+                    raise ValueError("raw snapshot capture parser version changed before promotion")
                 self._con.execute(
                     """
                     UPDATE raw_snapshots
                     SET parser_version = ?, parsed_row_count = ?,
-                        parsed_rows_sha256 = ?
+                        parsed_rows_sha256 = ?, parsed_rows_rejected = ?,
+                        parsed_rejection_codes = ?
                     WHERE snapshot_id = ?
                     """,
                     (
                         final_version,
                         parsed_row_count,
                         digest,
+                        parsed_rows_rejected,
+                        encoded_rejection_codes,
                         current["snapshot_id"],
                     ),
                 )
-            elif current_count is None or current_hash is None:
+            elif current_count is None or current_hash is None or current_rejected is None:
                 raise ValueError("raw snapshot has incomplete parsed evidence")
             elif (
                 current_version != final_version
                 or int(current_count) != parsed_row_count
                 or str(current_hash) != digest
+                or int(current_rejected) != parsed_rows_rejected
+                or current_rejection_codes != encoded_rejection_codes
             ):
                 raise ValueError("raw snapshot parsed evidence conflicts with existing values")
             self._con.execute("COMMIT")
@@ -2212,8 +3424,7 @@ class Store:
 
             if status == "accepted_no_change":
                 expected = {
-                    (str(row["ticker"]), str(row["security_id"]))
-                    for row in normalized_references
+                    (str(row["ticker"]), str(row["security_id"])) for row in normalized_references
                 }
                 active_members = self.query(
                     """
@@ -2238,9 +3449,7 @@ class Store:
                         prior.isoformat(),
                     ),
                 )
-                observed = {
-                    (str(row["ticker"]), str(row["security_id"])) for row in active_members
-                }
+                observed = {(str(row["ticker"]), str(row["security_id"])) for row in active_members}
                 if observed != expected or len(active_members) != len(expected):
                     raise ValueError("reviewed member/reference set changed before extension")
                 boundary = prior + timedelta(days=1)
@@ -2299,10 +3508,7 @@ class Store:
                     for row in normalized_references
                 }
                 if (
-                    {
-                        (str(row["security_id"]), str(row["issuer_id"]))
-                        for row in owner_rows
-                    }
+                    {(str(row["security_id"]), str(row["issuer_id"])) for row in owner_rows}
                     != expected_owners
                     or len(owner_rows) != len(expected_owners)
                     or any(row["effective_end"] != boundary for row in owner_rows)
@@ -2310,8 +3516,7 @@ class Store:
                     raise ValueError("issuer ownership windows do not match the member boundary")
 
                 expected_ciks = {
-                    (str(row["issuer_id"]), str(row["cik"]))
-                    for row in normalized_references
+                    (str(row["issuer_id"]), str(row["cik"])) for row in normalized_references
                 }
                 cik_rows = self.query(
                     """
@@ -2328,8 +3533,7 @@ class Store:
                     (prior.isoformat(), prior.isoformat()),
                 )
                 if (
-                    {(str(row["issuer_id"]), str(row["cik"])) for row in cik_rows}
-                    != expected_ciks
+                    {(str(row["issuer_id"]), str(row["cik"])) for row in cik_rows} != expected_ciks
                     or len(cik_rows) != len(expected_ciks)
                     or any(row["effective_end"] != boundary for row in cik_rows)
                 ):
@@ -2349,14 +3553,10 @@ class Store:
                     """,
                     (prior.isoformat(), prior.isoformat()),
                 )
-                provider_security_ids = {
-                    str(row["security_id"]) for row in provider_rows
-                }
-                if (
-                    provider_security_ids
-                    != {str(row["security_id"]) for row in normalized_references}
-                    or any(row["data_end"] != boundary for row in provider_rows)
-                ):
+                provider_security_ids = {str(row["security_id"]) for row in provider_rows}
+                if provider_security_ids != {
+                    str(row["security_id"]) for row in normalized_references
+                } or any(row["data_end"] != boundary for row in provider_rows):
                     raise ValueError("provider-symbol windows do not match the member boundary")
 
                 marker = f"|coverage-attestation:{attestation['attestation_id']}"
@@ -2518,9 +3718,7 @@ class Store:
         )
         missing = [column for column in columns if column not in row]
         if missing:
-            raise ValueError(
-                "universe attestation is missing fields: " + ", ".join(missing)
-            )
+            raise ValueError("universe attestation is missing fields: " + ", ".join(missing))
         placeholders = ", ".join("?" for _ in columns)
         self._con.execute(
             f"""
@@ -2548,16 +3746,235 @@ class Store:
         """Return the most recent ingest outcomes for operators and agents."""
         if limit < 1:
             return []
+        columns = {
+            row["column_name"]
+            for row in self.query(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'main' AND table_name = 'ingest_log'
+                """
+            )
+        }
+        present = {"subject_type", "subject_id"} & columns
+        if present and present != {"subject_type", "subject_id"}:
+            raise RuntimeError(
+                "Ingest subject schema is incomplete: subject_type and "
+                "subject_id must exist together."
+            )
+        subject_projection = (
+            "subject_type, subject_id" if present else "NULL AS subject_type, NULL AS subject_id"
+        )
+        rejection_projection = (
+            "rejection_codes" if "rejection_codes" in columns else "NULL AS rejection_codes"
+        )
         return self.query(
-            """
-            SELECT id, run_id, source, table_name, rows_inserted, rows_rejected,
-                   started_at, finished_at, status, error
+            f"""
+            SELECT id, run_id, source, table_name, {subject_projection},
+                   rows_inserted, rows_rejected, started_at, finished_at,
+                   status, error, {rejection_projection}
             FROM ingest_log
             ORDER BY id DESC
             LIMIT ?
             """,
             (limit,),
         )
+
+    def ingest_evidence(self, run_id: str) -> dict | None:
+        """Return one ingest outcome and the immutable payload metadata it cites.
+
+        A read-only connection can point at a database created before subject
+        provenance existed. Both missing subject columns are represented as
+        ``None`` without upgrading that database. A one-column partial schema
+        is ambiguous and fails closed.
+        """
+        normalized_run_id = str(run_id).strip()
+        if not normalized_run_id:
+            raise ValueError("ingest evidence requires a run id")
+        columns = {
+            row["column_name"]
+            for row in self.query(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'main' AND table_name = 'ingest_log'
+                """
+            )
+        }
+        present = {"subject_type", "subject_id"} & columns
+        if present and present != {"subject_type", "subject_id"}:
+            raise RuntimeError(
+                "Ingest subject schema is incomplete: subject_type and "
+                "subject_id must exist together."
+            )
+        subject_projection = (
+            "subject_type, subject_id" if present else "NULL AS subject_type, NULL AS subject_id"
+        )
+        rejection_projection = (
+            "rejection_codes" if "rejection_codes" in columns else "NULL AS rejection_codes"
+        )
+
+        outcomes = self.query(
+            f"""
+            SELECT id, run_id, source, table_name, {subject_projection},
+                   rows_inserted, rows_rejected, started_at, finished_at,
+                   status, error, {rejection_projection}
+            FROM ingest_log
+            WHERE run_id = ?
+            ORDER BY id
+            """,
+            (normalized_run_id,),
+        )
+        if not outcomes:
+            return None
+        if len(outcomes) != 1:
+            raise ValueError(f"ingest run {normalized_run_id!r} is ambiguous")
+
+        evidence = outcomes[0]
+        evidence["snapshots"] = self.query(
+            """
+            SELECT linked.role, linked.linked_at,
+                   snapshot.snapshot_id, snapshot.provider, snapshot.dataset,
+                   snapshot.artifact_kind, snapshot.requested_at,
+                   snapshot.received_at, snapshot.http_status,
+                   snapshot.content_type, snapshot.request_fingerprint,
+                   snapshot.payload_sha256, snapshot.adapter_name,
+                   snapshot.adapter_version, snapshot.parser_version,
+                   snapshot.parsed_row_count, snapshot.parsed_rows_sha256,
+                   payload.relative_path, payload.original_bytes,
+                   payload.stored_bytes, payload.compression
+            FROM ingest_raw_snapshots AS linked
+            LEFT JOIN raw_snapshots AS snapshot USING (snapshot_id)
+            LEFT JOIN raw_payloads AS payload USING (payload_sha256)
+            WHERE linked.run_id = ?
+            ORDER BY linked.role, linked.snapshot_id
+            """,
+            (normalized_run_id,),
+        )
+        return evidence
+
+    def sec_fundamental_lineage_rows(
+        self,
+        issuer_ids: list[str],
+        as_of: date | str,
+    ) -> list[dict]:
+        """Return only rows linked to a successful, subject-scoped SEC ingest.
+
+        This is metadata validation, not the final trust decision. The anomaly
+        detector still replays the exact response and verifies each row hash.
+        Legacy rows with nullable lineage are deliberately excluded.
+        """
+        normalized = sorted(
+            {str(issuer_id).strip() for issuer_id in issuer_ids if str(issuer_id).strip()}
+        )
+        if not normalized:
+            return []
+        columns = {
+            row["column_name"]
+            for row in self.query(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'main' AND table_name = 'fundamentals'
+                """
+            )
+        }
+        required = {
+            "ingest_run_id",
+            "source_snapshot_id",
+            "source_rowset_sha256",
+            "source_row_sha256",
+        }
+        if not required <= columns:
+            return []
+        ingest_columns = {
+            row["column_name"]
+            for row in self.query(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'main' AND table_name = 'ingest_log'
+                """
+            )
+        }
+        subject_present = {"subject_type", "subject_id"} & ingest_columns
+        if subject_present and subject_present != {"subject_type", "subject_id"}:
+            raise RuntimeError(
+                "Ingest subject schema is incomplete: subject_type and "
+                "subject_id must exist together."
+            )
+        if not subject_present:
+            return []
+        rejection_projection = (
+            "outcome.rejection_codes AS ingest_rejection_codes"
+            if "rejection_codes" in ingest_columns
+            else "NULL AS ingest_rejection_codes"
+        )
+        locator_projection = (
+            "fundamental.source_fact_locator"
+            if "source_fact_locator" in columns
+            else "NULL AS source_fact_locator"
+        )
+        placeholders = ",".join("?" for _ in normalized)
+        rows = self.query(
+            f"""
+            SELECT fundamental.ticker, fundamental.issuer_id,
+                   fundamental.security_id, fundamental.period_end,
+                   fundamental.as_of_date, fundamental.fiscal_period,
+                   fundamental.statement, fundamental.metric,
+                   fundamental.value, fundamental.quarter_value,
+                   fundamental.unit, fundamental.source,
+                   fundamental.ingest_run_id,
+                   fundamental.source_snapshot_id,
+                   fundamental.source_rowset_sha256,
+                   fundamental.source_row_sha256,
+                   {locator_projection},
+                   outcome.id AS ingest_id,
+                   outcome.rows_inserted AS ingest_rows_inserted,
+                   outcome.finished_at AS ingest_finished_at,
+                   outcome.status AS ingest_status,
+                   outcome.error AS ingest_error,
+                   {rejection_projection}
+            FROM fundamentals AS fundamental
+            JOIN ingest_log AS outcome
+              ON outcome.run_id = fundamental.ingest_run_id
+             AND outcome.table_name = 'fundamentals'
+             AND outcome.source LIKE 'edgar:%'
+             AND outcome.status IN ('success', 'warning')
+             AND outcome.rows_inserted > 0
+             AND outcome.subject_type = 'issuer'
+             AND outcome.subject_id = fundamental.issuer_id
+            JOIN ingest_raw_snapshots AS linked
+              ON linked.run_id = fundamental.ingest_run_id
+             AND linked.snapshot_id = fundamental.source_snapshot_id
+             AND linked.role = 'companyfacts'
+            JOIN raw_snapshots AS snapshot
+              ON snapshot.snapshot_id = linked.snapshot_id
+             AND snapshot.provider = 'sec-edgar'
+             AND snapshot.dataset = 'companyfacts'
+             AND snapshot.artifact_kind = 'exact_response'
+             AND snapshot.http_status BETWEEN 200 AND 299
+             AND snapshot.parsed_row_count > 0
+             AND snapshot.parsed_rows_sha256 =
+                 fundamental.source_rowset_sha256
+            WHERE fundamental.issuer_id IN ({placeholders})
+              AND fundamental.as_of_date <= CAST(? AS DATE)
+              AND fundamental.period_end <= fundamental.as_of_date
+            ORDER BY fundamental.issuer_id, outcome.id,
+                     fundamental.period_end, fundamental.as_of_date,
+                     fundamental.metric
+            """,
+            (*normalized, str(as_of)),
+        )
+        return [
+            row
+            for row in rows
+            if accepted_sec_fundamental_outcome(
+                status=row.get("ingest_status"),
+                error=row.get("ingest_error"),
+                rejection_codes=row.get("ingest_rejection_codes"),
+            )
+        ]
 
     def data_quality_report(self) -> list[dict]:
         """Run read-only checks on the stored data.
@@ -2599,6 +4016,65 @@ class Store:
             ],
             "fail",
             "A fiscal period cannot end after the filing became publicly knowable.",
+        )
+        add(
+            "fundamental_evidence_unversioned_projection",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM fundamentals AS current
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM fundamental_versions AS version
+                    WHERE version.ticker = current.ticker
+                      AND version.period_end = current.period_end
+                      AND version.as_of_date = current.as_of_date
+                      AND version.metric = current.metric
+                      AND version.is_deleted = FALSE
+                      AND version.issuer_id IS NOT DISTINCT FROM current.issuer_id
+                      AND version.security_id IS NOT DISTINCT FROM current.security_id
+                      AND version.ingest_run_id IS NOT DISTINCT FROM current.ingest_run_id
+                      AND version.source_snapshot_id IS NOT DISTINCT FROM
+                          current.source_snapshot_id
+                      AND version.source_rowset_sha256 IS NOT DISTINCT FROM
+                          current.source_rowset_sha256
+                      AND version.source_row_sha256 IS NOT DISTINCT FROM
+                          current.source_row_sha256
+                      AND version.source_fact_locator IS NOT DISTINCT FROM
+                          current.source_fact_locator
+                      AND version.fiscal_period IS NOT DISTINCT FROM current.fiscal_period
+                      AND version.statement IS NOT DISTINCT FROM current.statement
+                      AND version.value IS NOT DISTINCT FROM current.value
+                      AND version.quarter_value IS NOT DISTINCT FROM current.quarter_value
+                      AND version.unit IS NOT DISTINCT FROM current.unit
+                      AND version.source IS NOT DISTINCT FROM current.source
+                )
+                """
+            )[0]["n"],
+            "fail",
+            "Every current fundamental must have an immutable system-time version.",
+        )
+        add(
+            "fundamental_evidence_latest_projection_mismatch",
+            self._fundamental_projection_version_mismatch_count(),
+            "fail",
+            "Latest fact versions, including deletion tombstones, must exactly "
+            "reconstruct the current fundamental projection.",
+        )
+        add(
+            "fundamental_evidence_generation_ahead_of_history",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM fundamental_evidence_generations AS generation
+                WHERE generation.version_sequence > COALESCE(
+                    (SELECT MAX(version_sequence) FROM fundamental_versions),
+                    0
+                )
+                """
+            )[0]["n"],
+            "fail",
+            "Named evidence generations cannot point beyond immutable fact history.",
         )
         add(
             "fundamentals_missing_quarter_value",
@@ -2887,7 +4363,7 @@ class Store:
                 SELECT COUNT(*) AS n
                 FROM universe_coverage_attestations
                 WHERE requested_coverage_through <= prior_coverage_through
-                   OR completed_new_york_date >= CAST(checked_at AS DATE)
+                   OR requested_coverage_through > completed_new_york_date
                    OR official_release_count < 1
                    OR component_count NOT BETWEEN 450 AND 550
                    OR (
@@ -3452,10 +4928,7 @@ class Store:
                     str(extension["data_end"]),
                 ),
             )
-            payload = [
-                {**price, "provenance_id": extension["provenance_id"]}
-                for price in prices
-            ]
+            payload = [{**price, "provenance_id": extension["provenance_id"]} for price in prices]
             try:
                 actual_hash = canonical_price_payload_hash(payload)
             except (TypeError, ValueError):
@@ -3478,7 +4951,33 @@ class Store:
             where += " AND ticker = ?"
             params = (ticker.upper(),)
         count = self.query(f"SELECT COUNT(*) AS n FROM fundamentals WHERE {where}", params)[0]["n"]
-        self.execute(f"DELETE FROM fundamentals WHERE {where}", params)
+        if not count:
+            return 0
+        self.execute("BEGIN TRANSACTION")
+        try:
+            self.execute(
+                f"""
+                INSERT INTO fundamental_versions
+                (ticker, issuer_id, security_id, ingest_run_id,
+                 source_snapshot_id, source_rowset_sha256,
+                 source_row_sha256, source_fact_locator, period_end,
+                 as_of_date, fiscal_period, statement, metric, value,
+                 quarter_value, unit, source, recorded_at, is_deleted)
+                SELECT ticker, issuer_id, security_id, ingest_run_id,
+                       source_snapshot_id, source_rowset_sha256,
+                       source_row_sha256, source_fact_locator, period_end,
+                       as_of_date, fiscal_period, statement, metric, value,
+                       quarter_value, unit, source, now(), TRUE
+                FROM fundamentals
+                WHERE {where}
+                """,
+                params,
+            )
+            self.execute(f"DELETE FROM fundamentals WHERE {where}", params)
+            self.execute("COMMIT")
+        except Exception:
+            self.execute("ROLLBACK")
+            raise
         return int(count)
 
     def quarantine_invalid_fundamental_periods(self) -> int:
@@ -3493,13 +4992,34 @@ class Store:
             self.execute(
                 """
                 INSERT INTO fundamentals_quarantine
-                (ticker, issuer_id, security_id, period_end, as_of_date,
-                 fiscal_period, statement, metric, value, quarter_value, unit,
-                 source, fetched_at, quarantine_reason, quarantined_at)
-                SELECT ticker, issuer_id, security_id, period_end, as_of_date,
-                       fiscal_period, statement, metric, value, quarter_value,
-                       unit, source, fetched_at,
+                (ticker, issuer_id, security_id, ingest_run_id,
+                 source_snapshot_id, source_rowset_sha256, source_row_sha256,
+                 source_fact_locator, period_end, as_of_date, fiscal_period,
+                 statement, metric, value, quarter_value, unit, source, fetched_at,
+                 quarantine_reason, quarantined_at)
+                SELECT ticker, issuer_id, security_id, ingest_run_id,
+                       source_snapshot_id, source_rowset_sha256,
+                       source_row_sha256, source_fact_locator, period_end,
+                       as_of_date, fiscal_period, statement, metric, value,
+                       quarter_value, unit, source, fetched_at,
                        'period_end_after_as_of_date', now()
+                FROM fundamentals
+                WHERE period_end > as_of_date
+                """
+            )
+            self.execute(
+                """
+                INSERT INTO fundamental_versions
+                (ticker, issuer_id, security_id, ingest_run_id,
+                 source_snapshot_id, source_rowset_sha256,
+                 source_row_sha256, source_fact_locator, period_end,
+                 as_of_date, fiscal_period, statement, metric, value,
+                 quarter_value, unit, source, recorded_at, is_deleted)
+                SELECT ticker, issuer_id, security_id, ingest_run_id,
+                       source_snapshot_id, source_rowset_sha256,
+                       source_row_sha256, source_fact_locator, period_end,
+                       as_of_date, fiscal_period, statement, metric, value,
+                       quarter_value, unit, source, now(), TRUE
                 FROM fundamentals
                 WHERE period_end > as_of_date
                 """
@@ -3588,6 +5108,108 @@ class Store:
     # ------------------------------------------------------------------
     # Point-in-time query helpers (used by factor + backtest layers)
     # ------------------------------------------------------------------
+    def create_fundamental_evidence_generation(
+        self,
+        *,
+        purpose: str,
+        decision_date: date | str | None = None,
+        now: datetime | None = None,
+    ) -> FundamentalEvidenceGeneration:
+        """Capture one immutable named boundary over append-only fact versions."""
+
+        normalized_purpose = str(purpose).strip()
+        if not normalized_purpose or len(normalized_purpose) > 80:
+            raise ValueError("fundamental evidence purpose must contain 1-80 characters")
+        if any(
+            not (character.isalnum() or character in "-_.:")
+            for character in normalized_purpose
+        ):
+            raise ValueError(
+                "fundamental evidence purpose may contain only letters, numbers, "
+                "-, _, ., and :"
+            )
+        normalized_date = _as_date(decision_date) if decision_date is not None else None
+        moment = now or datetime.now(UTC)
+        if moment.tzinfo is None or moment.utcoffset() is None:
+            raise ValueError("fundamental evidence capture time must be timezone-aware")
+        captured_at = moment.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        generation_id = f"fundamental-generation-{uuid4().hex}"
+        self.execute("BEGIN TRANSACTION")
+        try:
+            self.execute(
+                """
+                INSERT INTO fundamental_evidence_generations
+                (generation_id, version_sequence, purpose, decision_date, captured_at)
+                SELECT ?, COALESCE(MAX(version_sequence), 0), ?, CAST(? AS DATE),
+                       CAST(? AS TIMESTAMP)
+                FROM fundamental_versions
+                """,
+                (
+                    generation_id,
+                    normalized_purpose,
+                    normalized_date.isoformat() if normalized_date is not None else None,
+                    captured_at,
+                ),
+            )
+            self.execute("COMMIT")
+        except Exception:
+            self.execute("ROLLBACK")
+            raise
+        return self.fundamental_evidence_generation(generation_id)
+
+    def fundamental_evidence_generation(
+        self,
+        generation_id: str,
+    ) -> FundamentalEvidenceGeneration:
+        normalized = str(generation_id).strip()
+        if not normalized:
+            raise ValueError("fundamental evidence generation id is required")
+        rows = self.query(
+            """
+            SELECT generation_id, version_sequence, purpose, decision_date,
+                   captured_at
+            FROM fundamental_evidence_generations
+            WHERE generation_id = ?
+            """,
+            (normalized,),
+        )
+        if len(rows) != 1:
+            raise ValueError(f"unknown fundamental evidence generation: {generation_id}")
+        row = rows[0]
+        return FundamentalEvidenceGeneration(
+            generation_id=str(row["generation_id"]),
+            version_sequence=int(row["version_sequence"]),
+            purpose=str(row["purpose"]),
+            decision_date=(
+                str(row["decision_date"]) if row["decision_date"] is not None else None
+            ),
+            captured_at=_utc_database_timestamp(row["captured_at"]),
+        )
+
+    def _fundamental_evidence_relation(
+        self,
+        generation_id: str | None,
+    ) -> tuple[str, str, tuple[Any, ...]]:
+        if generation_id is None:
+            return "WITH", "fundamentals", ()
+        generation = self.fundamental_evidence_generation(generation_id)
+        prefix = """
+            WITH generation_versions AS (
+                SELECT version.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY ticker, period_end, as_of_date, metric
+                           ORDER BY version_sequence DESC
+                       ) AS projection_rank
+                FROM fundamental_versions AS version
+                WHERE version.version_sequence <= ?
+            ), fundamental_evidence AS (
+                SELECT * EXCLUDE (projection_rank)
+                FROM generation_versions
+                WHERE projection_rank = 1 AND is_deleted = FALSE
+            ),
+        """
+        return prefix, "fundamental_evidence", (generation.version_sequence,)
+
     def security_id_for_ticker(
         self,
         ticker: str,
@@ -3624,10 +5246,11 @@ class Store:
             SELECT DISTINCT issuer_id
             FROM security_issuer_assignments
             WHERE security_id = ?
+              AND verified_date <= CAST(? AS DATE)
               AND effective_start <= CAST(? AS DATE)
               AND (effective_end IS NULL OR effective_end > CAST(? AS DATE))
             """,
-            (security_id, str(as_of), str(as_of)),
+            (security_id, str(as_of), str(as_of), str(as_of)),
         )
         if len(rows) > 1:
             raise ValueError(f"ambiguous issuer identity for {security_id}@{as_of}")
@@ -3671,6 +5294,20 @@ class Store:
         """
         normalized_ticker = ticker.upper()
         security_id = self.security_id_for_ticker(normalized_ticker, as_of)
+        if security_id is None:
+            historical = self.query(
+                """
+                SELECT DISTINCT security_id
+                FROM security_identity_assignments
+                WHERE ticker = ?
+                  AND known_date <= CAST(? AS DATE)
+                  AND effective_start <= CAST(? AS DATE)
+                """,
+                (normalized_ticker, str(as_of), str(as_of)),
+            )
+            if len(historical) > 1:
+                raise ValueError(f"ambiguous security identity for {normalized_ticker}@{as_of}")
+            security_id = historical[0]["security_id"] if historical else None
         if security_id is None:
             return "ticker = ?", normalized_ticker
 
@@ -3718,7 +5355,7 @@ class Store:
         try:
             rows = self.query(
                 f"""
-                WITH security_routes AS (
+                WITH active_security_routes AS (
                     SELECT requested.requested_ticker,
                            COUNT(DISTINCT identity.security_id) AS security_count,
                            MIN(identity.security_id) AS security_id
@@ -3732,12 +5369,40 @@ class Store:
                             OR identity.effective_end > CAST(? AS DATE)
                      )
                     GROUP BY requested.requested_ticker
+                ), historical_security_routes AS (
+                    SELECT requested.requested_ticker,
+                           COUNT(DISTINCT identity.security_id) AS security_count,
+                           MIN(identity.security_id) AS security_id
+                    FROM {relation} AS requested
+                    LEFT JOIN security_identity_assignments AS identity
+                      ON identity.ticker = requested.requested_ticker
+                     AND identity.known_date <= CAST(? AS DATE)
+                     AND identity.effective_start <= CAST(? AS DATE)
+                    GROUP BY requested.requested_ticker
+                ), security_routes AS (
+                    SELECT active.requested_ticker,
+                           active.security_count,
+                           active.security_id,
+                           CASE
+                               WHEN active.security_count > 0
+                               THEN active.security_count
+                               ELSE historical.security_count
+                           END AS fundamental_security_count,
+                           CASE
+                               WHEN active.security_count > 0
+                               THEN active.security_id
+                               ELSE historical.security_id
+                           END AS fundamental_security_id
+                    FROM active_security_routes AS active
+                    JOIN historical_security_routes AS historical
+                      USING (requested_ticker)
                 ), active_owners AS (
                     SELECT security_id,
                            COUNT(DISTINCT issuer_id) AS issuer_count,
                            MIN(issuer_id) AS issuer_id
                     FROM security_issuer_assignments
-                    WHERE effective_start <= CAST(? AS DATE)
+                    WHERE verified_date <= CAST(? AS DATE)
+                      AND effective_start <= CAST(? AS DATE)
                       AND (effective_end IS NULL OR effective_end > CAST(? AS DATE))
                     GROUP BY security_id
                 ), owner_history AS (
@@ -3750,25 +5415,32 @@ class Store:
                     SELECT DISTINCT security_id
                     FROM provider_symbol_history
                     WHERE mapping_status = 'verified'
+                      AND verified_date <= CAST(? AS DATE)
                       AND data_start <= CAST(? AS DATE)
                       AND (data_end IS NULL OR data_end > CAST(? AS DATE))
                 )
                 SELECT route.requested_ticker,
                        route.security_count,
                        route.security_id,
+                       route.fundamental_security_count,
+                       route.fundamental_security_id,
                        COALESCE(owner.issuer_count, 0) AS issuer_count,
                        owner.issuer_id,
                        history.security_id IS NOT NULL AS has_reviewed_owner,
                        mapping.security_id IS NOT NULL AS has_reviewed_mapping,
                        active.security_id IS NOT NULL AS has_active_mapping
                 FROM security_routes AS route
-                LEFT JOIN active_owners AS owner USING (security_id)
-                LEFT JOIN owner_history AS history USING (security_id)
-                LEFT JOIN mapping_history AS mapping USING (security_id)
-                LEFT JOIN active_mappings AS active USING (security_id)
+                LEFT JOIN active_owners AS owner
+                  ON owner.security_id = route.fundamental_security_id
+                LEFT JOIN owner_history AS history
+                  ON history.security_id = route.fundamental_security_id
+                LEFT JOIN mapping_history AS mapping
+                  ON mapping.security_id = route.security_id
+                LEFT JOIN active_mappings AS active
+                  ON active.security_id = route.security_id
                 ORDER BY route.requested_ticker
                 """,
-                (str(as_of),) * 7,
+                (str(as_of),) * 11,
             )
         finally:
             self._con.unregister(relation)
@@ -3778,15 +5450,34 @@ class Store:
             ticker = str(row["requested_ticker"])
             if int(row["security_count"]) > 1:
                 raise ValueError(f"ambiguous security identity for {ticker}@{as_of}")
-            if int(row["issuer_count"]) > 1:
-                raise ValueError(f"ambiguous issuer identity for {row['security_id']}@{as_of}")
             resolved[ticker] = row
         return resolved
 
-    def issuer_reference(self, issuer_id: str) -> dict | None:
-        """Return canonical issuer metadata and its latest verified SEC CIK."""
-        rows = self.query(
+    def issuer_reference(
+        self,
+        issuer_id: str,
+        *,
+        as_of: date | str | None = None,
+    ) -> dict | None:
+        """Return canonical issuer metadata and one reviewed SEC CIK.
+
+        Supplying ``as_of`` resolves the effective, already-verified CIK for
+        that date. Omitting it preserves the current-ingest behavior of
+        selecting the latest reviewed interval.
+        """
+        where = "WHERE issuer.issuer_id = ?"
+        parameters: list[Any] = [issuer_id]
+        limit = "LIMIT 1"
+        if as_of is not None:
+            where += """
+              AND cik.effective_start <= CAST(? AS DATE)
+              AND (cik.effective_end IS NULL OR cik.effective_end > CAST(? AS DATE))
+              AND cik.verified_date <= CAST(? AS DATE)
             """
+            parameters.extend((str(as_of), str(as_of), str(as_of)))
+            limit = ""
+        rows = self.query(
+            f"""
             SELECT issuer.issuer_id, issuer.canonical_name,
                    issuer.canonical_ticker, cik.cik,
                    cik.effective_start, cik.effective_end,
@@ -3794,12 +5485,14 @@ class Store:
                    issuer.source AS issuer_source
             FROM issuer_master AS issuer
             JOIN issuer_cik_history AS cik USING (issuer_id)
-            WHERE issuer.issuer_id = ?
+            {where}
             ORDER BY cik.effective_start DESC
-            LIMIT 1
+            {limit}
             """,
-            (issuer_id,),
+            tuple(parameters),
         )
+        if as_of is not None and len(rows) > 1:
+            raise ValueError(f"ambiguous SEC CIK for {issuer_id}@{as_of}")
         return rows[0] if rows else None
 
     def provider_symbol_mappings(
@@ -3898,11 +5591,7 @@ class Store:
     ) -> list[dict]:
         """Return reviewed identity-changing share events in ``(start, end]``."""
         normalized = sorted(
-            {
-                str(value).strip()
-                for value in source_security_ids
-                if str(value).strip()
-            }
+            {str(value).strip() for value in source_security_ids if str(value).strip()}
         )
         if not normalized:
             return []
@@ -3928,6 +5617,8 @@ class Store:
         ticker: str,
         as_of: date | str,
         metrics: list[str] | None = None,
+        *,
+        evidence_generation_id: str | None = None,
     ) -> list[dict]:
         """Get the latest fundamentals known as of `as_of` for a ticker.
 
@@ -3938,14 +5629,17 @@ class Store:
         if identity is None:
             return []
         identity_filter, identity_value = identity
+        generation_prefix, relation, generation_params = (
+            self._fundamental_evidence_relation(evidence_generation_id)
+        )
         sql = f"""
-            WITH ranked AS (
+            {generation_prefix} ranked AS (
                 SELECT *,
                        ROW_NUMBER() OVER (
                            PARTITION BY metric
                            ORDER BY as_of_date DESC, period_end DESC
                        ) AS rn
-                FROM fundamentals
+                FROM {relation}
                 WHERE {identity_filter}
                   AND as_of_date <= CAST(? AS DATE)
                   AND period_end <= as_of_date
@@ -3955,11 +5649,11 @@ class Store:
             FROM ranked
             WHERE rn = 1
         """
-        params: tuple[Any, ...] = (identity_value, str(as_of))
+        params: tuple[Any, ...] = (*generation_params, identity_value, str(as_of))
         if metrics:
             placeholders = ",".join("?" for _ in metrics)
             sql += f" AND metric IN ({placeholders})"
-            params = (identity_value, str(as_of), *metrics)
+            params = (*generation_params, identity_value, str(as_of), *metrics)
         return self.query(sql, params)
 
     def fundamental_history(
@@ -3967,21 +5661,26 @@ class Store:
         ticker: str,
         as_of: date | str,
         metric: str,
+        *,
+        evidence_generation_id: str | None = None,
     ) -> list[dict]:
         """Return PIT-deduped metric history using issuer identity when verified."""
         identity = self._fundamental_identity_filter(ticker, as_of)
         if identity is None:
             return []
         identity_filter, identity_value = identity
+        generation_prefix, relation, generation_params = (
+            self._fundamental_evidence_relation(evidence_generation_id)
+        )
         return self.query(
             f"""
-            WITH ranked AS (
+            {generation_prefix} ranked AS (
                 SELECT period_end, fiscal_period, quarter_value,
                        ROW_NUMBER() OVER (
                            PARTITION BY period_end
                            ORDER BY as_of_date DESC
                        ) AS rn
-                FROM fundamentals
+                FROM {relation}
                 WHERE {identity_filter}
                   AND metric = ?
                   AND as_of_date <= CAST(? AS DATE)
@@ -3993,7 +5692,7 @@ class Store:
             WHERE rn = 1
             ORDER BY period_end ASC
             """,
-            (identity_value, metric, str(as_of)),
+            (*generation_params, identity_value, metric, str(as_of)),
         )
 
     def pit_factor_fundamentals(
@@ -4001,6 +5700,8 @@ class Store:
         ticker: str,
         as_of: date | str,
         metrics: list[str],
+        *,
+        evidence_generation_id: str | None = None,
     ) -> list[dict]:
         """Return one PIT-deduped history snapshot for several factor metrics.
 
@@ -4018,17 +5719,20 @@ class Store:
         if identity is None:
             return []
         identity_filter, identity_value = identity
+        generation_prefix, relation, generation_params = (
+            self._fundamental_evidence_relation(evidence_generation_id)
+        )
         placeholders = ",".join("?" for _ in normalized_metrics)
         return self.query(
             f"""
-            WITH ranked AS (
+            {generation_prefix} ranked AS (
                 SELECT metric, period_end, as_of_date, fiscal_period,
                        value, quarter_value,
                        ROW_NUMBER() OVER (
                            PARTITION BY metric, period_end
                            ORDER BY as_of_date DESC
                        ) AS period_rn
-                FROM fundamentals
+                FROM {relation}
                 WHERE {identity_filter}
                   AND metric IN ({placeholders})
                   AND as_of_date <= CAST(? AS DATE)
@@ -4040,7 +5744,7 @@ class Store:
             WHERE period_rn = 1
             ORDER BY metric, period_end
             """,
-            (identity_value, *normalized_metrics, str(as_of)),
+            (*generation_params, identity_value, *normalized_metrics, str(as_of)),
         )
 
     def pit_factor_fundamentals_batch(
@@ -4048,6 +5752,8 @@ class Store:
         tickers: list[str],
         as_of: date | str,
         metrics: list[str],
+        *,
+        evidence_generation_id: str | None = None,
     ) -> dict[str, list[dict]]:
         """Return PIT-deduped factor histories for a universe in one data read.
 
@@ -4064,6 +5770,12 @@ class Store:
 
         readable: list[dict] = []
         for ticker, route in routes.items():
+            if int(route["fundamental_security_count"]) > 1:
+                raise ValueError(f"ambiguous security identity for {ticker}@{as_of}")
+            if int(route["issuer_count"]) > 1:
+                raise ValueError(
+                    f"ambiguous issuer identity for {route['fundamental_security_id']}@{as_of}"
+                )
             issuer_id = route.get("issuer_id")
             if issuer_id is not None:
                 readable.append(
@@ -4073,7 +5785,9 @@ class Store:
                         "identity_value": issuer_id,
                     }
                 )
-            elif route.get("security_id") is not None and route.get("has_reviewed_owner"):
+            elif route.get("fundamental_security_id") is not None and route.get(
+                "has_reviewed_owner"
+            ):
                 # Once reviewed ownership exists, a date without an active
                 # owner is an explicit evidence gap and cannot use ticker rows.
                 continue
@@ -4091,10 +5805,13 @@ class Store:
         relation = f"_tmp_factor_fundamental_routes_{uuid4().hex}"
         self._con.register(relation, _rows_to_arrowable(readable))
         placeholders = ",".join("?" for _ in normalized_metrics)
+        generation_prefix, fundamental_relation, generation_params = (
+            self._fundamental_evidence_relation(evidence_generation_id)
+        )
         try:
             rows = self.query(
                 f"""
-                WITH selected AS (
+                {generation_prefix} selected AS (
                     SELECT route.requested_ticker,
                            fundamental.metric,
                            fundamental.period_end,
@@ -4103,7 +5820,7 @@ class Store:
                            fundamental.value,
                            fundamental.quarter_value
                     FROM {relation} AS route
-                    JOIN fundamentals AS fundamental
+                    JOIN {fundamental_relation} AS fundamental
                       ON route.identity_kind = 'issuer'
                      AND fundamental.issuer_id = route.identity_value
                     UNION ALL
@@ -4115,7 +5832,7 @@ class Store:
                            fundamental.value,
                            fundamental.quarter_value
                     FROM {relation} AS route
-                    JOIN fundamentals AS fundamental
+                    JOIN {fundamental_relation} AS fundamental
                       ON route.identity_kind = 'ticker'
                      AND fundamental.ticker = route.identity_value
                 ), ranked AS (
@@ -4135,7 +5852,7 @@ class Store:
                 WHERE period_rn = 1
                 ORDER BY requested_ticker, metric, period_end
                 """,
-                (*normalized_metrics, str(as_of)),
+                (*generation_params, *normalized_metrics, str(as_of)),
             )
         finally:
             self._con.unregister(relation)
@@ -4276,13 +5993,14 @@ class Store:
                     SELECT COUNT(*) AS reviewed_count,
                            COUNT(*) FILTER (
                                WHERE mapping_status = 'verified'
+                                 AND verified_date <= CAST(? AS DATE)
                                  AND data_start <= CAST(? AS DATE)
                                  AND (data_end IS NULL OR data_end > CAST(? AS DATE))
                            ) AS active_count
                     FROM provider_symbol_history
                     WHERE security_id = ?
                 """,
-                (str(as_of), str(as_of), security_id),
+                (str(as_of), str(as_of), str(as_of), security_id),
             )[0]
             has_reviewed_mapping = mapping_state["reviewed_count"] > 0
             has_active_mapping = mapping_state["active_count"] > 0
@@ -4443,13 +6161,14 @@ class Store:
                 SELECT COUNT(*) AS reviewed_count,
                        COUNT(*) FILTER (
                            WHERE mapping_status = 'verified'
+                             AND verified_date <= CAST(? AS DATE)
                              AND data_start <= CAST(? AS DATE)
                              AND (data_end IS NULL OR data_end > CAST(? AS DATE))
                        ) AS active_count
                 FROM provider_symbol_history
                 WHERE security_id = ?
                 """,
-                (str(as_of), str(as_of), security_id),
+                (str(as_of), str(as_of), str(as_of), security_id),
             )[0]
             has_reviewed_mapping = mapping_state["reviewed_count"] > 0
             has_active_mapping = mapping_state["active_count"] > 0
@@ -4849,6 +6568,7 @@ class Store:
                            SELECT owner.issuer_id
                            FROM security_issuer_assignments AS owner
                            WHERE owner.security_id = members.security_id
+                             AND owner.verified_date <= members.known_as_of
                              AND owner.effective_start <= members.known_as_of
                              AND (
                                  owner.effective_end IS NULL
@@ -4912,6 +6632,7 @@ class Store:
                            SELECT issuer_id
                            FROM security_issuer_assignments AS owner
                            WHERE owner.security_id = members.security_id
+                             AND owner.verified_date <= members.as_of
                              AND owner.effective_start <= members.as_of
                              AND (
                                  owner.effective_end IS NULL
@@ -4929,6 +6650,7 @@ class Store:
                            FROM provider_symbol_history AS mapping
                            WHERE mapping.security_id = members.security_id
                              AND mapping.mapping_status = 'verified'
+                             AND mapping.verified_date <= members.as_of
                              AND mapping.data_start <= members.as_of
                              AND (
                                  mapping.data_end IS NULL
@@ -5038,6 +6760,13 @@ def _resolve(p: Path | str) -> Path:
     return p if p.is_absolute() else settings.project_root / p
 
 
+def _utc_database_timestamp(value: Any) -> str:
+    if not isinstance(value, datetime):
+        raise ValueError("stored evidence capture time is not a timestamp")
+    moment = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    return moment.isoformat().replace("+00:00", "Z")
+
+
 def _as_date(value: date | str) -> date:
     if isinstance(value, date):
         return value
@@ -5049,6 +6778,138 @@ def _required_text(row: dict, key: str, label: str) -> str:
     if not value:
         raise ValueError(f"{label} requires {key}")
     return value
+
+
+def _ingest_subject(
+    subject_type: str | None,
+    subject_id: str | None,
+) -> tuple[str | None, str | None]:
+    """Normalize an optional all-or-none ingest subject."""
+    if (subject_type is None) != (subject_id is None):
+        raise ValueError("ingest subject_type and subject_id must be provided together")
+    if subject_type is None:
+        return None, None
+    if not isinstance(subject_type, str) or not isinstance(subject_id, str):
+        raise TypeError("ingest subject_type and subject_id must be strings")
+    normalized_type = subject_type.strip().lower()
+    normalized_id = subject_id.strip()
+    if not normalized_type or not normalized_id:
+        raise ValueError("ingest subject_type and subject_id cannot be blank")
+    return normalized_type, normalized_id
+
+
+def _fundamental_provenance(row: dict) -> dict[str, str | None]:
+    """Normalize nullable all-or-none immutable SEC row provenance."""
+    keys = (
+        "ingest_run_id",
+        "source_snapshot_id",
+        "source_rowset_sha256",
+        "source_row_sha256",
+    )
+    values = {key: (str(row.get(key) or "").strip() or None) for key in keys}
+    present = {key for key, value in values.items() if value is not None}
+    if present and present != set(keys):
+        raise ValueError(
+            "fundamental provenance requires ingest_run_id, source_snapshot_id, "
+            "source_rowset_sha256, and source_row_sha256 together"
+        )
+    if not present:
+        if row.get("source_fact_locator") is not None:
+            raise ValueError(
+                "fundamental source_fact_locator requires complete immutable provenance"
+            )
+        return values
+    for key in ("source_rowset_sha256", "source_row_sha256"):
+        digest = str(values[key]).lower()
+        if len(digest) != 64:
+            raise ValueError(f"fundamental {key} must be a 64-character SHA-256")
+        try:
+            int(digest, 16)
+        except ValueError as exc:
+            raise ValueError(f"fundamental {key} must be a 64-character SHA-256") from exc
+        values[key] = digest
+    if str(row.get("source") or "edgar").strip().lower() != "edgar":
+        raise ValueError("fundamental provenance is supported only for SEC EDGAR rows")
+    if not str(row.get("issuer_id") or "").strip():
+        raise ValueError("fundamental provenance requires issuer_id")
+    locator = row.get("source_fact_locator")
+    if locator is not None:
+        if not isinstance(locator, str):
+            raise TypeError("fundamental source_fact_locator must be canonical JSON text")
+        try:
+            decoded = json.loads(locator)
+        except json.JSONDecodeError as exc:
+            raise ValueError("fundamental source_fact_locator is invalid JSON") from exc
+        if (
+            not isinstance(decoded, list)
+            or not decoded
+            or any(not isinstance(item, dict) for item in decoded)
+        ):
+            raise ValueError("fundamental source_fact_locator must contain source locator objects")
+        canonical = json.dumps(
+            decoded,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        if locator != canonical:
+            raise ValueError("fundamental source_fact_locator must be canonical JSON")
+        locator_fields = {
+            "taxonomy",
+            "concept",
+            "accession",
+            "form",
+            "start",
+            "end",
+            "filed",
+            "fiscal_period",
+            "fiscal_year",
+            "frame",
+        }
+        required_text = {
+            "taxonomy",
+            "concept",
+            "accession",
+            "form",
+            "end",
+            "filed",
+        }
+        for item in decoded:
+            if set(item) != locator_fields:
+                raise ValueError("fundamental source_fact_locator has an incomplete field set")
+            if any(
+                not isinstance(item[field], str) or not item[field].strip()
+                for field in required_text
+            ):
+                raise ValueError("fundamental source_fact_locator has a blank required field")
+            try:
+                locator_end = date.fromisoformat(item["end"])
+                locator_filed = date.fromisoformat(item["filed"])
+                locator_start = (
+                    date.fromisoformat(item["start"]) if item["start"] is not None else None
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("fundamental source_fact_locator has an invalid date") from exc
+            if locator_end != _as_date(row["period_end"]) or locator_filed != _as_date(
+                row["as_of_date"]
+            ):
+                raise ValueError("fundamental source_fact_locator dates do not match the row")
+            if locator_start is not None and locator_start >= locator_end:
+                raise ValueError("fundamental source_fact_locator start must precede end")
+        encoded_locators = [
+            json.dumps(
+                item,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            for item in decoded
+        ]
+        if encoded_locators != sorted(set(encoded_locators)):
+            raise ValueError("fundamental source_fact_locator entries must be sorted and unique")
+    return values
 
 
 def _half_open_dates(
@@ -5073,6 +6934,68 @@ def _verified_date(row: dict, label: str) -> date:
     if verified > date.today():
         raise ValueError(f"{label} verified_date cannot be in the future")
     return verified
+
+
+def _validate_raw_snapshot_registration(
+    payload: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> None:
+    """Reject malformed immutable-evidence metadata before opening a transaction."""
+
+    def sha256(value: Any, label: str) -> str:
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(f"{label} must be a lowercase 64-character SHA-256")
+        return value
+
+    payload_hash = sha256(payload.get("payload_sha256"), "raw payload hash")
+    if sha256(snapshot.get("payload_sha256"), "raw snapshot payload hash") != payload_hash:
+        raise ValueError("raw snapshot payload hash does not match its payload record")
+    sha256(snapshot.get("request_fingerprint"), "raw snapshot request fingerprint")
+    if payload.get("compression") != "gzip":
+        raise ValueError("raw snapshot compression must be gzip")
+    for key, limit in (
+        ("original_bytes", _RAW_SNAPSHOT_MAX_ORIGINAL_BYTES),
+        ("stored_bytes", _RAW_SNAPSHOT_MAX_STORED_BYTES),
+    ):
+        value = payload.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= limit:
+            raise ValueError(f"raw snapshot {key} is out of bounds")
+
+    parsed_count = snapshot.get("parsed_row_count")
+    parsed_hash = snapshot.get("parsed_rows_sha256")
+    if (parsed_count is None) != (parsed_hash is None):
+        raise ValueError("raw snapshot parsed row evidence is incomplete")
+    if parsed_count is not None:
+        if isinstance(parsed_count, bool) or not isinstance(parsed_count, int) or parsed_count < 0:
+            raise ValueError("raw snapshot parsed row count cannot be negative")
+        sha256(parsed_hash, "raw snapshot parsed-row hash")
+
+    rejected = snapshot.get("parsed_rows_rejected")
+    rejection_codes = snapshot.get("parsed_rejection_codes")
+    if rejected is None:
+        if rejection_codes is not None:
+            raise ValueError("raw snapshot rejection evidence is incomplete")
+    else:
+        if isinstance(rejected, bool) or not isinstance(rejected, int) or rejected < 0:
+            raise ValueError("raw snapshot rejected row count cannot be negative")
+        decoded_codes = decode_rejection_codes(rejection_codes)
+        if (rejected == 0) != (decoded_codes is None):
+            raise ValueError("raw snapshot rejection count and codes are inconsistent")
+        if parsed_count is None:
+            raise ValueError("raw snapshot rejection evidence requires parsed row evidence")
+
+    parsed_companyfacts = (
+        snapshot.get("provider") == "sec-edgar"
+        and snapshot.get("dataset") == "companyfacts"
+        and snapshot.get("parser_version") in {"sec-companyfacts-v2", "sec-companyfacts-v3"}
+        and parsed_count is not None
+    )
+    if parsed_companyfacts and rejected is None:
+        raise ValueError("parsed SEC Company Facts snapshots require rejection evidence")
 
 
 def _rows_to_arrowable(rows: list[dict]) -> pd.DataFrame:

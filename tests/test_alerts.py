@@ -39,13 +39,24 @@ def test_incident_lifecycle_deduplicates_reopens_and_retains_events(tmp_path) ->
     opened = store.emit(_alert(), now=first_time)
     repeated = store.emit(_alert(), now=first_time + timedelta(minutes=1))
     acknowledged = store.acknowledge(
-        opened.incident_id, now=first_time + timedelta(minutes=2)
+        opened.incident_id,
+        actor="ops@example.test",
+        note="Reviewed the exact current warning evidence.",
+        expected_evidence_sha256=repeated.evidence_sha256,
+        now=first_time + timedelta(minutes=2),
     )
     reopened = store.emit(
         _alert(severity=AlertSeverity.CRITICAL),
         now=first_time + timedelta(minutes=3),
     )
-    resolved = store.resolve(opened.incident_id, now=first_time + timedelta(minutes=4))
+    resolved = store.resolve(
+        opened.incident_id,
+        actor="ops@example.test",
+        note="The later refresh completed without warnings.",
+        outcome="verified_recovery",
+        expected_evidence_sha256=reopened.evidence_sha256,
+        now=first_time + timedelta(minutes=4),
+    )
 
     assert repeated.incident_id == opened.incident_id
     assert repeated.occurrence_count == 2
@@ -133,7 +144,9 @@ def test_job_lifecycle_refuses_a_second_live_owner(tmp_path) -> None:
         )
 
 
-def test_systemd_failure_capture_is_bounded_structured_and_recoverable(tmp_path) -> None:
+def test_systemd_failure_capture_is_bounded_and_proofless_recovery_is_retained(
+    tmp_path,
+) -> None:
     store = AlertStore(tmp_path / "alerts.sqlite3")
 
     def runner(command, **_kwargs):
@@ -158,7 +171,10 @@ def test_systemd_failure_capture_is_bounded_structured_and_recoverable(tmp_path)
     assert incident.severity == "critical"
     assert incident.body.endswith("result exit-code and exit status 1.")
     assert incident.payload["systemd"]["ExecMainStatus"] == "1"
-    assert recovered is not None and recovered.state == "resolved"
+    assert recovered is None
+    current = store.get(incident.incident_id)
+    assert current.state == "open"
+    assert current.operationally_blocking is True
 
 
 def test_systemd_failure_capture_refuses_unmanaged_units(tmp_path) -> None:
@@ -197,11 +213,14 @@ def test_incident_read_only_store_preserves_exact_database_bytes(tmp_path) -> No
 
     read_only = AlertStore(path, read_only=True)
 
-    assert read_only.get(incident.incident_id) == incident
-    assert read_only.list(unresolved_only=True) == [incident]
-    assert [event["event_type"] for event in read_only.events(incident.incident_id)] == [
-        "opened"
-    ]
+    for _ in range(3):
+        assert read_only.get(incident.incident_id) == incident
+        assert read_only.list(unresolved_only=True) == [incident]
+        assert [
+            event["event_type"]
+            for event in read_only.events(incident.incident_id)
+        ] == ["opened"]
+        assert read_only.incident_summary()["unresolved"] == 1
     assert path.read_bytes() == before
     assert {
         suffix: candidate.read_bytes()
@@ -230,6 +249,68 @@ def test_incident_read_only_store_refuses_uncheckpointed_wal(tmp_path) -> None:
         connection.close()
 
 
+def test_existing_read_only_store_refuses_writer_wal_started_between_reads(
+    tmp_path,
+) -> None:
+    path = tmp_path / "alerts.sqlite3"
+    writable = AlertStore(path)
+    incident = writable.emit(_alert())
+    with sqlite3.connect(path) as checkpoint:
+        checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        checkpoint.execute("PRAGMA journal_mode = DELETE")
+    read_only = AlertStore(path, read_only=True)
+    writer = sqlite3.connect(path)
+    try:
+        writer.execute("PRAGMA journal_mode = WAL")
+        writer.execute(
+            "UPDATE incidents SET body = body || ' [concurrent]' "
+            "WHERE incident_id = ?",
+            (incident.incident_id,),
+        )
+        writer.commit()
+
+        with pytest.raises(RuntimeError, match="uncheckpointed WAL"):
+            read_only.get(incident.incident_id)
+    finally:
+        writer.close()
+
+
+def test_read_only_query_refuses_main_file_change_after_immutable_read(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "alerts.sqlite3"
+    writable = AlertStore(path)
+    incident = writable.emit(_alert())
+    with sqlite3.connect(path) as checkpoint:
+        checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        checkpoint.execute("PRAGMA journal_mode = DELETE")
+    read_only = AlertStore(path, read_only=True)
+    real_identity = alerts_module._stable_read_only_database_identity
+    calls = 0
+
+    def change_after_read(candidate):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            with sqlite3.connect(path) as writer:
+                writer.execute(
+                    "UPDATE incidents SET body = body || ' [concurrent]' "
+                    "WHERE incident_id = ?",
+                    (incident.incident_id,),
+                )
+        return real_identity(candidate)
+
+    monkeypatch.setattr(
+        alerts_module,
+        "_stable_read_only_database_identity",
+        change_after_read,
+    )
+
+    with pytest.raises(RuntimeError, match="changed during a read-only query"):
+        read_only.get(incident.incident_id)
+
+
 def test_incident_read_only_store_refuses_schema_migration(tmp_path) -> None:
     path = tmp_path / "alerts.sqlite3"
     connection = sqlite3.connect(path)
@@ -240,10 +321,53 @@ def test_incident_read_only_store_refuses_schema_migration(tmp_path) -> None:
         connection.close()
     before = path.read_bytes()
 
-    with pytest.raises(ValueError, match="schema 3 does not match required schema 4"):
+    with pytest.raises(ValueError, match="schema 3 does not match required schema 7"):
         AlertStore(path, read_only=True)
 
     assert path.read_bytes() == before
+
+
+def test_writable_store_migrates_v4_to_v6_without_changing_existing_incidents(
+    tmp_path,
+) -> None:
+    path = tmp_path / "alerts.sqlite3"
+    original_store = AlertStore(path)
+    original = original_store.emit(_alert())
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP TABLE anomaly_case_events")
+        connection.execute("DROP TABLE anomaly_cases")
+        connection.execute("DROP TABLE anomaly_scans")
+        connection.execute("PRAGMA user_version = 4")
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = AlertStore(path)
+
+    assert migrated.get(original.incident_id) == original
+    assert migrated.anomaly_cases() == []
+    verification = sqlite3.connect(path)
+    try:
+        assert verification.execute("PRAGMA user_version").fetchone()[0] == 7
+        tables = {
+            row[0]
+            for row in verification.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name LIKE 'anomaly_%'
+                """
+            )
+        }
+        assert tables == {
+            "anomaly_case_events",
+            "anomaly_cases",
+            "anomaly_scans",
+        }
+        assert verification.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        verification.close()
 
 
 def test_incident_references_require_a_unique_prefix_and_same_second_order_is_stable(
@@ -253,7 +377,14 @@ def test_incident_references_require_a_unique_prefix_and_same_second_order_is_st
     moment = datetime(2026, 7, 22, 1, 0, tzinfo=UTC)
     first = store.emit(_alert(), now=moment)
     store.emit(_alert(dedup_key="refresh:other", code="other"), now=moment)
-    store.resolve(first.incident_id[:12], now=moment)
+    store.resolve(
+        first.incident_id[:12],
+        actor="ops@example.test",
+        note="Bounded reference-resolution test.",
+        outcome="false_positive",
+        expected_evidence_sha256=first.evidence_sha256,
+        now=moment,
+    )
 
     assert store.get(first.incident_id[:12]).state == "resolved"
     assert [event["event_type"] for event in store.events(first.incident_id[:12])] == [
@@ -279,7 +410,19 @@ def test_alert_cli_tests_lists_and_inspects_local_history(monkeypatch, tmp_path)
     list_result = CliRunner().invoke(cli.app, ["alerts", "--unresolved"])
     incident_ref = unresolved.incident_id[:12]
     show_result = CliRunner().invoke(cli.app, ["alert-show", incident_ref])
-    ack_result = CliRunner().invoke(cli.app, ["alert-ack", incident_ref])
+    ack_result = CliRunner().invoke(
+        cli.app,
+        [
+            "alert-ack",
+            incident_ref,
+            "--actor",
+            "ops@example.test",
+            "--note",
+            "Reviewed the exact current warning evidence.",
+            "--evidence-sha256",
+            unresolved.evidence_sha256,
+        ],
+    )
 
     assert test_result.exit_code == 0
     assert "opened, logged, and resolved" in test_result.output

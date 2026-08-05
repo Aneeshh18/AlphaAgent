@@ -164,7 +164,7 @@ def test_existing_universe_schema_migrates_without_rewriting_rows(tmp_path):
     finally:
         con.close()
 
-    store = Store(db_path)
+    store = Store(db_path, allow_schema_upgrade=True)
     try:
         columns = {
             row["column_name"] for row in store.query("DESCRIBE universe_membership")

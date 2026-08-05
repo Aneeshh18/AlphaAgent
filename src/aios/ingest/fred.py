@@ -24,7 +24,7 @@ from uuid import uuid4
 from structlog import get_logger
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
-from aios.config import settings
+from aios.config import secret_value, settings
 from aios.ingest.http_client import RawSnapshotContext, get_http
 from aios.market_calendar import latest_completed_us_equity_session
 from aios.raw_snapshots import (
@@ -112,14 +112,15 @@ def fetch_series_fred(
     ``realtime_start`` — the date that vintage became public. Keeping both is
     required to answer historical questions without revision look-ahead.
     """
-    if not settings.fred_api_key:
+    api_key = secret_value(settings.fred_api_key)
+    if not api_key:
         log.warning("fred.no_api_key", series_id=series_id)
         return []
     requested_at = datetime.now(UTC)
     try:
         from fredapi import Fred
 
-        fred = Fred(api_key=settings.fred_api_key)
+        fred = Fred(api_key=api_key)
     except ImportError as e:  # pragma: no cover
         raise RuntimeError("fredapi not installed") from e
 
@@ -542,7 +543,7 @@ def ingest_macro(
             failures[sid] = str(exc)
             log.error("fred.series_failed", series_id=sid, error=str(exc))
 
-    treasury_required = not settings.fred_api_key or bool(
+    treasury_required = not secret_value(settings.fred_api_key) or bool(
         TREASURY_YIELD_SERIES & failures.keys()
     )
     try:

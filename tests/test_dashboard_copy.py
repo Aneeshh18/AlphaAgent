@@ -128,7 +128,7 @@ def test_dashboard_overview_is_source_backed_and_not_presented_as_live_trading()
     assert "Research readiness" in dashboard
     assert "Paper-trial progress" in dashboard
     assert "Current proposal targets" in dashboard
-    assert "Open incidents" in dashboard
+    assert "Open reviews" in dashboard
     assert "Simulation only · No broker" in dashboard
     assert "build_home_view_model(report, monitor, operations)" in dashboard
     assert "load_operating_summary()" in dashboard
@@ -243,18 +243,25 @@ def test_dashboard_dependency_matches_the_tested_streamlit_contract() -> None:
     assert '"streamlit>=1.58.0,<2.0"' in pyproject
 
 
-def test_system_control_reads_real_independent_incident_history() -> None:
+def test_system_control_reads_real_independent_case_and_incident_history() -> None:
     dashboard = Path("src/aios/dashboard.py").read_text(encoding="utf-8")
 
     assert "load_operations_evidence_read_only(operations_path)" in dashboard
     assert "get_alert_store" not in dashboard
-    assert '"Open incidents"' in dashboard
+    assert '"Open reviews"' in dashboard
     assert 'state["incident_summary"] = operations["incident_summary"]' in dashboard
+    assert 'state["anomaly_cases"] = operations["anomaly_cases"]' in dashboard
+    assert (
+        'state["anomaly_case_summary"] = operations["anomaly_case_summary"]'
+        in dashboard
+    )
     assert 'state["notification_summary"] = operations["notification_summary"]' in dashboard
     assert "External email is off. Incidents are still saved locally" in dashboard
     assert '"Email alerts"' in dashboard
     assert "email_worker_enabled" in dashboard
     assert "Incidents & alert delivery" in dashboard
+    assert "Data review cases" in dashboard
+    assert "aios anomaly-show CASE_REF" in dashboard
     assert "aios alert-show INCIDENT_REF" in dashboard
     assert "aios notification-show NOTIFICATION_REF" in dashboard
     assert "sqlite3.Error" in dashboard

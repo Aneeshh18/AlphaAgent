@@ -152,7 +152,11 @@ are replaceable implementation details behind supported commands and the
 
 The current checkout remains a local supervised research and paper-simulation
 beta. `aios dashboard` hides Streamlit and the CLI hides DuckDB for ordinary
-use. `aios health`, `aios backup`, `aios verify-backup`, and confirmed
+use. Until authentication and HTTPS are implemented, the supported launcher
+accepts only `localhost` or an IP loopback address. Supported mutation commands
+temporarily enforce a private `0077` creation umask and restore the caller's
+prior value when they finish. `aios health`, `aios backup`, `aios
+verify-backup`, and confirmed
 `aios restore` provide fail-visible health and recovery. The normal
 `aios refresh-us-daily` path refreshes action-safe SPY first, certifies the
 unchanged investable universe through that completed session, refreshes member
@@ -162,9 +166,13 @@ lower-level `aios refresh-us-current` remains available for selective prices,
 SEC filings, SPY, and macro work through already reviewed identities.
 `aios review-universe-current` archives exact S&P Global press-archive bytes
 and an independent current-component CSV, checks unreviewed change headlines,
-exact ticker-set equality, and reviewed CIK lineage, then extends all bounded
-reference domains atomically only on a no-change result. Real constituent
-changes remain a manual provenance gate.
+exact ticker-set equality, and reviewed CIK lineage. For a candidate headline,
+it also archives the exact official detail page and strictly parses balanced,
+dated S&P 500 table rows. An announced change can permit unchanged coverage
+only for requested closes strictly before every effective date; it remains
+pending and blocks at its effective date until formally imported. All bounded
+reference domains still extend atomically or not at all. Real constituent
+membership changes remain a manual provenance gate.
 
 `aios preflight` is the canonical read-only operator contract. It resolves the
 active proposal from the checksum-protected forward-trial registry, selects the
@@ -173,11 +181,11 @@ operations ledger without initializing or migrating it. Its versioned,
 checksum-protected JSON keeps research, proposal creation, stress review, paper
 recording, unattended operations, and real-capital execution as independent
 capabilities and emits exactly one safe next action. The default uses the
-lightweight timing gate; `--review-paper` runs the full governed review but
-still stops at an explicit human decision and deliberately emits no
-state-changing command. Repeated `--require` options turn independent
-capabilities into a machine-readable exit gate. The Overview consumes the same
-pure action router.
+lightweight timing gate; `--review-paper` runs the full governed read-only
+review but still stops at an explicit human decision and deliberately produces
+or executes no order or other state-changing command. Repeated `--require`
+options turn independent capabilities into a machine-readable exit gate. The
+Overview consumes the same pure action router.
 
 Every supported CLI command that can change backup-covered DuckDB, immutable
 raw-snapshot, paper-account, proposal, or forward-trial state acquires one
@@ -193,6 +201,22 @@ persistence boundary is not retrofitted mid-trial. A next policy version must
 add the final forward trial/proposal compare-and-set checks before this
 cooperative lock can be described as universal transaction safety.
 
+`aios backup` checkpoints DuckDB through the storage layer without constructing
+a writable `Store`, so a preservation command cannot run application migrations
+before its snapshot. Its failure path records an incident only when the
+operations ledger already matches the current schema. `aios upgrade-local-state
+--confirm` holds the same lease while it creates and re-verifies an exact
+pre-upgrade backup, rehearses both DuckDB and SQLite upgrades on disposable
+copies, compares their logical evidence with live state, applies the supported
+migrations, and publishes a checksum-chained prepared, analytical, operations,
+and verified journal. `upgrade-local-state-recover` resumes or verifies that
+exact attempt after a phase-publication or process failure. An unexpected live
+failure is never auto-restored across the two databases. The verified backup
+supports tested forward recovery through the current release; it is not proof
+that defective migration logic can be rolled back byte-for-byte. Exact rollback
+requires the release-pinned code that produced the pre-upgrade schema, while the
+operations ledger remains forward-only so newer incident evidence is not lost.
+
 Caller-selected generated outputs pass a separate artifact boundary before
 work begins. Project-local artifacts must stay under `data/` while remaining
 outside DuckDB, operations, maintenance, raw, paper, and backup state; symlink
@@ -204,12 +228,103 @@ exception to the general paper-directory exclusion: they must stay under
 existing document kind, paper account, and decision date. Direct library calls
 remain outside this CLI path policy.
 
-The incident-history, incident-detail, notification-history,
-notification-detail, and email-status commands apply the same fail-closed
+The `alerts`, `alert-show`, `notifications`, `notification-show`, `anomalies`,
+`anomaly-show`, and `email-status` commands apply the same fail-closed
 principle to SQLite. They require the current schema and a checkpointed ledger,
 then open it with `mode=ro`, `immutable=1`, and `query_only`. Inspection never
 runs schema DDL, changes journal mode, or updates the database merely to show
 status.
+
+### Governed data-quality review boundary
+
+Anomaly review is an operations workflow, not an analytical repair path. The
+first rule bundle compares accepted SEC fundamentals coverage with the exact
+reviewed U.S. universe and issuer identities for one decision date. The
+detector opens DuckDB read-only and resolves the exact ingest run, raw snapshot,
+payload checksum, parser provenance, and issuer subject for each finding. A
+missing, conflicting, or tampered required source boundary withholds the
+complete scan. It never fills a value, advances readiness, or converts a
+warning into an accepted research fact.
+
+Coverage has two explicit proof paths. Newly ingested rows must carry complete,
+all-or-none run, Company Facts snapshot, canonical row-set, and canonical row
+lineage. Legacy rows without those fields are eligible only when the detector
+replays the exact Company Facts bytes, verifies Company Facts/Submissions CIK
+identity, and proves equality between the decision-date provider row set and
+the stored issuer row set. That compatibility path is read-only and never
+backfills inferred lineage. Both paths admit a successful ingest, or the
+narrow accepted warning with positive inserted rows whose rejected rows had
+`period_end` after filing date. Zero-row and all other warning outcomes do not
+establish coverage.
+
+The comparison has two explicit modes:
+
+- `anomaly-scan --preview` constructs the complete source-bound scan in memory,
+  leaves both DuckDB and the operations ledger unchanged, does not acquire the
+  project maintenance lease, and does not create or update its lock file.
+- `anomaly-scan --record` writes the immutable scan, appends lifecycle events,
+  and reconciles only fingerprint-deduplicated current cases in the independent
+  operations SQLite ledger. It does not change DuckDB, raw evidence, proposal,
+  trial, paper-account, or broker state.
+
+Operations schema v6 contains append-protected `anomaly_scans`, current
+`anomaly_cases`, and append-only `anomaly_case_events` beside the existing
+incident and notification truth. The first `--record` against a schema-v4
+ledger performs this supported additive migration. It creates empty anomaly
+tables without inventing historical scans, backfilling cases, or changing the
+v4 incident/notification contract; read-only anomaly views fail closed until
+the migration occurs. When schema-v5 anomaly tables already exist, the v6
+migration preserves every scan, case, and event and deterministically fills
+only a missing `event_sequence` from the existing append row order. This is a
+structural ordering migration, not a semantic backfill of historical anomaly
+observations or decisions. Each case retains old/new values, severity,
+confidence, source evidence, suggested checks, rule version, owner, occurrence
+count, and the latest evidence hash. Every scan separates the provider
+`source_boundary_at` from its ledger `recorded_at` and carries an immutable
+monotonic record sequence. SEC source-boundary policy v2 computes
+`source_boundary_at` as the maximum receipt time of only the exact snapshots
+actually consumed to prove coverage plus the selected warnings used for missing
+issuers; unrelated or newer global ingest activity cannot advance it. The
+ledger permits exactly one audited, one-way transition from a matching legacy
+implicit-global v1 scan to a consumed-snapshot v2 scan even if that correction
+produces an earlier boundary. The exception requires the same SEC rule bundle
+and scope, exact v1/v2 policy signatures, the v2 consumed-snapshot maximum
+proof, and a zero-write safety contract. A v2 scan cannot use the exception
+against another v2 scan, so same-policy boundary regressions remain blocked.
+Repeated identical scans are idempotent; changed evidence is auditable, and a
+later recurrence with changed evidence can reopen a resolved case.
+
+Acknowledgement-first is the recommended ownership workflow. Acknowledgement
+requires a named owner, audit note, and the exact evidence hash shown during
+inspection. Direct resolution is also permitted with those same three fields.
+The compare-and-set hash makes stale operator decisions fail visibly. Exact
+retries return the existing lifecycle result without appending duplicate
+events; retries with different content fail closed. Outcomes are limited to
+`accepted`,
+`source_corrected`, `mapping_corrected`, `false_positive`, or `deferred`. A
+corrected-source or corrected-mapping disposition requires a later complete
+same-scope scan: it must be recorded after the finding, carry a distinct
+source-boundary hash with a non-earlier source-boundary time, run the exact
+rule, omit the fingerprint, and bind its clearance to a source-provenanced
+accepted SEC ingest with positive verified rows. Before every case read or
+mutation, the lifecycle verifier replays the immutable ordered events and
+requires owner, state, disposition, timestamps, severity, occurrence count,
+and scan/evidence pointers to equal the mutable case projection. Deferral
+requires a future review time and stays unresolved. These state changes never
+authorize a data edit or waive readiness. The dashboard and the
+`anomalies`/`anomaly-show` commands consume the same immutable reader and expose
+no inline mutation or execution control.
+
+The legacy v1-to-v2 boundary transition is a scan-recording compatibility rule,
+not a correction-clearance shortcut: a verification scan for
+`source_corrected` or `mapping_corrected` must still have a non-earlier source
+boundary than its finding.
+
+This is a local structural-integrity boundary, not remote attestation. It
+trusts the released AIOS code and the operating system's filesystem and access
+controls. It detects an inconsistent direct database edit; it cannot
+cryptographically defend against a privileged actor who can replace the
+verifier, ledger, and local source evidence together.
 
 Runtime root resolution is distribution-safe. A source or installed CLI first
 discovers the AIOS workspace from the current directory and its parents; an
@@ -218,6 +333,21 @@ never treats the wheel or `site-packages` directory as the data root. The
 Streamlit launcher uses the dashboard module shipped beside the installed CLI
 while keeping its working directory and governed data paths at the resolved
 workspace.
+
+Release artifacts have a separate source-to-wheel acceptance boundary. The
+candidate verifier snapshots the reviewed package tree, refuses source changes
+during review, and requires the wheel to contain exactly the expected package
+assets and distribution files with no duplicate, unsafe, symlinked, missing,
+unexpected, or byte-stale member. `METADATA` must reproduce the project name,
+version, `Requires-Python`, every `Requires-Dist`, and the optional-extra set
+from `pyproject.toml`; the console entry point must remain
+`aios = aios.cli:main`. `WHEEL` must declare the reviewed pure-Python
+`py3-none-any` contract. `RECORD` must cover every archive member with its exact
+SHA-256 digest and byte size, except its required empty self-entry. The default
+verification path finally installs the candidate with `--no-deps` into a new
+temporary virtual environment and smoke-tests imports, bundled UI/risk
+resources, and `aios --help`. This is a candidate gate, not evidence that an
+unverified or stale `dist/` artifact is current.
 
 The local UI deliberately remains Streamlit. The 2026-07-28 product review used
 the [CopyUI component catalog](https://copyui.com/components) for component
@@ -293,12 +423,37 @@ connection, and managed writers have a bounded five-minute lock wait. This
 secondary database wait protects brief reader overlap after scheduled writers
 have already queued, preserving DuckDB's single-writer constraint without
 requiring the dashboard to be closed for normal scheduled updates. Restore
-still requires the dashboard to be closed. `aios restore-drill` exercises the
-confirmed restore path inside a disposable project, opens and validates the
-recovered DuckDB, and replays every registered raw snapshot without changing
-the live database, paper state, operations ledger, or raw archive. The July 25
-drill passed against a non-empty 1,542-file backup. EOD adapters cap accepted
-rows at the latest completed New York session plus a conservative 30-minute
+still requires the dashboard to be closed. Confirmed restore copies the complete
+candidate into an isolated project-shaped staging tree before a safety backup,
+operations incident, raw publication, or live paper/database swap. That
+pre-swap gate requires exact application-version compatibility, an openable
+DuckDB with no hard data-quality failure, checksum/schema-valid account,
+proposal, and active/archived forward-trial envelopes, consistent active
+trial/account/proposal references, and replay of every registered raw snapshot;
+immutable raw merge conflicts are also rejected before publication.
+`aios restore-drill` exercises this same confirmed restore path inside a
+disposable project without changing the live database, paper state, operations
+ledger, or raw archive. The July 25 drill passed against a non-empty 1,542-file
+backup.
+
+Raw evidence publication is descriptor-relative and no-overwrite. Every path
+component is opened from the held project root with directory and no-follow
+flags; temporary files are fsynced and linked into place only if the final
+content address does not exist. Verification rejects traversal, symlink swaps,
+hardlinks, FIFOs, unsupported compression, unreviewed parsed-data parsers and
+incomplete Company Facts rejection evidence. HTTP response streaming, stored
+payloads and decompression are bounded, and replay retains at most one
+decompressed payload at a time. The additive rejection-evidence migration
+replays exact historical Company Facts bytes before recording its schema
+marker, so mutable timestamps cannot create a legacy exemption.
+
+The publication phase is not a cross-filesystem transaction. A later
+filesystem failure uses the pre-restore safety backup and existing paper
+rollback; immutable raw additions and the operations stale-evidence incident
+remain forward-only audit evidence rather than being rolled back.
+
+EOD adapters cap accepted rows at the latest completed New York session plus a
+conservative 30-minute
 free-provider finalization delay rather than the host's local date, preventing
 an India-after-midnight or just-after-close catch-up from accepting a partial
 U.S. daily bar. Container/hosted packaging,
@@ -308,18 +463,18 @@ remain future exit conditions—not capabilities to assume today. The SMTP
 adapter exists, but no external-delivery claim is valid before a real receipt
 test and explicit route/timer activation.
 
-The operations ledger is schema v4. It contains a channel-neutral
-`notification_outbox` and append-only `notification_deliveries` beside incident
-truth. An actionable incident transition and its message copy commit in one
-SQLite transaction, linked by the incident event ID; repeated observations
-without escalation do not create message noise. Claims use exclusive bounded
-five-minute leases, and delivery outcomes distinguish success, pre-send
-temporary failure, permanent failure, and ambiguous provider state. Only
-temporary failures known to occur before acceptance retry deterministically up
-to five attempts. A post-send disconnect or expired worker lease has an unknown
-outcome and becomes operator-visible immediately instead of risking a duplicate.
-Stored provider metadata is allow-listed and redacted rather than preserving
-arbitrary responses.
+The operations ledger is schema v6. Its v4 incident/notification contract
+remains unchanged: a channel-neutral `notification_outbox` and append-only
+`notification_deliveries` sit beside incident truth. An actionable incident
+transition and its message copy commit in one SQLite transaction, linked by the
+incident event ID; repeated observations without escalation do not create
+message noise. Claims use exclusive bounded five-minute leases, and delivery
+outcomes distinguish success, pre-send temporary failure, permanent failure,
+and ambiguous provider state. Only temporary failures known to occur before
+acceptance retry deterministically up to five attempts. A post-send disconnect
+or expired worker lease has an unknown outcome and becomes operator-visible
+immediately instead of risking a duplicate. Stored provider metadata is
+allow-listed and redacted rather than preserving arbitrary responses.
 
 External delivery remains fail-closed. Without an enabled route,
 incident-generated messages enter `held`, which no worker can claim. Every
@@ -345,10 +500,16 @@ The 2026-07-27 live v3-to-v4 migration retained 11 incidents, 50 incident
 events, five job records, three outbox rows, and one local-test delivery with no
 configured route; SQLite integrity and foreign-key checks passed. The installed
 optional worker is disabled, while all three core timers remain enabled.
+The subsequent additive schema-v6 migration retained those records and now
+holds two immutable anomaly scans, three current review cases, and six
+append-only case events. Post-migration SQLite integrity and foreign-key checks
+also pass. A v5-to-v6 upgrade preserves those anomaly records and derives only
+their deterministic event sequence from the pre-existing append order.
 
 `FUTURE_BUILD_PLAN.md` is the sequencing and acceptance companion to this
-architecture. It prioritizes immutable provider snapshots, external notification
-delivery on top of the implemented local incident ledger, and the next
+architecture. It prioritizes immutable provider snapshots, external
+notification delivery on top of the implemented local incident ledger, the
+remaining anomaly rule families after the SEC coverage v1 slice, and the next
 governance milestones after the implemented Proposal Stress Review v1.
 
 ### Reconstructable provider-evidence contract
@@ -407,6 +568,27 @@ builds a later simulation-only baseline, moves the predecessor unchanged into
 the forward-trial archive, and atomically activates the replacement. It refuses
 to replace an unchanged trial and rolls the archive move back if activation
 fails.
+
+An unchanged trial with one expired, unexecuted proposal is a different
+transition. `forward-rollover` defaults to a deterministic, read-only v4
+plan over the exact trial, account, proposal, execution registry, readiness,
+normalized proposal blueprint, successor deadline, policy bundle, archive
+paths, no-fill disposition, and required transaction invariants. Volatile
+preflight time, operations availability, and current blockers remain in the
+observation envelope outside the plan hash. `--write-plan` can publish the plan
+content-addressed under `data/reports`. Activation consumes only that exact
+artifact with its exact SHA and explicit confirmation. It creates and verifies
+a fresh backup, takes the project and fixed-order document locks, repeats
+readiness/operations/deadline/source checks, publishes byte-identical
+predecessor archives and successor outputs write-once, then performs one atomic
+active-trial swap. Checksum-protected append-only phases make an interruption
+recoverable: the confirmed recovery command either verifies the successor or
+removes only exact plan-owned outputs while the predecessor remains
+authoritative. A missed generation window moves to a later certified close; it
+never permits a retrospective fill. The v4 mechanism is implemented; live
+activation remains gate-dependent and must stay blocked until current
+readiness, operations, and deadline checks are clean in a naturally prospective
+window.
 
 DuckDB is intentionally outside the policy checksum. Prices, filings, macro
 vintages, and reviewed membership must continue to advance under their existing
@@ -487,10 +669,10 @@ universe. This prevents one newer SPY row from turning one missing universe edge
 into several misleading downstream 0/0 failures.
 
 As of the 2026-07-29 engineering check, the reviewed current decision close is
-2026-07-27. It has 503
+2026-07-29. It has 503
 dated members and stable identities, 500/503 PIT filing coverage, 503/503
 identity-safe/action-safe price coverage, SPY through the same close, and macro
-releases through 2026-07-27. Research-data readiness passes with zero hard
+releases through 2026-07-29. Research-data readiness passes with zero hard
 database failures and three visible historical-audit warnings. Active trial
 `us-qv-forward-72c4560a442d` has one registered proposal, zero executions, and
 intact forward-policy evidence; recording remains timing-gated and explicitly
@@ -551,6 +733,24 @@ contain internally inconsistent observations; extraction and storage reject
 those rows, validation treats any active copy as a hard failure, and the narrow
 `quarantine-invalid-fundamentals` command moves legacy copies intact to
 `fundamentals_quarantine` instead of destroying their provenance.
+
+Filing time alone is not enough for reproducibility: a fact with an old filing
+date can be accepted by AIOS after an earlier decision was made. The current
+`fundamentals` relation is therefore paired with append-only
+`fundamental_versions`. Each accepted upsert first resolves the current
+projection and then appends that exact post-merge row in the same DuckDB
+transaction. Governed cleanup appends a deletion tombstone before removing a
+projection row, and duplicate incoming economic keys fail atomically. A named
+`fundamental_evidence_generation` captures an immutable maximum version
+sequence. Scalar and universe-batch factor reads can bind to that generation,
+so later inserts and same-key corrections cannot alter the earlier result.
+Legacy projections are seeded transactionally and marked in
+`schema_migrations`; an unmarked partial history or any difference between the
+latest versions and current projection is a hard integrity failure. This v1
+boundary covers fundamental rows only. Its issuer/security routing still uses
+the mutable reference projection. Price, identity, membership, macro, and
+policy generations must be bound before the mechanism is activated for a new
+governed paper policy.
 
 ### Macro release/vintage contract
 
@@ -805,21 +1005,35 @@ Historical GitHub/S&P reference captures created before replay parsers remain
 byte-verifiable but honestly labeled as non-replayable legacy evidence. Every
 future production adapter, including NSE transports, must add its own
 capture/replay contract before crossing the corresponding readiness gate.
+The shared HTTP boundary forces `Accept-Encoding: identity`; provider bytes are
+bounded before capture and compressed deterministically by AIOS. Current bulk
+refreshes also open a per-source circuit after three consecutive transport
+failures, preserving attempted failures while refusing hundreds of identical
+retries; independent refresh areas may still continue.
 
-Large reviewed batches may optionally read fundamentals from a local official
-SEC `companyfacts.zip` via `ingest-reference-batch --companyfacts-zip`. The ZIP
-is opened once and only exact reviewed CIK members are parsed; member presence,
-JSON shape, and embedded CIK must validate before ingestion. The default remains
-the real-time per-CIK Company Facts API because the bulk archive is only updated
-nightly. This optimization changes transport, not identity rules, PIT dates, or
-the separate Submissions metadata request.
+`ingest-reference-batch --companyfacts-zip` is a reserved, fail-closed
+interface. Supplying it currently refuses the operation before reference import
+because bulk archive members do not yet have governed, immutable, run-bound
+source lineage. Reviewed batch ingestion therefore uses the per-CIK Company
+Facts capture path and the separate Submissions metadata request.
+
+`companyfacts-v3-plan --as-of YYYY-MM-DD` is a separate read-only planner over
+already-captured exact Company Facts v2 responses. It bounds reviewed identities
+and observations to the decision date, verifies accepted issuer-scoped ingest
+evidence and the current issuer relation, replays the archived v2 parse and the
+candidate v3 parser, and classifies each issuer without provider access. By
+default it publishes nothing; `--write-plan` creates only a content-addressed
+review artifact under `data/reports/companyfacts_replays/plans`. No v3
+activation path exists in this build, and the planner cannot mutate DuckDB, raw
+snapshots, paper state, or broker state.
 
 Reference import remains one atomic transaction. Data ingestion is isolated per
 accepted issuer and security so a network/provider failure cannot hide or roll
 back successful peers; each failure is reported and logged independently. A
-successful full issuer refresh also atomically removes facts for that same
-`issuer_id` under an obsolete canonical display ticker, preventing duplicate
-PIT rows when SEC's multi-ticker ordering is corrected.
+full issuer refresh must preserve every existing storage key for that
+`issuer_id`; an omitted key fails and rolls back the transaction. No existing
+fact is silently deleted as an obsolete ticker. A future shrinking replacement
+path must add explicit confirmation, backup, and compare-and-set evidence.
 
 `aios universe-coverage` reports member-level availability using the dated
 membership ticker and stable IDs. For reviewed identities it only counts

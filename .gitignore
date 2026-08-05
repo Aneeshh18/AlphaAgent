@@ -2,11 +2,74 @@
 .env
 .env.*
 !.env.example
+!.env.sample
+!.env.template
+!.env.dist
+.streamlit/secrets.toml
+.streamlit/secrets.*.toml
+!.streamlit/secrets.toml.example
+
+# Private keys and local credential stores. Public certificates such as
+# audited *.pem/*.crt files remain eligible; private-key-shaped names do not.
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.ppk
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+private.pem
+private-key.pem
+private_key.pem
+*private-key*.pem
+*private_key*.pem
+*-key.pem
+*_key.pem
+.aws/
+.azure/
+.config/gcloud/
+.config/gh/
+.docker/config.json
+.gnupg/
+.kube/
+.password-store/
+.ssh/
+.terraform.d/
+.git-credentials
+.netrc
+_netrc
+.npmrc
+.pypirc
+pip.conf
+kubeconfig
+credentials
+credentials.json
+credentials.tfrc.json
+application_default_credentials.json
+service-account*.json
+service_account*.json
+token.json
 
 # --- Data artifacts (never commit data; it is huge + often licensed) ---
 data/
 *.duckdb
 *.duckdb.wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.db
+*.db-shm
+*.db-wal
+*.wal
+*.bak
+*.backup
+*.dump
 *.parquet
 *.parquet.tmp
 *.csv
@@ -14,6 +77,13 @@ data/
 
 # Small, audited source manifests are code-like examples, not bulk market data.
 !examples/*.csv
+
+# Explicitly public, synthetic fixtures may exercise runtime formats. The
+# repository metadata verifier still rejects secret-shaped names in this tree.
+!tests/fixtures/public/*.duckdb
+!tests/fixtures/public/*.sqlite
+!tests/fixtures/public/*.sqlite3
+!tests/fixtures/public/*.db
 
 # --- Python ---
 __pycache__/
@@ -39,5 +109,7 @@ venv/
 # --- Project runtime artifacts ---
 logs/
 *.log
+!tests/fixtures/public/*.log
+runtime/
 snapshots/
 backups/

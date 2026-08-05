@@ -24,6 +24,7 @@ from aios.notifications import (
     dispatch_notifications,
 )
 from aios.operations import create_local_backup
+from aios.storage.store import Store
 
 BASE_TIME = datetime(2026, 7, 25, 10, 0, tzinfo=UTC)
 
@@ -123,13 +124,26 @@ def test_incident_lifecycle_enqueues_only_actionable_transitions(tmp_path) -> No
 
     incident = store.emit(_alert(), now=BASE_TIME)
     store.emit(_alert(), now=BASE_TIME + timedelta(minutes=1))
-    store.emit(
+    escalated = store.emit(
         _alert(severity=AlertSeverity.CRITICAL),
         now=BASE_TIME + timedelta(minutes=2),
     )
-    store.acknowledge(incident.incident_id, now=BASE_TIME + timedelta(minutes=3))
-    store.emit(_alert(), now=BASE_TIME + timedelta(minutes=4))
-    store.resolve(incident.incident_id, now=BASE_TIME + timedelta(minutes=5))
+    store.acknowledge(
+        incident.incident_id,
+        actor="ops@example.test",
+        note="Reviewed the escalated incident.",
+        expected_evidence_sha256=escalated.evidence_sha256,
+        now=BASE_TIME + timedelta(minutes=3),
+    )
+    reopened = store.emit(_alert(), now=BASE_TIME + timedelta(minutes=4))
+    store.resolve(
+        incident.incident_id,
+        actor="ops@example.test",
+        note="The producer completed a clean retry.",
+        outcome="verified_recovery",
+        expected_evidence_sha256=reopened.evidence_sha256,
+        now=BASE_TIME + timedelta(minutes=5),
+    )
 
     messages = sorted(
         store.list_notifications(limit=20),
@@ -171,8 +185,15 @@ def test_incident_event_and_outbox_roll_back_together(monkeypatch, tmp_path) -> 
 def test_local_only_incident_policy_persists_through_resolution(tmp_path) -> None:
     store = AlertStore(tmp_path / "alerts.sqlite3")
     incident = store.emit(_alert(notify=False), now=BASE_TIME)
-    store.emit(_alert(), now=BASE_TIME + timedelta(minutes=1))
-    resolved = store.resolve(incident.incident_id, now=BASE_TIME + timedelta(minutes=2))
+    repeated = store.emit(_alert(), now=BASE_TIME + timedelta(minutes=1))
+    resolved = store.resolve(
+        incident.incident_id,
+        actor="ops@example.test",
+        note="The local-only incident is no longer active.",
+        outcome="verified_recovery",
+        expected_evidence_sha256=repeated.evidence_sha256,
+        now=BASE_TIME + timedelta(minutes=2),
+    )
 
     assert resolved.notifications_enabled is False
     assert store.list_notifications() == []
@@ -419,7 +440,7 @@ def test_local_test_channel_delivers_without_network_and_backup_keeps_history(
     database = project / "data" / "aios.duckdb"
     operations = project / "data" / "operations" / "alerts.sqlite3"
     database.parent.mkdir(parents=True)
-    database.write_bytes(b"test database")
+    Store(database).close()
     store = AlertStore(operations)
     message = store.enqueue_notification(_request(), held=False, now=BASE_TIME)
 

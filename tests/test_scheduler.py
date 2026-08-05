@@ -325,12 +325,96 @@ def test_scheduler_status_cli_explains_unverified_runtime(monkeypatch) -> None:
     monkeypatch.setattr(scheduler_module, "user_linger_status", lambda: None)
     monkeypatch.setattr(cli, "_emit_operational_alert", emitted.append)
 
-    result = CliRunner().invoke(cli.app, ["scheduler-status"])
+    result = CliRunner().invoke(
+        cli.app,
+        ["scheduler-status", "--record-incidents"],
+    )
 
     assert result.exit_code == 0
     assert "not verified" in result.output
     assert "did not answer within 5 seconds" in result.output
     assert [alert.code for alert in emitted] == ["scheduler_runtime_unverified"]
+
+
+@pytest.mark.parametrize("runtime_verified", [False, True])
+def test_scheduler_status_report_only_never_mutates_incidents(
+    monkeypatch,
+    runtime_verified: bool,
+) -> None:
+    status = {
+        timer: {
+            "enabled": True,
+            "active": runtime_verified,
+            "last_trigger": "Tue 2026-07-21 08:00:00 IST",
+            "last_run": "Tue 2026-07-21 08:05:00 IST",
+            "next_trigger": "Wed 2026-07-22 08:00:00 IST",
+            "service_result": "success" if runtime_verified else "unverified",
+            "exit_status": "0" if runtime_verified else "unknown",
+            "runtime_verified": runtime_verified,
+        }
+        for timer in TIMER_NAMES
+    }
+    monkeypatch.setattr(scheduler_module, "user_scheduler_status", lambda: status)
+    monkeypatch.setattr(scheduler_module, "user_linger_status", lambda: True)
+    monkeypatch.setattr(
+        cli,
+        "_emit_operational_alert",
+        lambda *_args, **_kwargs: pytest.fail(
+            "report-only scheduler status must not emit incidents"
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_resolve_operational_alert",
+        lambda *_args, **_kwargs: pytest.fail(
+            "report-only scheduler status must not resolve incidents"
+        ),
+    )
+
+    result = CliRunner().invoke(cli.app, ["scheduler-status"])
+
+    assert result.exit_code == 0
+    assert "operating-incident lifecycle was not changed" in result.output
+    if runtime_verified:
+        assert "waiting" in result.output
+    else:
+        assert "not verified" in result.output
+
+
+def test_scheduler_status_explicit_record_resolves_verified_runtime(monkeypatch) -> None:
+    resolved: list[dict[str, dict[str, object]]] = []
+    status = {
+        timer: {
+            "enabled": True,
+            "active": True,
+            "last_trigger": "Tue 2026-07-21 08:00:00 IST",
+            "last_run": "Tue 2026-07-21 08:05:00 IST",
+            "next_trigger": "Wed 2026-07-22 08:00:00 IST",
+            "service_result": "success",
+            "exit_status": "0",
+            "runtime_verified": True,
+        }
+        for timer in TIMER_NAMES
+    }
+    monkeypatch.setattr(scheduler_module, "user_scheduler_status", lambda: status)
+    monkeypatch.setattr(scheduler_module, "user_linger_status", lambda: True)
+    monkeypatch.setattr(
+        cli,
+        "_emit_operational_alert",
+        lambda *_args, **_kwargs: pytest.fail(
+            "verified scheduler status must not emit incidents"
+        ),
+    )
+    monkeypatch.setattr(cli, "_record_scheduler_runtime_recovery", resolved.append)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["scheduler-status", "--record-incidents"],
+    )
+
+    assert result.exit_code == 0
+    assert resolved == [status]
+    assert "Report-only inspection" not in result.output
 
 
 def test_scheduler_cli_requires_confirmation_and_explains_safe_dashboard_overlap(

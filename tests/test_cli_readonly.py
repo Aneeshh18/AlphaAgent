@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 from contextlib import nullcontext
+from datetime import date
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -220,3 +223,152 @@ def test_forward_status_never_mutates_incident_lifecycle(
     result = CliRunner().invoke(cli.app, ["forward-status"])
 
     assert result.exit_code == expected_exit
+
+
+def test_forward_rollover_preview_is_read_only_and_machine_readable(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    store = object()
+    scopes: list[dict] = []
+    captured: dict = {}
+
+    def scoped_store(**kwargs):
+        scopes.append(kwargs)
+        return nullcontext(store)
+
+    def preview(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        print("preview diagnostic")
+        return SimpleNamespace(
+            source_eligible=True,
+            canonical_json=lambda: (
+                '{"document_kind":"aios.forward-rollover-preview","read_only":true}'
+            ),
+        )
+
+    monkeypatch.setattr(cli, "settings", SimpleNamespace(project_root=tmp_path))
+    monkeypatch.setattr(cli, "store_scope", scoped_store)
+    monkeypatch.setattr(
+        cli,
+        "assess_us_readiness",
+        lambda *args, **kwargs: SimpleNamespace(
+            ready=True,
+            to_dict=lambda: {"as_of": "2026-07-29", "ready": True},
+        ),
+    )
+    monkeypatch.setattr(
+        "aios.operator_preflight.assess_operator_preflight",
+        lambda **kwargs: SimpleNamespace(
+            to_envelope=lambda: {
+                "document_kind": "aios.operator_preflight",
+                "checked_at": kwargs["now"].isoformat(),
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "aios.paper.latest_paper_decision_date",
+        lambda value: date(2026, 7, 29) if value is store else None,
+    )
+    monkeypatch.setattr("aios.forward_rollover.preview_forward_rollover", preview)
+    monkeypatch.setattr(
+        "aios.forward_rollover.persist_forward_rollover_plan",
+        lambda *_args, **_kwargs: pytest.fail(
+            "plan persistence requires explicit --write-plan"
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_emit_operational_alert",
+        lambda *_args, **_kwargs: pytest.fail("preview must not emit incidents"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_resolve_operational_alert",
+        lambda *_args, **_kwargs: pytest.fail("preview must not resolve incidents"),
+    )
+
+    result = CliRunner().invoke(cli.app, ["forward-rollover-preview", "--json"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {
+        "document_kind": "aios.forward-rollover-preview",
+        "read_only": True,
+    }
+    assert "preview diagnostic" in result.stderr
+    assert scopes == [{"read_only": True}]
+    assert captured["args"][0] == tmp_path
+    assert captured["kwargs"]["successor_decision_date"] == date(2026, 7, 29)
+    assert captured["kwargs"]["readiness_evidence"]["ready"] is True
+    assert (
+        captured["kwargs"]["operator_preflight_evidence"]["document_kind"]
+        == "aios.operator_preflight"
+    )
+
+
+def test_forward_rollover_preview_writes_only_an_explicit_stable_plan(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    store = object()
+    preview = SimpleNamespace(
+        source_eligible=True,
+        to_envelope=lambda: {
+            "document_kind": "aios.forward-rollover-preview",
+            "read_only": True,
+        },
+    )
+    artifact = (
+        tmp_path
+        / "data/reports/forward_rollovers/plans"
+        / f"{'a' * 64}.json"
+    )
+    captured: list[tuple[Path, object]] = []
+
+    monkeypatch.setattr(cli, "settings", SimpleNamespace(project_root=tmp_path))
+    monkeypatch.setattr(
+        cli,
+        "store_scope",
+        lambda **_kwargs: nullcontext(store),
+    )
+    monkeypatch.setattr(
+        cli,
+        "assess_us_readiness",
+        lambda *args, **kwargs: SimpleNamespace(to_dict=lambda: {"ready": True}),
+    )
+    monkeypatch.setattr(
+        "aios.operator_preflight.assess_operator_preflight",
+        lambda **_kwargs: SimpleNamespace(to_envelope=lambda: {"read_only": True}),
+    )
+    monkeypatch.setattr(
+        "aios.paper.latest_paper_decision_date",
+        lambda value: date(2026, 7, 29) if value is store else None,
+    )
+    monkeypatch.setattr(
+        "aios.forward_rollover.preview_forward_rollover",
+        lambda *_args, **_kwargs: preview,
+    )
+
+    def persist(root: Path, candidate: object) -> Path:
+        captured.append((root, candidate))
+        return artifact
+
+    monkeypatch.setattr(
+        "aios.forward_rollover.persist_forward_rollover_plan",
+        persist,
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["forward-rollover-preview", "--write-plan", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["document_kind"] == "aios.forward-rollover-preview"
+    assert payload["read_only"] is True
+    assert payload["plan_artifact_path"] == (
+        f"data/reports/forward_rollovers/plans/{'a' * 64}.json"
+    )
+    assert captured == [(tmp_path, preview)]

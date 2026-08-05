@@ -34,6 +34,7 @@ from zipfile import BadZipFile, ZipFile, ZipInfo
 from structlog import get_logger
 
 from aios.ingest.http_client import RawSnapshotContext, get_http
+from aios.sec_rejections import SEC_FUNDAMENTAL_REJECTION_CODES
 
 if TYPE_CHECKING:
     from aios.storage.store import Store
@@ -46,7 +47,10 @@ SUBMISSIONS_FILE_URL = "https://data.sec.gov/submissions/{name}"
 FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 COMPANYFACTS_BULK_URL = "https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip"
 COMPANYFACTS_CAPTURE_PARSER_VERSION = "sec-companyfacts-capture-v1"
+COMPANYFACTS_LEGACY_PARSER_VERSION = "sec-companyfacts-v2"
 COMPANYFACTS_PARSER_VERSION = "sec-companyfacts-v2"
+COMPANYFACTS_NEXT_PARSER_VERSION = "sec-companyfacts-v3"
+DEI_ENTITY_SHARES_CONCEPT = "EntityCommonStockSharesOutstanding"
 SUBMISSIONS_CAPTURE_PARSER_VERSION = "sec-submissions-capture-v1"
 SUBMISSIONS_PARSER_VERSION = "sec-submissions-v2"
 COMPANY_TICKERS_CAPTURE_PARSER_VERSION = "sec-company-tickers-capture-v1"
@@ -59,8 +63,7 @@ COMPANY_TICKERS_PARSER_VERSION = "sec-company-tickers-v2"
 CIK_OVERRIDES: dict[str, int] = {"XOM": 34088}
 
 # Curated metric set we care about for factor computation.
-# Maps our canonical metric name → list of XBRL concepts to try (in priority order;
-# first non-null wins — companies report under us-gaap or dei; some use alternate tags).
+# Maps our canonical metric name → list of exact XBRL concepts to try in priority order.
 METRIC_CONCEPTS: dict[str, list[str]] = {
     # Income statement
     "revenue": [
@@ -110,6 +113,14 @@ METRIC_CONCEPTS: dict[str, list[str]] = {
         "PaymentsForDividends",
         "PaymentsOfDividends",
     ],
+}
+
+# Company Facts groups concepts by taxonomy. Concepts default to `us-gaap`;
+# this deliberately narrow override is the only cross-taxonomy selection.
+# Do not add weighted-average share concepts here: they represent a period
+# average and are not a substitute for point-in-time shares outstanding.
+_METRIC_CONCEPT_TAXONOMIES: dict[tuple[str, str], str] = {
+    ("shares_out", DEI_ENTITY_SHARES_CONCEPT): "dei",
 }
 
 
@@ -222,9 +233,7 @@ def _canonical_company_ticker_rows(raw: Any) -> list[dict[str, Any]]:
         try:
             cik = int(cik_value)
         except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"SEC company ticker entry {key!r} has an invalid CIK"
-            ) from exc
+            raise ValueError(f"SEC company ticker entry {key!r} has an invalid CIK") from exc
         if cik <= 0:
             raise ValueError(f"SEC company ticker entry {key!r} has an invalid CIK")
         identity = (ticker, cik, title)
@@ -435,8 +444,7 @@ def _validate_submissions_payload(payload: Any, cik: int) -> dict[str, Any]:
         raise ValueError("SEC Submissions payload has no valid CIK") from exc
     if payload_cik != cik:
         raise ValueError(
-            f"SEC Submissions payload CIK {payload_cik:010d} does not match "
-            f"reviewed CIK {cik:010d}"
+            f"SEC Submissions payload CIK {payload_cik:010d} does not match reviewed CIK {cik:010d}"
         )
     exchanges = payload.get("exchanges")
     if exchanges is not None and not isinstance(exchanges, list):
@@ -517,7 +525,11 @@ def _filing_dates_by_period(submissions: dict[str, Any]) -> dict[str, date]:
     return out
 
 
-def _resolve_concept(units_field: dict[str, Any] | list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _resolve_concept(
+    units_field: dict[str, Any] | list[dict[str, Any]],
+    *,
+    preserve_bucket_unit: bool = False,
+) -> list[dict[str, Any]]:
     """Given a concept's 'units' field, return the flattened raw rows.
 
     EDGAR's structure is: concept['units'] = { '<UNIT>': [ {row}, {row}, ... ] }
@@ -525,21 +537,95 @@ def _resolve_concept(units_field: dict[str, Any] | list[dict[str, Any]]) -> list
     """
     rows: list[dict[str, Any]] = []
     if isinstance(units_field, dict):
-        for _unit, data_rows in units_field.items():
+        for unit, data_rows in units_field.items():
             if isinstance(data_rows, list):
-                rows.extend(data_rows)
+                for raw_row in data_rows:
+                    if not isinstance(raw_row, dict):
+                        continue
+                    row = dict(raw_row)
+                    if preserve_bucket_unit:
+                        row["unit"] = str(unit)
+                    rows.append(row)
     elif isinstance(units_field, list):
         # Defensive fallback for the alternate list-of-buckets shape.
         for bucket in units_field:
             if isinstance(bucket, dict):
-                rows.extend(bucket.get("data", []) or [])
+                data_rows = bucket.get("data", []) or []
+                if not isinstance(data_rows, list):
+                    continue
+                for raw_row in data_rows:
+                    if not isinstance(raw_row, dict):
+                        continue
+                    row = dict(raw_row)
+                    if preserve_bucket_unit and bucket.get("unit") is not None:
+                        row["unit"] = str(bucket["unit"])
+                    rows.append(row)
+    return rows
+
+
+def _exact_instant_share_rows(
+    node: Any,
+    *,
+    taxonomy: str,
+    concept: str,
+) -> list[dict[str, Any]]:
+    """Return exact, accession-bound instant-share observations.
+
+    Both supported outstanding-share concepts are instant facts. Period
+    averages, currency buckets, span rows, and observations without filing
+    identity are unsafe substitutes for the point-in-time market-cap
+    denominator. This strict path is v3-only; v2 replay remains byte-contract
+    compatible.
+    """
+    if not isinstance(node, dict):
+        raise ValueError(f"Company Facts {taxonomy}:{concept} is not an object")
+    units = node.get("units", {})
+    if not isinstance(units, dict):
+        raise ValueError(f"Company Facts {taxonomy}:{concept} units are not an object")
+    provider_rows = units.get("shares", [])
+    if not isinstance(provider_rows, list):
+        raise ValueError(f"Company Facts {taxonomy}:{concept} shares unit is not a row list")
+
+    rows: list[dict[str, Any]] = []
+    seen: dict[tuple[str, str], dict[str, Any]] = {}
+    for provider_row in provider_rows:
+        if not isinstance(provider_row, dict):
+            raise ValueError(f"Company Facts {taxonomy}:{concept} row is not an object")
+        accession = str(provider_row.get("accn") or "").strip()
+        period_end = str(provider_row.get("end") or "").strip()
+        filed = str(provider_row.get("filed") or "").strip()
+        if (
+            not accession
+            or not period_end
+            or not filed
+            or provider_row.get("val") is None
+            or provider_row.get("start") not in (None, "")
+        ):
+            continue
+
+        normalized = {**provider_row, "unit": "shares"}
+        key = (accession, period_end)
+        prior = seen.get(key)
+        if prior is not None:
+            comparison_fields = ("filed", "val", "fp", "fy", "form", "frame")
+            if any(prior.get(field) != normalized.get(field) for field in comparison_fields):
+                raise ValueError(
+                    f"Company Facts {taxonomy}:{concept} conflict within one accession"
+                )
+            continue
+        seen[key] = normalized
+        rows.append(normalized)
     return rows
 
 
 def _merge_concepts(
-    us_gaap: dict[str, Any], concepts: list[str]
+    namespaces: dict[str, dict[str, Any]],
+    metric: str,
+    concepts: list[str],
+    *,
+    taxonomy_aware: bool,
 ) -> tuple[str | None, list[dict[str, Any]]]:
-    """Merge ALL candidate concepts into one de-duplicated row list.
+    """Merge ALL candidate concepts into one provider-row list.
 
     WHY NOT 'pick densest': companies rename XBRL tags over time. Apple reported
     revenue as `SalesRevenueNet` through FY2018, then switched to
@@ -548,20 +634,63 @@ def _merge_concepts(
     year after the rename (2019-2026 gone). Merging all candidates preserves
     full coverage and handles renames transparently.
 
-    A company never reports the SAME (period_end, filed, value) under two
-    different concepts in one filing, so merging by (accn, end, start) dedupes
-    cleanly without double-counting.
+    The active v2 contract retains explicit candidate-concept precedence for the
+    same filing identity. V3 keeps every canonical-unit candidate, annotates its
+    exact taxonomy/concept/accession locator, and lets the storage selector
+    collapse only evidence that agrees on both economics and fiscal semantics.
     """
     seen: set[tuple[str | None, str | None, str | None]] = set()
     merged: list[dict[str, Any]] = []
     used_concept: str | None = None
     for concept in concepts:
-        node = us_gaap.get(concept)
-        if not node:
+        taxonomy = (
+            _METRIC_CONCEPT_TAXONOMIES.get((metric, concept), "us-gaap")
+            if taxonomy_aware
+            else "us-gaap"
+        )
+        node = namespaces[taxonomy].get(concept)
+        if node is None:
             continue
+        if not isinstance(node, dict):
+            raise ValueError(f"Company Facts {taxonomy}:{concept} concept is not an object")
         if used_concept is None:
             used_concept = concept
-        for r in _resolve_concept(node.get("units", {})):
+        if taxonomy_aware and metric == "shares_out":
+            concept_rows = _exact_instant_share_rows(
+                node,
+                taxonomy=taxonomy,
+                concept=concept,
+            )
+        else:
+            concept_rows = _resolve_concept(
+                node.get("units", {}),
+                preserve_bucket_unit=taxonomy_aware,
+            )
+            if taxonomy_aware:
+                expected_unit = _expected_metric_unit(metric)
+                concept_rows = [
+                    row for row in concept_rows if row.get("unit") == expected_unit
+                ]
+        for r in concept_rows:
+            if taxonomy_aware:
+                merged.append(
+                    {
+                        **r,
+                        _SOURCE_FACT_LOCATOR_KEY: {
+                            "taxonomy": taxonomy,
+                            "concept": concept,
+                            "accession": str(r.get("accn") or "").strip(),
+                            "form": str(r.get("form") or "").strip(),
+                            "start": r.get("start"),
+                            "end": r.get("end"),
+                            "filed": r.get("filed"),
+                            "fiscal_period": r.get("fp"),
+                            "fiscal_year": r.get("fy"),
+                            "frame": r.get("frame"),
+                        },
+                    }
+                )
+                continue
             key = (r.get("accn"), r.get("end"), r.get("start"))
             if key in seen:
                 continue
@@ -585,6 +714,196 @@ FLOW_METRICS = {
     "capex",
     "dividends_paid",
 }
+
+PER_SHARE_METRICS = {"eps_basic", "eps_diluted"}
+PERIOD_METRICS = FLOW_METRICS | PER_SHARE_METRICS
+MAX_PERIOD_CONTEXT_DAYS = 400
+_ANNUAL_FACT_FORMS = {
+    "10-K",
+    "10-K/A",
+    "20-F",
+    "20-F/A",
+    "40-F",
+    "40-F/A",
+}
+_INTERIM_FACT_FORMS = {
+    "10-Q",
+    "10-Q/A",
+    "6-K",
+    "6-K/A",
+    "8-K",
+    "8-K/A",
+}
+_SOURCE_FACT_LOCATOR_KEY = "_source_fact_locator"
+_FUNDAMENTAL_STORAGE_KEY_FIELDS = (
+    "cik",
+    "period_end",
+    "as_of_date",
+    "metric",
+)
+
+
+def _expected_metric_unit(metric: str) -> str:
+    """Return the only v3 unit that can feed one canonical factor metric."""
+
+    if metric == "shares_out":
+        return "shares"
+    if metric in PER_SHARE_METRICS:
+        return "USD/shares"
+    return "USD"
+
+
+def _metric_context_rows(
+    metric: str,
+    raw_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Select exact v3 contexts before they can collide in storage.
+
+    Period metrics use the shortest span for a quarterly filing and the longest
+    span for an annual filing, independently for every accession and period
+    end. Instant metrics require an observation without a start date. Every
+    accepted context is accession-bound, uses an explicit supported SEC form,
+    and carries the exact canonical unit. Mixed fiscal metadata and invalid or
+    unreasonable spans are withheld as a complete accession/end group.
+
+    The active v2 replay deliberately bypasses this selector so archived
+    parsed-row checksums remain byte-compatible.
+    """
+
+    expected_unit = _expected_metric_unit(metric)
+    exact_unit = [row for row in raw_rows if row.get("unit") == expected_unit]
+    required = [
+        row
+        for row in exact_unit
+        if row.get("val") is not None
+        and str(row.get("accn") or "").strip()
+        and str(row.get("end") or "").strip()
+        and str(row.get("filed") or "").strip()
+        and str(row.get("form") or "").strip()
+    ]
+    rejected = len(exact_unit) - len(required)
+    if metric not in PERIOD_METRICS:
+        selected = [
+            row
+            for row in required
+            if row.get("start") in (None, "")
+            and str(row["form"]).strip() in (_ANNUAL_FACT_FORMS | _INTERIM_FACT_FORMS)
+        ]
+        return selected, rejected + len(required) - len(selected)
+
+    groups: dict[tuple[str | None, str | None], list[dict[str, Any]]] = {}
+    for row in required:
+        if not str(row.get("fp") or "").strip() or row.get("fy") is None:
+            rejected += 1
+            continue
+        span = _span_days(row)
+        if span is None or span <= 0 or span > MAX_PERIOD_CONTEXT_DAYS:
+            rejected += 1
+            continue
+        groups.setdefault((row.get("accn"), row.get("end")), []).append(row)
+
+    selected: list[dict[str, Any]] = []
+    for group in groups.values():
+        fiscal_contexts = {
+            (
+                str(row.get("fp") or "").strip(),
+                str(row.get("fy")),
+            )
+            for row in group
+        }
+        if len(fiscal_contexts) != 1:
+            rejected += len(group)
+            continue
+        fiscal_period, _fiscal_year = next(iter(fiscal_contexts))
+        annual = fiscal_period == "FY"
+        allowed_forms = _ANNUAL_FACT_FORMS if annual else _INTERIM_FACT_FORMS
+        authoritative = [
+            row
+            for row in group
+            if str(row.get("form") or "").strip() in allowed_forms
+        ]
+        rejected += len(group) - len(authoritative)
+        if not authoritative:
+            continue
+        spanned = [(_span_days(row), row) for row in authoritative]
+        target_span = (
+            max(int(span) for span, _row in spanned)
+            if annual
+            else min(int(span) for span, _row in spanned)
+        )
+        selected.extend(row for span, row in spanned if span == target_span)
+    return selected, rejected
+
+
+def _fundamental_storage_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(row[field] for field in _FUNDAMENTAL_STORAGE_KEY_FIELDS)
+
+
+def _select_metric_storage_rows(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Produce at most one unambiguous v3 row for every database key.
+
+    Repeated filings on one day commonly restate the same fact under identical
+    economics and fiscal semantics. Those rows collapse deterministically while
+    retaining every exact source locator. If the same PIT key disagrees on
+    fiscal period, statement, value, quarter value, or unit, the entire key is
+    withheld rather than letting insertion order choose an answer.
+    """
+
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(_fundamental_storage_key(row), []).append(row)
+
+    selected: list[dict[str, Any]] = []
+    rejected_conflicts = 0
+    for key in sorted(grouped, key=lambda item: tuple(str(value) for value in item)):
+        candidates = grouped[key]
+        economic_values = {
+            (
+                candidate.get("fiscal_period"),
+                candidate.get("statement"),
+                candidate.get("value"),
+                candidate.get("quarter_value"),
+                candidate.get("unit"),
+            )
+            for candidate in candidates
+        }
+        if len(economic_values) != 1:
+            rejected_conflicts += 1
+            continue
+        source_locators = sorted(
+            {
+                json.dumps(
+                    candidate[_SOURCE_FACT_LOCATOR_KEY],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+                for candidate in candidates
+            }
+        )
+        selected_row = min(
+            candidates,
+            key=lambda candidate: json.dumps(
+                candidate,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ),
+        ).copy()
+        selected_row.pop(_SOURCE_FACT_LOCATOR_KEY)
+        selected_row["source_fact_locator"] = json.dumps(
+            [json.loads(locator) for locator in source_locators],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        selected.append(selected_row)
+    return selected, rejected_conflicts
 
 
 def _span_days(r: dict[str, Any]) -> int | None:
@@ -647,19 +966,40 @@ def _single_period_value(raw_rows: list[dict[str, Any]]) -> dict[int, float | No
 def _companyfacts_provider_rows(
     payload: Any,
     cik: int,
-) -> tuple[list[dict[str, Any]], int]:
+    *,
+    taxonomy_aware: bool = False,
+) -> tuple[list[dict[str, Any]], int, int, int]:
     """Parse the identity-neutral, PIT-safe rows consumed from Company Facts."""
     facts = _validate_companyfacts_payload(payload, cik)
-    us_gaap = facts.get("facts", {}).get("us-gaap", {})
+    fact_namespaces = facts["facts"]
+    us_gaap = fact_namespaces.get("us-gaap", {})
     if not isinstance(us_gaap, dict):
         raise ValueError("Company Facts us-gaap namespace is not an object")
+    namespaces = {"us-gaap": us_gaap}
+    if taxonomy_aware:
+        dei = fact_namespaces.get("dei", {})
+        if not isinstance(dei, dict):
+            raise ValueError("Company Facts dei namespace is not an object")
+        namespaces["dei"] = dei
     rows: list[dict[str, Any]] = []
     rejected_future_periods = 0
+    rejected_contexts = 0
 
     for metric, concepts in METRIC_CONCEPTS.items():
-        _concept, raw_rows = _merge_concepts(us_gaap, concepts)
+        _concept, raw_rows = _merge_concepts(
+            namespaces,
+            metric,
+            concepts,
+            taxonomy_aware=taxonomy_aware,
+        )
         if not raw_rows:
             continue
+
+        if taxonomy_aware:
+            raw_rows, context_rejections = _metric_context_rows(metric, raw_rows)
+            rejected_contexts += context_rejections
+            if not raw_rows:
+                continue
 
         qmap: dict[int, float | None] = {}
         if metric in FLOW_METRICS:
@@ -693,33 +1033,158 @@ def _companyfacts_provider_rows(
             if quarter_value is None and metric not in FLOW_METRICS:
                 quarter_value = float(value)
 
-            rows.append(
-                {
-                    "cik": _cik_zero_padded(cik),
-                    "period_end": period_end.isoformat(),
-                    "as_of_date": as_of.isoformat(),
-                    "fiscal_period": fiscal_period,
-                    "statement": _statement_for(metric),
-                    "metric": metric,
-                    "value": float(value),
-                    "quarter_value": quarter_value,
-                    "unit": raw_row.get("unit", "USD"),
-                    "source": "edgar",
-                }
-            )
+            provider_row = {
+                "cik": _cik_zero_padded(cik),
+                "period_end": period_end.isoformat(),
+                "as_of_date": as_of.isoformat(),
+                "fiscal_period": fiscal_period,
+                "statement": _statement_for(metric),
+                "metric": metric,
+                "value": float(value),
+                "quarter_value": quarter_value,
+                "unit": raw_row.get("unit", "USD"),
+                "source": "edgar",
+            }
+            if taxonomy_aware:
+                provider_row[_SOURCE_FACT_LOCATOR_KEY] = raw_row[
+                    _SOURCE_FACT_LOCATOR_KEY
+                ]
+            rows.append(provider_row)
 
-    return rows, rejected_future_periods
+    rejected_storage_conflicts = 0
+    if taxonomy_aware:
+        rows, rejected_storage_conflicts = _select_metric_storage_rows(rows)
+    return (
+        rows,
+        rejected_future_periods,
+        rejected_contexts,
+        rejected_storage_conflicts,
+    )
 
 
 def parse_sec_companyfacts_response(payload: bytes) -> list[dict[str, Any]]:
-    """Replay canonical fundamentals from exact SEC Company Facts bytes."""
+    """Replay the currently active v2 Company Facts contract."""
+    rows, _metadata = replay_sec_companyfacts_response(
+        payload,
+        parser_version=COMPANYFACTS_PARSER_VERSION,
+    )
+    return rows
+
+
+def replay_sec_companyfacts_response(
+    payload: bytes,
+    *,
+    parser_version: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Replay one explicit parser and return its structured withholding proof."""
+
     decoded = _decode_json_object(payload, "SEC Company Facts")
     try:
         cik = int(decoded["cik"])
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("Company Facts payload has no valid CIK") from exc
-    rows, _rejected_future_periods = _companyfacts_provider_rows(decoded, cik)
+    if parser_version == COMPANYFACTS_PARSER_VERSION:
+        taxonomy_aware = False
+    elif parser_version == COMPANYFACTS_NEXT_PARSER_VERSION:
+        taxonomy_aware = True
+    else:
+        raise ValueError(
+            f"unsupported SEC Company Facts parser version: {parser_version}"
+        )
+    (
+        rows,
+        rejected_future_periods,
+        rejected_contexts,
+        rejected_storage_conflicts,
+    ) = _companyfacts_provider_rows(
+        decoded,
+        cik,
+        taxonomy_aware=taxonomy_aware,
+    )
+    metadata = {
+        "parser_version": parser_version,
+        "rows_rejected_future_period": rejected_future_periods,
+        "rows_rejected_context": rejected_contexts,
+        "rows_rejected_storage_conflict": rejected_storage_conflicts,
+    }
+    metadata["rejection_codes"] = _fundamental_rejection_codes(metadata)
+    metadata["rows_rejected"] = (
+        rejected_future_periods
+        + rejected_contexts
+        + rejected_storage_conflicts
+    )
+    return rows, metadata
+
+
+def parse_sec_companyfacts_response_v2(payload: bytes) -> list[dict[str, Any]]:
+    """Replay archived v2 rows without applying the dormant v3 repair."""
+    return parse_sec_companyfacts_response(payload)
+
+
+def parse_sec_companyfacts_response_v3(payload: bytes) -> list[dict[str, Any]]:
+    """Replay the reviewed next-policy taxonomy and storage-key policy."""
+    rows, _metadata = replay_sec_companyfacts_response(
+        payload,
+        parser_version=COMPANYFACTS_NEXT_PARSER_VERSION,
+    )
     return rows
+
+
+def canonical_sec_fundamental_row_sha256(row: dict[str, Any]) -> str:
+    """Hash one identity-neutral row exactly as the Company Facts parser emits it."""
+    from aios.raw_snapshots import canonical_parsed_rows_sha256
+
+    canonical = {
+        "cik": _cik_zero_padded(int(row["cik"])),
+        "period_end": str(row["period_end"]),
+        "as_of_date": str(row["as_of_date"]),
+        "fiscal_period": row.get("fiscal_period"),
+        "statement": row.get("statement"),
+        "metric": row["metric"],
+        "value": row.get("value"),
+        "quarter_value": row.get("quarter_value"),
+        "unit": row.get("unit", "USD"),
+        "source": row.get("source", "edgar"),
+    }
+    if row.get("source_fact_locator") is not None:
+        canonical["source_fact_locator"] = row["source_fact_locator"]
+    return canonical_parsed_rows_sha256([canonical])
+
+
+def _fundamental_rejection_summary(metadata: dict[str, Any]) -> tuple[int, str | None]:
+    """Describe every fail-closed Company Facts rejection category."""
+
+    future_periods = int(metadata.get("rows_rejected_future_period") or 0)
+    contexts = int(metadata.get("rows_rejected_context") or 0)
+    storage_conflicts = int(metadata.get("rows_rejected_storage_conflict") or 0)
+    details: list[str] = []
+    if future_periods:
+        details.append(
+            f"rejected {future_periods} row(s) with period_end after filing date"
+        )
+    if contexts:
+        details.append(f"withheld {contexts} unsupported SEC fact context row(s)")
+    if storage_conflicts:
+        details.append(
+            f"withheld {storage_conflicts} ambiguous database storage key(s)"
+        )
+    return future_periods + contexts + storage_conflicts, "; ".join(details) or None
+
+
+def _fundamental_rejection_codes(metadata: dict[str, Any]) -> tuple[str, ...]:
+    """Return the stable machine contract for Company Facts withholding."""
+
+    codes: list[str] = []
+    if int(metadata.get("rows_rejected_future_period") or 0):
+        codes.append("future_period")
+    if int(metadata.get("rows_rejected_storage_conflict") or 0):
+        codes.append("storage_conflict")
+    if int(metadata.get("rows_rejected_context") or 0):
+        codes.append("unsupported_context")
+    result = tuple(sorted(codes))
+    if not set(result) <= SEC_FUNDAMENTAL_REJECTION_CODES:
+        raise AssertionError("unknown SEC fundamental rejection code")
+    return result
 
 
 def extract_fundamentals(
@@ -732,6 +1197,7 @@ def extract_fundamentals(
     snapshot_store: Store | None = None,
     ingest_run_id: str | None = None,
     snapshot_project_root: Path | None = None,
+    companyfacts_parser_version: str = COMPANYFACTS_PARSER_VERSION,
 ) -> tuple[list[dict], dict[str, Any]]:
     """Full extract: return a list of fundamental row dicts (PIT-tagged).
 
@@ -762,54 +1228,85 @@ def extract_fundamentals(
         ),
         cik,
     )
-    provider_rows, rejected_future_periods = _companyfacts_provider_rows(facts, cik)
+    if companyfacts_parser_version == COMPANYFACTS_PARSER_VERSION:
+        taxonomy_aware = False
+    elif companyfacts_parser_version == COMPANYFACTS_NEXT_PARSER_VERSION:
+        taxonomy_aware = True
+    else:
+        raise ValueError(
+            f"unsupported SEC Company Facts parser version: {companyfacts_parser_version}"
+        )
+    (
+        provider_rows,
+        rejected_future_periods,
+        rejected_contexts,
+        rejected_storage_conflicts,
+    ) = _companyfacts_provider_rows(
+        facts,
+        cik,
+        taxonomy_aware=taxonomy_aware,
+    )
+    companyfacts_snapshot_id: str | None = None
+    companyfacts_rowset_sha256: str | None = None
     if fetched_facts and snapshot_store is not None and ingest_run_id is not None:
+        from aios.raw_snapshots import (
+            attach_parsed_rows_evidence,
+            canonical_parsed_rows_sha256,
+        )
+
+        companyfacts_snapshot_id = attach_parsed_rows_evidence(
+            store=snapshot_store,
+            ingest_run_id=ingest_run_id,
+            role="companyfacts",
+            capture_parser_version=COMPANYFACTS_CAPTURE_PARSER_VERSION,
+            parser_version=companyfacts_parser_version,
+            parsed_rows=provider_rows,
+            rows_rejected=(
+                rejected_future_periods
+                + rejected_contexts
+                + rejected_storage_conflicts
+            ),
+            rejection_codes=_fundamental_rejection_codes(
+                {
+                    "rows_rejected_future_period": rejected_future_periods,
+                    "rows_rejected_context": rejected_contexts,
+                    "rows_rejected_storage_conflict": rejected_storage_conflicts,
+                }
+            ),
+        )
+        companyfacts_rowset_sha256 = canonical_parsed_rows_sha256(provider_rows)
+
+    # Fetch Submissions for company metadata and attach its independently
+    # replayable canonical row only after the identity validation succeeds.
+    submissions = fetch_submissions(
+        cik,
+        store=snapshot_store,
+        ingest_run_id=ingest_run_id,
+        project_root=snapshot_project_root,
+    )
+    submissions_rows = _submissions_provider_rows(submissions, cik)
+    if snapshot_store is not None and ingest_run_id is not None:
         from aios.raw_snapshots import attach_parsed_rows_evidence
 
         attach_parsed_rows_evidence(
             store=snapshot_store,
             ingest_run_id=ingest_run_id,
-            role="companyfacts",
-            capture_parser_version=COMPANYFACTS_CAPTURE_PARSER_VERSION,
-            parser_version=COMPANYFACTS_PARSER_VERSION,
-            parsed_rows=provider_rows,
+            role="submissions",
+            capture_parser_version=SUBMISSIONS_CAPTURE_PARSER_VERSION,
+            parser_version=SUBMISSIONS_PARSER_VERSION,
+            parsed_rows=submissions_rows,
         )
+    submissions_meta = submissions_rows[0]
+    facts["_meta"] = {
+        "name": submissions_meta["name"],
+        "sic": submissions_meta["sic"],
+        "sicDescription": submissions_meta["sic_description"],
+        "exchanges": submissions_meta["exchanges"],
+    }
 
-    # Fetch Submissions for company metadata and attach its independently
-    # replayable canonical row only after the identity validation succeeds.
-    submissions_rows: list[dict[str, Any]] | None = None
-    try:
-        submissions = fetch_submissions(
-            cik,
-            store=snapshot_store,
-            ingest_run_id=ingest_run_id,
-            project_root=snapshot_project_root,
-        )
-        submissions_rows = _submissions_provider_rows(submissions, cik)
-    except Exception as exc:
-        log.warning("edgar.submissions_fetch_failed", ticker=ticker, error=str(exc))
-    else:
-        if snapshot_store is not None and ingest_run_id is not None:
-            from aios.raw_snapshots import attach_parsed_rows_evidence
-
-            attach_parsed_rows_evidence(
-                store=snapshot_store,
-                ingest_run_id=ingest_run_id,
-                role="submissions",
-                capture_parser_version=SUBMISSIONS_CAPTURE_PARSER_VERSION,
-                parser_version=SUBMISSIONS_PARSER_VERSION,
-                parsed_rows=submissions_rows,
-            )
-        submissions_meta = submissions_rows[0]
-        facts["_meta"] = {
-            "name": submissions_meta["name"],
-            "sic": submissions_meta["sic"],
-            "sicDescription": submissions_meta["sic_description"],
-            "exchanges": submissions_meta["exchanges"],
-        }
-
-    rows: list[dict] = [
-        {
+    rows: list[dict] = []
+    for row in provider_rows:
+        stored_row = {
             "ticker": ticker,
             "issuer_id": issuer_id,
             "security_id": security_id,
@@ -822,17 +1319,41 @@ def extract_fundamentals(
             "quarter_value": row["quarter_value"],
             "unit": row["unit"],
             "source": row["source"],
+            "source_fact_locator": row.get("source_fact_locator"),
         }
-        for row in provider_rows
-    ]
+        if companyfacts_snapshot_id is not None and issuer_id is not None:
+            stored_row.update(
+                {
+                    "ingest_run_id": ingest_run_id,
+                    "source_snapshot_id": companyfacts_snapshot_id,
+                    "source_rowset_sha256": companyfacts_rowset_sha256,
+                    "source_row_sha256": canonical_sec_fundamental_row_sha256(row),
+                }
+            )
+        rows.append(stored_row)
 
     meta = _extract_company_meta(facts, ticker)
     meta["rows_rejected_future_period"] = rejected_future_periods
+    meta["rows_rejected_context"] = rejected_contexts
+    meta["rows_rejected_storage_conflict"] = rejected_storage_conflicts
+    meta["submissions_row"] = submissions_meta
     if rejected_future_periods:
         log.warning(
             "edgar.future_period_rows_rejected",
             ticker=ticker,
             rows=rejected_future_periods,
+        )
+    if rejected_storage_conflicts:
+        log.warning(
+            "edgar.ambiguous_storage_keys_rejected",
+            ticker=ticker,
+            rows=rejected_storage_conflicts,
+        )
+    if rejected_contexts:
+        log.warning(
+            "edgar.unsupported_fact_contexts_rejected",
+            ticker=ticker,
+            rows=rejected_contexts,
         )
     log.info("edgar.fundamentals_extracted", ticker=ticker, rows=len(rows))
     return rows, meta
@@ -843,6 +1364,7 @@ def ingest_issuer(
     *,
     store: Store | None = None,
     facts_payload: dict[str, Any] | None = None,
+    companyfacts_parser_version: str = COMPANYFACTS_PARSER_VERSION,
 ) -> int:
     """Fetch SEC facts by reviewed issuer/CIK identity, not a current ticker map."""
     from aios.storage.store import get_store
@@ -854,6 +1376,21 @@ def ingest_issuer(
         "edgar:companyfacts-bulk" if facts_payload is not None else "edgar:issuer-cik-history"
     )
     try:
+        if facts_payload is not None:
+            raise RuntimeError(
+                "Unlineaged Company Facts payload ingestion is unavailable; "
+                "capture and verify immutable source evidence before issuer commit."
+            )
+        if companyfacts_parser_version == COMPANYFACTS_NEXT_PARSER_VERSION:
+            raise RuntimeError(
+                "SEC Company Facts v3 live mutation is unavailable in this build; "
+                "use the read-only governed replay planner."
+            )
+        if companyfacts_parser_version != COMPANYFACTS_PARSER_VERSION:
+            raise ValueError(
+                "unsupported SEC Company Facts parser version: "
+                f"{companyfacts_parser_version}"
+            )
         reference = db.issuer_reference(issuer_id)
         if reference is None:
             raise ValueError(f"No reviewed SEC CIK for issuer {issuer_id!r}.")
@@ -874,17 +1411,22 @@ def ingest_issuer(
             "snapshot_store": db,
             "ingest_run_id": run_id,
         }
+        if companyfacts_parser_version != COMPANYFACTS_PARSER_VERSION:
+            extract_kwargs["companyfacts_parser_version"] = companyfacts_parser_version
         if facts_payload is not None:
             extract_kwargs["facts_payload"] = facts_payload
         rows, meta = extract_fundamentals(ticker, cik, **extract_kwargs)
-        rejected = int(meta.get("rows_rejected_future_period") or 0)
-        inserted, stale_labels_removed = db.refresh_issuer_fundamentals(
+        rejected, rejection_error = _fundamental_rejection_summary(meta)
+        rejection_codes = _fundamental_rejection_codes(meta)
+        accepted_status = "success" if rows and not rejected else "warning"
+        accepted_error = rejection_error or (
+            None if rows else "SEC returned no fundamental rows"
+        )
+        inserted, stale_relation_rows_removed = db.commit_issuer_fundamental_ingest(
             rows,
             issuer_id=issuer_id,
             canonical_ticker=ticker,
-        )
-        db.upsert_securities(
-            [
+            security_rows=[
                 {
                     "ticker": ticker,
                     "cik": cik,
@@ -895,41 +1437,45 @@ def ingest_issuer(
                     "market_cap_bucket": None,
                     "sic_code": meta.get("sic_code"),
                 }
-            ]
-        )
-        db.record_ingest(
+            ],
+            submissions_row=meta["submissions_row"],
             run_id=run_id,
             source=ingest_source,
-            table_name="fundamentals",
-            rows_inserted=inserted,
             rows_rejected=rejected,
             started_at=started_at,
-            status="success" if inserted and not rejected else "warning",
-            error=(
-                f"Rejected {rejected} rows with period_end after filing date"
-                if rejected
-                else (None if inserted else "SEC returned no fundamental rows")
-            ),
+            status=accepted_status,
+            error=accepted_error,
+            rejection_codes=rejection_codes,
         )
-        log.info(
-            "edgar.ingest_issuer_done",
-            issuer_id=issuer_id,
-            ticker=ticker,
-            rows=inserted,
-            stale_labels_removed=stale_labels_removed,
-            run_id=run_id,
-        )
-        return inserted
     except Exception as exc:
-        db.record_ingest(
-            run_id=run_id,
-            source=ingest_source,
-            table_name="fundamentals",
-            started_at=started_at,
-            status="failed",
-            error=str(exc),
-        )
+        try:
+            db.record_ingest(
+                run_id=run_id,
+                source=ingest_source,
+                table_name="fundamentals",
+                subject_type="issuer",
+                subject_id=issuer_id,
+                started_at=started_at,
+                status="failed",
+                error=str(exc),
+            )
+        except Exception as outcome_exc:
+            log.error(
+                "edgar.failed_outcome_record_failed",
+                issuer_id=issuer_id,
+                run_id=run_id,
+                error=str(outcome_exc),
+            )
         raise
+    log.info(
+        "edgar.ingest_issuer_done",
+        issuer_id=issuer_id,
+        ticker=ticker,
+        rows=inserted,
+        stale_relation_rows_removed=stale_relation_rows_removed,
+        run_id=run_id,
+    )
+    return inserted
 
 
 def _statement_for(metric: str) -> str:
@@ -981,69 +1527,31 @@ def _extract_company_meta(facts_blob: dict[str, Any], ticker: str) -> dict[str, 
 
 
 def ingest_ticker(ticker: str, cik_map: dict[str, int] | None = None) -> int:
-    """Fetch + store fundamentals for one ticker. Returns rows stored.
-
-    Convenience entrypoint used by the CLI.
-    """
+    """Route a legacy ticker request through one reviewed issuer identity."""
     from aios.storage.store import get_store
 
     store = get_store()
-    started_at = datetime.now()
-    run_id = str(uuid4())
-    ticker_up = ticker.upper()
-    try:
-        if cik_map is None:
-            cik_map = load_ticker_cik_map(store=store, ingest_run_id=run_id)
-        if ticker_up not in cik_map:
-            raise ValueError(f"Ticker {ticker_up} not found in SEC ticker map.")
-        cik = cik_map[ticker_up]
-        rows, meta = extract_fundamentals(
-            ticker_up,
-            cik,
-            snapshot_store=store,
-            ingest_run_id=run_id,
+    ticker_up = str(ticker).strip().upper()
+    if not ticker_up:
+        raise ValueError("ticker cannot be blank")
+    if cik_map is not None:
+        raise RuntimeError(
+            "Direct ticker/CIK-map fundamental ingestion is disabled; "
+            "use a reviewed issuer identity."
         )
-        rejected = int(meta.get("rows_rejected_future_period") or 0)
-        n = store.upsert_fundamentals(rows)
-
-        # Upsert the security row WITH metadata (SIC enables sector detection).
-        store.upsert_securities(
-            [
-                {
-                    "ticker": ticker_up,
-                    "cik": cik,
-                    "name": meta.get("name"),
-                    "exchange": meta.get("exchange"),
-                    "sector": meta.get("sic_description"),
-                    "industry": meta.get("sic_description"),
-                    "market_cap_bucket": None,
-                    "sic_code": meta.get("sic_code"),
-                }
-            ]
+    matches = store.query(
+        """
+        SELECT DISTINCT issuer.issuer_id
+        FROM issuer_master AS issuer
+        JOIN issuer_cik_history AS cik USING (issuer_id)
+        WHERE upper(issuer.canonical_ticker) = ?
+          AND cik.effective_end IS NULL
+        ORDER BY issuer.issuer_id
+        """,
+        (ticker_up,),
+    )
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Ticker {ticker_up} does not resolve to exactly one reviewed active issuer."
         )
-        store.record_ingest(
-            run_id=run_id,
-            source="edgar",
-            table_name="fundamentals",
-            rows_inserted=n,
-            rows_rejected=rejected,
-            started_at=started_at,
-            status="success" if n and not rejected else "warning",
-            error=(
-                f"Rejected {rejected} rows with period_end after filing date"
-                if rejected
-                else (None if n else "SEC returned no fundamental rows")
-            ),
-        )
-        log.info("edgar.ingest_ticker_done", ticker=ticker_up, rows=n, run_id=run_id)
-        return n
-    except Exception as e:
-        store.record_ingest(
-            run_id=run_id,
-            source="edgar",
-            table_name="fundamentals",
-            started_at=started_at,
-            status="failed",
-            error=str(e),
-        )
-        raise
+    return ingest_issuer(str(matches[0]["issuer_id"]), store=store)
