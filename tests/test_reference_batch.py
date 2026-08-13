@@ -236,6 +236,49 @@ def test_stable_reference_batch_uses_current_sec_identity_for_live_endpoint(tmp_
         store.close()
 
 
+def test_stable_reference_batch_accepts_current_completed_session_boundary(tmp_path):
+    today = date.today()
+    start = today - timedelta(days=10)
+    store = Store(tmp_path / "live-completed-endpoint.duckdb")
+    try:
+        _setup_named_security(
+            store,
+            ticker="TST",
+            security_id=SECURITY_ID,
+            start=start.isoformat(),
+            end=today.isoformat(),
+        )
+
+        def current_submissions(_cik: int) -> dict:
+            return {
+                "cik": "1",
+                "name": "Test Corporation",
+                "tickers": ["TST"],
+                "filings": {
+                    "recent": {
+                        "filingDate": [(start - timedelta(days=1)).isoformat()]
+                    }
+                },
+            }
+
+        result = build_stable_reference_batch(
+            ["TST"],
+            universe_id="demo",
+            start=start,
+            end=today,
+            verified_date=today,
+            store=store,
+            sec_records=_sec_records(),
+            submissions_fetcher=current_submissions,
+            price_fetcher=_prices,
+        )
+
+        assert result["accepted"] == 1
+        assert result["rejected"] == 0
+    finally:
+        store.close()
+
+
 def test_stable_reference_batch_rejects_window_beyond_verification_boundary(tmp_path):
     store = Store(tmp_path / "future-window.duckdb")
     try:

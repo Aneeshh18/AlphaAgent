@@ -1,5 +1,9 @@
 # AI Investment OS — beginner guide
 
+> Prefer clicking through the app instead of the terminal? Start with
+> [`DASHBOARD_GUIDE.md`](./DASHBOARD_GUIDE.md) — this guide covers the CLI in
+> full depth, which most people don't need day to day.
+
 ## What this project does
 
 This project collects public financial information about companies, stores it

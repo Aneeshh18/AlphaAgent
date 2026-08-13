@@ -10,8 +10,10 @@ checksum-validated evidence.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -22,6 +24,7 @@ from aios.paper import (
     ACCOUNT_DOCUMENT_KIND,
     PROPOSAL_DOCUMENT_KIND,
     canonical_payload_sha256,
+    document_write_lock,
     read_paper_document,
 )
 
@@ -156,11 +159,28 @@ def replace_drifted_forward_trial(
 
     An unchanged active trial cannot be replaced. The predecessor is moved
     without rewriting its checksum-protected contents, and a failed activation
-    restores it to the active path.
+    restores it to the active path. Holds the same cross-process trial lock
+    `register_forward_proposal` uses, so a restart cannot race a concurrent
+    proposal registration into archiving a version of the trial neither
+    caller actually saw.
     """
     if not confirm:
         raise ValueError("explicit --confirm-restart approval is required")
+    with document_write_lock(path):
+        return _replace_drifted_forward_trial_locked(
+            project_root, path, account_path, proposal_path, now=now, policy_files=policy_files
+        )
 
+
+def _replace_drifted_forward_trial_locked(
+    project_root: Path,
+    path: Path,
+    account_path: Path,
+    proposal_path: Path,
+    *,
+    now: datetime | None,
+    policy_files: tuple[str, ...],
+) -> ForwardTrialReplacement:
     root = Path(project_root).resolve()
     destination = Path(path)
     previous = read_forward_trial(destination)
@@ -277,7 +297,30 @@ def register_forward_proposal(
     *,
     now: datetime | None = None,
 ) -> ForwardTrialDocument:
-    """Append one checksum-verified proposal to an unchanged active trial."""
+    """Append one checksum-verified proposal to an unchanged active trial.
+
+    Holds the trial's cross-process write lock for the full read-modify-write
+    so two concurrent registrations (a CLI call racing a direct-library
+    caller, most concretely) cannot silently lose one appended proposal to
+    the other's `os.replace`. The final write also re-verifies the on-disk
+    trial is byte-identical to what was read at the start of this call —
+    true compare-and-set, not just mutual exclusion, in case a future caller
+    ever bypasses the lock.
+    """
+    with document_write_lock(trial_path):
+        return _register_forward_proposal_locked(
+            project_root, trial_path, account_path, proposal_path, now=now
+        )
+
+
+def _register_forward_proposal_locked(
+    project_root: Path,
+    trial_path: Path,
+    account_path: Path,
+    proposal_path: Path,
+    *,
+    now: datetime | None,
+) -> ForwardTrialDocument:
     root = Path(project_root).resolve()
     trial = read_forward_trial(trial_path)
     files = tuple(trial.payload["policy_files"])
@@ -305,7 +348,12 @@ def register_forward_proposal(
         },
     ]
     updated["updated_at"] = timestamp
-    return _write_forward_document(trial.path, updated, replace=True)
+    return _write_forward_document(
+        trial.path,
+        updated,
+        replace=True,
+        before_replace=lambda: _require_forward_trial_unchanged(trial),
+    )
 
 
 def require_registered_forward_proposal(
@@ -489,11 +537,32 @@ def _proposal_record(
     }
 
 
+def _require_forward_trial_unchanged(expected: ForwardTrialDocument) -> None:
+    """Re-read the live trial and refuse if it changed since `expected` was read.
+
+    A cooperative CLI lease serializes CLI-issued mutations, but it is not a
+    universal transaction: a direct-library caller (a script, a test, a
+    future dashboard write path) that skips the CLI can still race a
+    read-modify-write against this same file. `os.replace` alone is atomic
+    per-call but blind — the second writer silently wins and the first
+    writer's update is lost with no error. This closes that gap the same way
+    `paper.py`'s `_require_document_unchanged` already does for account and
+    proposal documents.
+    """
+    current = read_forward_trial(expected.path)
+    if not hmac.compare_digest(current.payload_sha256, expected.payload_sha256):
+        raise ValueError(
+            "forward trial changed while this update was in progress; "
+            "retry from fresh evidence"
+        )
+
+
 def _write_forward_document(
     path: Path,
     payload: dict[str, Any],
     *,
     replace: bool = False,
+    before_replace: Callable[[], None] | None = None,
 ) -> ForwardTrialDocument:
     destination = Path(path)
     if destination.exists() and not replace:
@@ -512,6 +581,10 @@ def _write_forward_document(
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        if before_replace is not None:
+            before_replace()
+        if destination.exists() and not replace:
+            raise ValueError(f"forward trial already exists: {destination}")
         os.replace(temporary, destination)
     finally:
         if temporary.exists():

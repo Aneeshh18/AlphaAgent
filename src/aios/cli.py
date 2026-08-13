@@ -15,6 +15,8 @@ Commands
   aios verify-backup — verify a backup without restoring it
   aios verify-raw-snapshots — verify immutable provider payloads
   aios review-universe-current — safely roll forward unchanged S&P 500 coverage
+  aios prepare-universe-change — stage evidence and publish an atomic event plan
+  aios activate-universe-change — explicitly commit one reviewed event plan
   aios restore       — confirmed recovery with automatic rollback backup
   aios scheduler-install — enable local refresh/health/backup timers
   aios scheduler-status — show whether local timers are enabled and waiting
@@ -41,7 +43,7 @@ Commands
   aios dashboard     — open the local research dashboard
   aios paper-init    — create a local simulation-only portfolio
   aios forward-freeze — freeze policy/configuration for untouched monitoring
-  aios forward-rollover — preview/publish an exact plan; activation is disabled
+  aios forward-rollover — preview/publish or explicitly activate an exact plan
   aios forward-rollover-recover — reconcile one interrupted rollover attempt
   aios forward-restart — prospectively replace and archive a drifted trial
   aios forward-status — verify the active forward policy has not drifted
@@ -482,7 +484,6 @@ def _record_daily_cycle_recovery(run_id: str) -> None:
             target,
             purpose="paper",
             store=get_store(),
-            today=target,
         )
         latest_event = store.events(context.incident_id, limit=1)[0]
         if (
@@ -1263,6 +1264,124 @@ def review_universe_current() -> None:
         )
 
 
+@app.command("prepare-universe-change")
+@_exclusive_project_operation("prepare-universe-change")
+def prepare_universe_change(
+    actor: Annotated[
+        str,
+        typer.Option(help="Stable operator identity recorded in the immutable plan."),
+    ],
+    event_path: Annotated[
+        Path,
+        typer.Option(help="Reviewed official constituent-event CSV."),
+    ] = Path("examples/sp500_events_verified_2026-07-22_to_2026-08-06.csv"),
+    reference_stem: Annotated[
+        Path,
+        typer.Option(
+            help="Path prefix shared by the reviewed FERG reference batch files."
+        ),
+    ] = Path("examples/sp500_reference_ferg_2026_08"),
+    effective_date: Annotated[
+        str,
+        typer.Option(help="Expected official effective date, YYYY-MM-DD."),
+    ] = "2026-08-05",
+) -> None:
+    """Stage FERG evidence, drill recovery, and publish one immutable plan."""
+    from aios.universe_change_activation import prepare_sp500_constituent_activation
+
+    release_url = (
+        "https://press.spglobal.com/2026-07-31-Ferguson-Enterprises-"
+        "Set-to-Join-S-P-500-and-ADI-Global-Distribution-to-Join-S-P-SmallCap-600"
+    )
+    try:
+        expected = date.fromisoformat(effective_date)
+        result = prepare_sp500_constituent_activation(
+            project_root=settings.project_root,
+            database_path=_project_path(settings.duckdb_path),
+            operations_database_path=_project_path(settings.operations_db_path),
+            application_version=__version__,
+            actor=actor,
+            event_path=_project_path(event_path),
+            reference_stem=_project_path(reference_stem),
+            official_release_url=release_url,
+            expected_effective_date=expected,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Universe-change preparation failed safely:[/red] {exc}")
+        console.print(
+            "No membership, paper account, proposal, simulation, or broker state changed."
+        )
+        raise typer.Exit(code=1) from exc
+    console.print("[bold green]Governed universe-change plan prepared.[/bold green]")
+    console.print(f"Plan: {result.plan_path}")
+    console.print(f"Plan SHA-256: {result.plan_sha256}")
+    console.print(
+        f"Backup: {result.backup.path} ({result.backup.manifest_sha256}); "
+        f"restore drill verified {result.restore_files} file(s) and "
+        f"{result.restore_raw_payloads} raw payload(s)."
+    )
+    console.print(
+        f"FERG prices staged: {result.price_rows}; fundamentals: "
+        f"{result.fundamental_status}."
+    )
+    console.print(
+        "Review the plan, then run activate-universe-change with its exact path, "
+        "SHA-256, actor, and --confirm-activation."
+    )
+
+
+@app.command("activate-universe-change")
+@_exclusive_project_operation("activate-universe-change")
+def activate_universe_change(
+    plan: Annotated[Path, typer.Argument(help="Published activation-plan JSON.")],
+    plan_sha256: Annotated[
+        str,
+        typer.Option("--plan-sha256", help="Exact reviewed plan SHA-256."),
+    ],
+    actor: Annotated[
+        str,
+        typer.Option(help="Operator identity; must equal the plan actor."),
+    ],
+    confirm_activation: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-activation/--no-confirm-activation",
+            help="Required acknowledgement of the bounded live universe mutation.",
+        ),
+    ] = False,
+) -> None:
+    """CAS-check and atomically activate one reviewed constituent event."""
+    from aios.universe_change_activation import activate_sp500_constituent_change
+
+    try:
+        result = activate_sp500_constituent_change(
+            project_root=settings.project_root,
+            database_path=_project_path(settings.duckdb_path),
+            plan_path=_project_path(plan),
+            expected_plan_sha256=plan_sha256,
+            actor=actor,
+            confirm=confirm_activation,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Universe-change activation failed safely:[/red] {exc}")
+        console.print(
+            "The database transaction rolled back; paper and broker state were untouched."
+        )
+        raise typer.Exit(code=1) from exc
+    console.print("[bold green]Constituent change activated atomically.[/bold green]")
+    console.print(f"Activation receipt: {result.activation_id}")
+    console.print(f"Event: {result.event_id}")
+    console.print(
+        f"Coverage: {result.prior_coverage_through} → "
+        f"{result.target_coverage_through}"
+    )
+    console.print(f"After-state SHA-256: {result.after_state_sha256}")
+    console.print(
+        "Disposable activation and rollback proof passed. FERG fundamentals remain "
+        "pending; no paper fill or broker action occurred."
+    )
+
+
 @app.command("restore")
 @_exclusive_project_operation("restore")
 def restore(
@@ -1433,14 +1552,21 @@ def scheduler_status(
                 if state["service_result"] == "success" and state["exit_status"] == "0"
                 else "not run yet"
             )
+        elif state["service_result"] == "running":
+            last_result = "running"
         else:
             last_result = f"failed ({state['service_result']}, exit {state['exit_status']})"
         last_event = state.get("last_run", state["last_trigger"])
         last_run = f"{last_result}; {last_event}" if last_event != "never" else last_result
+        timer_state = (
+            "running"
+            if state["service_result"] == "running"
+            else ("waiting" if state["active"] else "stopped")
+        )
         table.add_row(
             timer,
             "yes" if state["enabled"] else "no",
-            "waiting" if state["active"] else "stopped",
+            timer_state,
             last_run,
             state["next_trigger"],
         )
@@ -1925,6 +2051,27 @@ def anomaly_scan(
             help=("Reviewed comparison date. Defaults to the latest certified research close."),
         ),
     ] = None,
+    rules: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--rule",
+            help=(
+                "Rule id to run; repeat for more than one. Omit for the original "
+                "single SEC-coverage scan. Use --all-rules for every registered rule."
+            ),
+        ),
+    ] = None,
+    all_rules: Annotated[
+        bool,
+        typer.Option("--all-rules", help="Run every registered rule family."),
+    ] = False,
+    factor_model: Annotated[
+        str,
+        typer.Option(
+            "--factor-model",
+            help="Factor model factor_percentile_jump compares (qv or qvml).",
+        ),
+    ] = "qv",
     record: Annotated[
         bool,
         typer.Option(
@@ -1941,6 +2088,17 @@ def anomaly_scan(
     ] = False,
 ) -> None:
     """Detect governed data-quality cases without repairing research data."""
+    if all_rules or rules:
+        _anomaly_scan_multi_rule(
+            as_of=as_of,
+            rules=rules,
+            all_rules=all_rules,
+            factor_model=factor_model,
+            record=record,
+            json_output=json_output,
+        )
+        return
+
     from dataclasses import asdict
 
     from aios.alerts import get_alert_store
@@ -2088,6 +2246,207 @@ def anomaly_scan(
     )
 
 
+def _anomaly_scan_multi_rule(
+    *,
+    as_of: datetime | None,
+    rules: list[str] | None,
+    all_rules: bool,
+    factor_model: str,
+    record: bool,
+    json_output: bool,
+) -> None:
+    """Run one or more of the five v2 library detectors plus the SEC rule.
+
+    Each rule writes into its own ledger scope, so every scan here is recorded
+    (or previewed) independently — one rule's evidence never blocks another's,
+    matching `anomalies.run_detectors()`'s own contract. `coverage_deterioration`
+    and `factor_percentile_jump` each need a baseline from the *previous*
+    comparable measurement: the coverage baseline comes from the ledger's own
+    last recorded scan for that scope, and the factor baseline comes from the
+    separate write-once snapshot store, since a 503-name score map does not
+    fit the ledger's evidence limit.
+
+    Preview mode never opens the operations ledger, matching the legacy
+    single-rule command's contract exactly — even a read risks a first-use
+    schema migration on disk. The cost: previewing `coverage_deterioration` or
+    `factor_percentile_jump` always shows a baseline-free scan, the same shape
+    as a genuine first run, and never previews the comparison a `--record` run
+    would actually make. That trade is stated below rather than left implicit.
+    """
+    from dataclasses import asdict
+
+    from aios import anomalies
+    from aios.alerts import get_alert_store
+    from aios.maintenance import MaintenanceLockBusyError, project_maintenance_lock
+
+    selected = tuple(anomalies.registered_rule_ids()) if all_rules else tuple(rules or ())
+    unknown = [rule_id for rule_id in selected if rule_id not in anomalies.registered_rule_ids()]
+    if unknown:
+        message = f"unknown anomaly rule(s): {sorted(unknown)}"
+        if json_output:
+            console.print_json(
+                json.dumps(
+                    {
+                        "schema_version": "data-quality-anomaly-scan.v2",
+                        "status": "withheld",
+                        "recorded": False,
+                        "error": message,
+                    },
+                    sort_keys=True,
+                )
+            )
+        else:
+            console.print(f"[red]Data-quality scan withheld safely:[/red] {message}")
+        raise typer.Exit(code=1)
+
+    results: list[dict[str, Any]] = []
+    try:
+        operation_guard = (
+            project_maintenance_lock(settings.project_root, operation="anomaly-scan")
+            if record
+            else nullcontext()
+        )
+        with operation_guard, store_scope(read_only=True) as store:
+            decision_date = as_of.date() if as_of is not None else None
+            if decision_date is None:
+                readiness = assess_us_readiness(purpose="historical_research", store=store)
+                if readiness.certified_research_through is None:
+                    raise ValueError(
+                        "no certified research close is available; pass --as-of "
+                        "only after the reviewed universe is initialized"
+                    )
+                decision_date = date.fromisoformat(readiness.certified_research_through)
+
+            alert_store = get_alert_store() if record else None
+            factor_snapshot: dict[str, Any] | None = None
+            for rule_id in selected:
+                scope = anomalies.rule_scope(rule_id)
+                kwargs: dict[str, Any] = {
+                    "store": store,
+                    "as_of": decision_date,
+                    "project_root": settings.project_root,
+                    "rules": (rule_id,),
+                }
+                if rule_id == anomalies.COVERAGE_RULE_ID:
+                    evidence = (
+                        alert_store.latest_anomaly_scan_evidence(scope)
+                        if alert_store is not None
+                        else None
+                    )
+                    kwargs["coverage_baseline"] = (
+                        evidence.get("current_coverage") if evidence else None
+                    )
+                if rule_id == anomalies.FACTOR_RULE_ID:
+                    kwargs["factor_model"] = factor_model
+                    factor_snapshot = anomalies.measure_universe_factor_percentiles(
+                        store=store,
+                        as_of=decision_date,
+                        factor_model=factor_model,
+                    )
+                    kwargs["factor_baseline"] = anomalies.latest_factor_percentile_baseline(
+                        factor_model=factor_model,
+                        before=decision_date,
+                    )
+                (scan,) = anomalies.run_detectors(**kwargs)
+                cases = alert_store.record_anomaly_scan(scan) if record else ()
+                if record and rule_id == anomalies.FACTOR_RULE_ID and factor_snapshot:
+                    with suppress(FileExistsError):
+                        anomalies.record_factor_percentile_baseline(factor_snapshot)
+                results.append({"rule_id": rule_id, "scan": scan, "cases": cases})
+    except MaintenanceLockBusyError as exc:
+        if json_output:
+            console.print_json(
+                json.dumps(
+                    {
+                        "schema_version": "data-quality-anomaly-scan.v2",
+                        "status": "withheld",
+                        "recorded": False,
+                        "error": "another AIOS mutation workflow is running",
+                    },
+                    sort_keys=True,
+                )
+            )
+        else:
+            console.print(
+                f"[yellow]Another AIOS mutation workflow is already running.[/yellow] {exc}"
+            )
+        raise typer.Exit(code=75) from exc
+    except (OSError, RuntimeError, ValueError, duckdb.Error) as exc:
+        if json_output:
+            console.print_json(
+                json.dumps(
+                    {
+                        "schema_version": "data-quality-anomaly-scan.v2",
+                        "status": "withheld",
+                        "recorded": False,
+                        "error": str(exc),
+                    },
+                    sort_keys=True,
+                )
+            )
+        else:
+            console.print(f"[red]Data-quality scan withheld safely:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    payload = {
+        "schema_version": "data-quality-anomaly-scan.v2",
+        "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "status": "recorded" if record else "preview",
+        "recorded": record,
+        "as_of": decision_date.isoformat(),
+        "scans": [
+            {
+                "rule_id": row["rule_id"],
+                "scan_id": row["scan"].scan_id,
+                "scope": row["scan"].scope,
+                "executed_rules": list(row["scan"].executed_rules),
+                "observation_count": len(row["scan"].observations),
+                "evidence": row["scan"].evidence,
+                "observations": [asdict(obs) for obs in row["scan"].observations],
+                "cases": [asdict(case) for case in row["cases"]],
+            }
+            for row in results
+        ],
+        "safety": {
+            "research_data_changed": False,
+            "readiness_overridden": False,
+            "paper_state_changed": False,
+            "broker_action": False,
+        },
+    }
+    if json_output:
+        console.print_json(json.dumps(payload, default=str, sort_keys=True))
+        return
+
+    mode = "Recorded" if record else "Preview"
+    console.rule(f"[bold]{mode} data-quality review scan — {len(results)} rule(s)[/bold]")
+    console.print(f"Reviewed comparison date: {decision_date.isoformat()}")
+    table = Table(title="Findings by rule")
+    table.add_column("rule")
+    table.add_column("scope")
+    table.add_column("findings", justify="right")
+    table.add_column("cases recorded", justify="right")
+    for row in results:
+        table.add_row(
+            row["rule_id"],
+            row["scan"].scope,
+            str(len(row["scan"].observations)),
+            str(len(row["cases"])) if record else "—",
+        )
+    console.print(table)
+    total_findings = sum(len(row["scan"].observations) for row in results)
+    if total_findings == 0:
+        console.print("[green]No data-quality cases were detected by any selected rule.[/green]")
+    elif not record:
+        console.print(
+            "Preview only. Re-run with `--record` to reconcile the independent review ledger."
+        )
+    console.print(
+        "The scan never repairs data, changes readiness, records a paper fill, "
+        "or contacts a broker."
+    )
+
+
 @app.command("companyfacts-v3-plan")
 def companyfacts_v3_plan(
     as_of: Annotated[
@@ -2205,8 +2564,119 @@ def companyfacts_v3_plan(
     else:
         console.print("Preview only. Use --write-plan to publish the exact plan.")
     console.print(
-        "[yellow]Activation is unavailable.[/yellow] No database, provider, "
-        "paper-account, or broker state was changed."
+        "No database, provider, paper-account, or broker state was changed. "
+        "To activate an eligible issuer scope, use companyfacts-v3-prepare "
+        "then companyfacts-v3-activate."
+    )
+
+
+@app.command("companyfacts-v3-prepare")
+@_exclusive_project_operation("companyfacts-v3-prepare")
+def companyfacts_v3_prepare(
+    as_of: Annotated[
+        datetime,
+        typer.Option(
+            "--as-of",
+            formats=["%Y-%m-%d"],
+            help="Decision date bounding reviewed identities and captured evidence.",
+        ),
+    ],
+    issuer_ids: Annotated[
+        list[str],
+        typer.Option(
+            "--issuer-id",
+            help="Reviewed issuer_id to migrate; repeat for more than one. Required.",
+        ),
+    ],
+    actor: Annotated[
+        str,
+        typer.Option(help="Stable operator identity recorded in the immutable plan."),
+    ],
+) -> None:
+    """Verify one explicit issuer scope is v3-eligible, back up, and publish a plan.
+
+    No provider fetch happens: v3 replays the same payload bytes v2 already
+    captured and verified. Refuses before taking a backup if any requested
+    issuer is not currently eligible in the read-only planner.
+    """
+    from aios.companyfacts_v3_activation import prepare_companyfacts_v3_activation
+
+    try:
+        result = prepare_companyfacts_v3_activation(
+            project_root=settings.project_root,
+            database_path=_project_path(settings.duckdb_path),
+            application_version=__version__,
+            as_of=as_of.date(),
+            issuer_ids=issuer_ids,
+            actor=actor,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError, duckdb.Error) as exc:
+        console.print(f"[red]Company Facts v3 preparation refused:[/red] {exc}")
+        console.print("No database, backup, or plan state changed.")
+        raise typer.Exit(code=1) from exc
+    console.print("[bold green]Company Facts v3 activation plan prepared.[/bold green]")
+    console.print(f"Plan: {result.plan_path}")
+    console.print(f"Plan SHA-256: {result.plan_sha256}")
+    console.print(f"Issuers in scope: {', '.join(result.issuer_ids)}")
+    console.print(f"Backup: {result.backup.path} ({result.backup.manifest_sha256})")
+    console.print(
+        "Review the plan, then run companyfacts-v3-activate with its exact "
+        "path, SHA-256, actor, and --confirm-activation."
+    )
+
+
+@app.command("companyfacts-v3-activate")
+@_exclusive_project_operation("companyfacts-v3-activate")
+def companyfacts_v3_activate(
+    plan: Annotated[Path, typer.Argument(help="Published activation-plan JSON.")],
+    plan_sha256: Annotated[
+        str,
+        typer.Option("--plan-sha256", help="Exact reviewed plan SHA-256."),
+    ],
+    actor: Annotated[
+        str,
+        typer.Option(help="Operator identity; must equal the plan actor."),
+    ],
+    confirm_activation: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-activation/--no-confirm-activation",
+            help="Required acknowledgement of the bounded live fundamentals mutation.",
+        ),
+    ] = False,
+) -> None:
+    """Recheck CAS, prove disposable rollback, then atomically activate v3 for the plan."""
+    from aios.companyfacts_v3_activation import activate_companyfacts_v3
+
+    try:
+        result = activate_companyfacts_v3(
+            project_root=settings.project_root,
+            database_path=_project_path(settings.duckdb_path),
+            plan_path=_project_path(plan),
+            expected_plan_sha256=plan_sha256,
+            actor=actor,
+            confirm=confirm_activation,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError, duckdb.Error) as exc:
+        console.print(f"[red]Company Facts v3 activation refused safely:[/red] {exc}")
+        console.print(
+            "The database transaction rolled back; paper and broker state were untouched."
+        )
+        raise typer.Exit(code=1) from exc
+    console.print("[bold green]Company Facts v3 activated atomically.[/bold green]")
+    console.print(f"Activation receipt: {result.activation_id}")
+    console.print(f"Issuers: {', '.join(result.issuer_ids)}")
+    console.print(
+        f"Rows added: {result.counts['added']}, changed: {result.counts['changed']}, "
+        f"removed: {result.counts['removed']}"
+    )
+    console.print(
+        f"Evidence generation: {result.generation_id} "
+        f"(version boundary {result.version_sequence_boundary})"
+    )
+    console.print(
+        "Disposable activation and rollback proof passed. No paper fill or "
+        "broker action occurred."
     )
 
 
@@ -3621,8 +4091,7 @@ def forward_rollover(
         typer.Option(
             "--plan",
             help=(
-                "Dormant future activation contract: canonical content-addressed "
-                "plan artifact. Current builds refuse activation."
+                "Activation contract: canonical content-addressed plan artifact."
             ),
         ),
     ] = None,
@@ -3630,24 +4099,18 @@ def forward_rollover(
         str | None,
         typer.Option(
             "--plan-sha256",
-            help=(
-                "Dormant future activation contract: exact lowercase SHA-256. "
-                "Current builds refuse activation."
-            ),
+            help="Activation contract: exact lowercase SHA-256.",
         ),
     ] = None,
     confirm_rollover: Annotated[
         bool,
         typer.Option(
             "--confirm-rollover",
-            help=(
-                "Dormant future activation confirmation. Current builds refuse "
-                "activation."
-            ),
+            help="Explicitly confirm activation of the exact reviewed plan.",
         ),
     ] = False,
 ) -> None:
-    """Preview/publish a plan; activation is dormant and disabled in this build."""
+    """Preview/publish a plan or explicitly activate its prospective successor."""
 
     activation_fields = (plan is not None, plan_sha256 is not None, confirm_rollover)
     activation_requested = any(activation_fields)
@@ -4056,6 +4519,59 @@ def forward_restart(
     )
 
 
+def _qvml_selecting_composite_computer(tickers, as_of, store, **kwargs):
+    """Select by `qvml_score` while `create_paper_proposal` reads `qv_score`.
+
+    `create_paper_proposal` is frozen `paper.py`: it always reads
+    `row.qv_score`/`row.qv_rank` off whatever `composite_computer` returns,
+    and always calls it with `include_market_factors=False`. Passing this
+    function instead of `compute_composite` itself computes the real QVML
+    sleeves (`include_market_factors=True`, ignoring the caller's False) and
+    then copies each row's already-independently-ranked `qvml_score`/
+    `qvml_rank` onto its `qv_score`/`qv_rank` fields before returning — the
+    exact, sanctioned dependency-injection point `composite_computer` exists
+    for, not an edit to the frozen selection logic itself. `CompositeRow` is
+    an ordinary mutable dataclass, so this is a plain attribute copy, not a
+    hack around immutability.
+    """
+    from aios.factors.composite import compute_composite
+
+    rows = compute_composite(tickers, as_of, store, include_market_factors=True)
+    for row in rows:
+        row.qv_score = row.qvml_score
+        row.qv_rank = row.qvml_rank
+    return rows
+
+
+def _write_factor_model_override_note(proposal_path: Path, *, factor_model: str) -> Path:
+    """Durably declare that a proposal's selection model differs from its own label.
+
+    `create_paper_proposal` hardcodes `payload["strategy"] = "qv"` — that field
+    name is frozen in `paper.py` and cannot be corrected in place without
+    invalidating the proposal's own content hash. This write-once sidecar,
+    named identically plus a suffix, is the honest paper trail: anyone reading
+    the proposal's raw JSON and trusting its `strategy` field alone would be
+    misled, but anyone looking in the same directory would not be.
+    """
+    from aios.artifacts import publish_text_write_once
+    from aios.canonical import canonical_json
+
+    note_path = proposal_path.with_name(proposal_path.name + ".factor_model_override.json")
+    payload = {
+        "proposal_path": str(proposal_path),
+        "declared_strategy_field": "qv",
+        "actual_factor_model": factor_model,
+        "reason": (
+            "create_paper_proposal's payload['strategy'] literal is frozen in "
+            "paper.py and always reads 'qv'; this proposal was actually selected "
+            "using compute_composite's qvml_score via the composite_computer "
+            "injection point, not the payload's own declared strategy."
+        ),
+    }
+    publish_text_write_once(note_path, canonical_json(payload))
+    return note_path
+
+
 @app.command("paper-propose")
 @_exclusive_project_operation("paper-propose")
 def paper_propose(
@@ -4070,6 +4586,13 @@ def paper_propose(
         Path,
         typer.Option("--account", help="Local paper-account JSON path."),
     ] = Path("data/paper/us_qv_sandbox.json"),
+    trial: Annotated[
+        Path,
+        typer.Option(
+            "--trial",
+            help="Checksum-protected forward-trial path this proposal registers against.",
+        ),
+    ] = Path("data/paper/us_qv_forward_trial.json"),
     output: Annotated[
         Path | None,
         typer.Option("--output", help="Dated proposal path; a safe default is generated."),
@@ -4078,6 +4601,18 @@ def paper_propose(
         int,
         typer.Option("--top-n", min=10, max=20, help="Number of simulated holdings."),
     ] = 10,
+    factor_model: Annotated[
+        str,
+        typer.Option(
+            "--factor-model",
+            help=(
+                "Selection model: certified baseline 'qv' or experimental 'qvml'. "
+                "The proposal's own 'strategy' field always reads 'qv' — that field "
+                "name is frozen in paper.py — so a 'qvml' proposal also gets a "
+                "sidecar file declaring the override explicitly."
+            ),
+        ),
+    ] = "qv",
     replace: Annotated[
         bool,
         typer.Option(
@@ -4087,8 +4622,8 @@ def paper_propose(
     ] = False,
 ) -> None:
     """Create a risk-checked research proposal; no trade is performed."""
+    from aios.factors.composite import compute_composite
     from aios.forward import (
-        DEFAULT_FORWARD_RELATIVE_PATH,
         assess_forward_trial,
         read_forward_trial,
         register_forward_proposal,
@@ -4102,6 +4637,12 @@ def paper_propose(
         latest_paper_decision_date,
         read_paper_document,
     )
+
+    if factor_model not in ("qv", "qvml"):
+        console.print(
+            f"[red]Paper proposal refused:[/red] unsupported factor model: {factor_model!r}"
+        )
+        raise typer.Exit(code=1)
 
     try:
         with store_scope(read_only=True) as store:
@@ -4129,7 +4670,7 @@ def paper_propose(
                     raise ValueError("existing proposal belongs to a different paper account")
                 if existing.payload.get("decision_date") != decision_date.isoformat():
                     raise ValueError("existing proposal belongs to a different decision date")
-            trial_path = settings.project_root / DEFAULT_FORWARD_RELATIVE_PATH
+            trial_path = _project_path(trial)
             if trial_path.exists():
                 status = assess_forward_trial(
                     settings.project_root,
@@ -4163,7 +4704,14 @@ def paper_propose(
                 store,
                 top_n=top_n,
                 replace=replace,
+                composite_computer=(
+                    _qvml_selecting_composite_computer
+                    if factor_model == "qvml"
+                    else compute_composite
+                ),
             )
+            if factor_model == "qvml":
+                _write_factor_model_override_note(document.path, factor_model="qvml")
             if trial_path.exists():
                 try:
                     register_forward_proposal(
@@ -4200,6 +4748,12 @@ def paper_propose(
 
     payload = document.payload
     console.rule(f"[bold]U.S. paper proposal — {payload['decision_date']}[/bold]")
+    if factor_model == "qvml":
+        console.print(
+            "[yellow]Selected using experimental QVML, not the certified QV baseline "
+            f"this proposal's own 'strategy' field says.[/yellow] See "
+            f"{document.path.name}.factor_model_override.json."
+        )
     console.print(f"Status: [bold]{payload['status']}[/bold]")
     console.print(f"Proposal: {document.path}")
     console.print(f"Next simulated close: {payload['scheduled_simulation_date']}")
@@ -4489,16 +5043,17 @@ def paper_review(
         Path,
         typer.Option("--account", help="Local paper-account JSON path."),
     ] = Path("data/paper/us_qv_sandbox.json"),
+    trial: Annotated[
+        Path,
+        typer.Option("--trial", help="Checksum-protected forward-trial JSON path."),
+    ] = Path("data/paper/us_qv_forward_trial.json"),
 ) -> None:
     """Project a fill and check every gate without changing the account."""
-    from aios.forward import (
-        DEFAULT_FORWARD_RELATIVE_PATH,
-        require_registered_forward_proposal,
-    )
+    from aios.forward import require_registered_forward_proposal
     from aios.paper import review_paper_proposal_execution
 
     try:
-        trial_path = settings.project_root / DEFAULT_FORWARD_RELATIVE_PATH
+        trial_path = _project_path(trial)
         require_registered_forward_proposal(
             settings.project_root,
             trial_path,
@@ -4572,6 +5127,10 @@ def paper_execute(
         Path,
         typer.Option("--account", help="Local paper-account JSON path."),
     ] = Path("data/paper/us_qv_sandbox.json"),
+    trial: Annotated[
+        Path,
+        typer.Option("--trial", help="Checksum-protected forward-trial JSON path."),
+    ] = Path("data/paper/us_qv_forward_trial.json"),
     confirm_simulated: Annotated[
         bool,
         typer.Option(
@@ -4581,14 +5140,11 @@ def paper_execute(
     ] = False,
 ) -> None:
     """Simulate an approved next-session close after explicit confirmation."""
-    from aios.forward import (
-        DEFAULT_FORWARD_RELATIVE_PATH,
-        require_registered_forward_proposal,
-    )
+    from aios.forward import require_registered_forward_proposal
     from aios.paper import execute_paper_proposal
 
     try:
-        trial_path = settings.project_root / DEFAULT_FORWARD_RELATIVE_PATH
+        trial_path = _project_path(trial)
         require_registered_forward_proposal(
             settings.project_root,
             trial_path,
@@ -4653,9 +5209,13 @@ def paper_status(
         Path,
         typer.Option("--account", help="Local paper-account JSON path."),
     ] = Path("data/paper/us_qv_sandbox.json"),
+    trial: Annotated[
+        Path,
+        typer.Option("--trial", help="Checksum-protected forward-trial JSON path."),
+    ] = Path("data/paper/us_qv_forward_trial.json"),
 ) -> None:
     """Show the local simulated account without requiring DuckDB knowledge."""
-    from aios.forward import DEFAULT_FORWARD_RELATIVE_PATH, assess_forward_trial
+    from aios.forward import assess_forward_trial
     from aios.paper import paper_account_summary
 
     try:
@@ -4671,7 +5231,7 @@ def paper_status(
     console.print(f"Cash: ${summary['cash']:,.2f}")
     console.print(f"Current drawdown: {summary['drawdown']:.2%}")
     console.print(f"Recorded rebalances: {summary['execution_count']}")
-    trial_path = settings.project_root / DEFAULT_FORWARD_RELATIVE_PATH
+    trial_path = _project_path(trial)
     if trial_path.exists():
         try:
             forward = assess_forward_trial(
@@ -4907,7 +5467,12 @@ def refresh_us_current_command(
                 "the JSON summary and ingest audit.[/red]"
             )
         raise typer.Exit(code=1)
-    if result.warnings:
+    actionable_warnings = tuple(
+        warning
+        for warning in result.warnings
+        if warning.kind != "fundamentals_pending"
+    )
+    if actionable_warnings:
         from aios.alerts import Alert, AlertSeverity
 
         _emit_operational_alert(
@@ -4920,8 +5485,10 @@ def refresh_us_current_command(
                 source_job="aios refresh-us-current",
                 payload={
                     "areas": enabled_areas,
-                    "warning_count": len(result.warnings),
-                    "identities": [warning.identity for warning in result.warnings[:25]],
+                    "warning_count": len(actionable_warnings),
+                    "identities": [
+                        warning.identity for warning in actionable_warnings[:25]
+                    ],
                 },
             )
         )
@@ -5998,9 +6565,34 @@ def backtest_qv(
         max=1.0,
         help="Dividend tax rate as a decimal.",
     ),
+    register_experiment: Annotated[
+        bool,
+        typer.Option(
+            "--register-experiment",
+            help=(
+                "Bind this run's exact code/data identity into the experiment "
+                "registry. Requires --output; see --experiment-purpose."
+            ),
+        ),
+    ] = False,
+    experiment_purpose: str = typer.Option(
+        "exploratory",
+        "--experiment-purpose",
+        help="exploratory (default), frozen, or holdout. frozen/holdout require a clean worktree.",
+    ),
+    experiment_notes: Annotated[
+        str | None,
+        typer.Option("--experiment-notes", help="Free-text note stored with the registration."),
+    ] = None,
 ) -> None:
     """Compare QV/QVML policies after explicit costs/taxes and benchmarks."""
     from aios.backtest import TaxPolicy, TransactionCostPolicy, run_qv_policy_backtest
+
+    if register_experiment and output is None:
+        console.print(
+            "[red]Backtest refused:[/red] --register-experiment requires --output"
+        )
+        raise typer.Exit(code=1)
 
     try:
         audit_destination = (
@@ -6213,6 +6805,145 @@ def backtest_qv(
             console.print(f"[red]Backtest output refused:[/red] {exc}")
             raise typer.Exit(code=1) from exc
         console.print(f"[green]Audit artifact:[/green] {audit_path}")
+        if register_experiment:
+            from aios.experiments import register_experiment as register_experiment_fn
+
+            db_path = (
+                settings.duckdb_path
+                if settings.duckdb_path.is_absolute()
+                else settings.project_root / settings.duckdb_path
+            )
+            try:
+                with store_scope(read_only=True) as registration_store:
+                    document = register_experiment_fn(
+                        result=result,
+                        purpose=experiment_purpose,
+                        artifact_path=audit_path,
+                        store=registration_store,
+                        db_path=db_path,
+                        project_root=settings.project_root,
+                        notes=experiment_notes,
+                    )
+            except (OSError, ValueError) as exc:
+                console.print(f"[red]Experiment registration refused:[/red] {exc}")
+                raise typer.Exit(code=1) from exc
+            console.print(
+                f"[green]Registered experiment:[/green] {document['experiment_id']} "
+                f"(purpose={document['purpose']})"
+            )
+
+
+@app.command("list-experiments")
+def list_experiments_command(
+    purpose: Annotated[
+        str | None,
+        typer.Option("--purpose", help="Filter to exploratory, frozen, or holdout."),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit one machine-readable list."),
+    ] = False,
+) -> None:
+    """List registered backtest/factor experiments. Reads only; nothing is changed."""
+    from aios.experiments import list_experiments as list_experiments_fn
+
+    try:
+        documents = list_experiments_fn(purpose=purpose)
+    except ValueError as exc:
+        console.print(f"[red]Could not list experiments:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if json_output:
+        console.print_json(json.dumps(documents, default=str, sort_keys=True))
+        return
+
+    if not documents:
+        console.print("[yellow]No experiments are registered yet.[/yellow]")
+        console.print(
+            "Register one with `aios backtest-qv ... --output PATH --register-experiment`."
+        )
+        return
+
+    table = Table(title="Registered experiments")
+    table.add_column("experiment_id")
+    table.add_column("purpose")
+    table.add_column("recorded_at")
+    table.add_column("factor model")
+    table.add_column("window")
+    table.add_column("dirty", justify="center")
+    for document in documents:
+        parameters = document["parameters"]
+        table.add_row(
+            document["experiment_id"],
+            document["purpose"],
+            str(document["recorded_at"]),
+            str(parameters.get("factor_model")),
+            f"{parameters.get('start')} → {parameters.get('end')}",
+            "yes" if document["git"]["dirty"] else "no",
+        )
+    console.print(table)
+
+
+@app.command("compare-experiments")
+def compare_experiments_command(
+    experiment_ids: Annotated[
+        list[str],
+        typer.Argument(help="Two or more experiment_id values to compare."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit one machine-readable comparison."),
+    ] = False,
+) -> None:
+    """Side-by-side experiment comparison. Never picks a winner or changes state."""
+    from aios.experiments import compare_experiments as compare_experiments_fn
+
+    try:
+        comparison = compare_experiments_fn(experiment_ids)
+    except ValueError as exc:
+        console.print(f"[red]Could not compare experiments:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if json_output:
+        console.print_json(json.dumps(comparison, default=str, sort_keys=True))
+        return
+
+    console.rule("[bold]Experiment comparison[/bold]")
+    if not comparison["comparable_window"]:
+        console.print(
+            "[yellow]These runs cover different date windows; treat differences with "
+            "extra caution.[/yellow]"
+        )
+    if not comparison["comparable_universe"]:
+        console.print("[yellow]These runs use different universes.[/yellow]")
+    if not comparison["comparable_policy"]:
+        console.print(
+            "[yellow]These runs used different named research/market/account policy "
+            "versions (or at least one predates policy-identity tracking).[/yellow]"
+        )
+
+    table = Table(title="Side by side")
+    table.add_column("experiment_id")
+    table.add_column("model")
+    table.add_column("regime cum. return", justify="right")
+    table.add_column("regime max drawdown", justify="right")
+    table.add_column("baseline cum. return", justify="right")
+    for row in comparison["rows"]:
+        def _pct(value: Any) -> str:
+            return "N/A" if value is None else f"{float(value) * 100:.2f}%"
+
+        table.add_row(
+            row["experiment_id"],
+            str(row.get("factor_model")),
+            _pct(row.get("regime_cumulative_return")),
+            _pct(row.get("regime_max_drawdown")),
+            _pct(row.get("baseline_cumulative_return")),
+        )
+    console.print(table)
+    console.print(
+        "[dim]This is a comparison, not a recommendation. Adopting a variant is still "
+        "a deliberate `forward-restart --confirm-restart` after independent review.[/dim]"
+    )
 
 
 def _backtest_ticker_explanations(result, tickers: list[str]) -> list[dict]:

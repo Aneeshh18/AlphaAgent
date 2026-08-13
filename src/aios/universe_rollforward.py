@@ -30,6 +30,7 @@ from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from aios.canonical import canonical_json
 from aios.ingest.http_client import RawSnapshotContext, get_http
 from aios.market_calendar import latest_completed_us_equity_session
 from aios.paper import latest_reviewed_market_close
@@ -44,6 +45,7 @@ NEW_YORK = ZoneInfo("America/New_York")
 MAX_ARCHIVE_PAGES = 10
 ARCHIVE_PAGE_SIZE = 100
 MAX_ARCHIVE_STALENESS_DAYS = 14
+MAX_ACTIVATED_COMPONENT_LAG_DAYS = 7
 MINIMUM_MEMBERS = 450
 MAXIMUM_MEMBERS = 550
 PRESS_ARCHIVE_PARSER_VERSION = "spglobal-press-archive-html-v1"
@@ -179,6 +181,21 @@ def roll_forward_sp500_coverage(
         component_tickers = set(component_by_ticker)
         missing_components = sorted(reviewed_tickers - component_tickers)
         unexpected_components = sorted(component_tickers - reviewed_tickers)
+        activated_component_lag = _accepted_activation_component_lag(
+            db,
+            universe_id=universe_id,
+            target=target,
+            reviewed_tickers=reviewed_tickers,
+            component_tickers=component_tickers,
+            missing_components=missing_components,
+            unexpected_components=unexpected_components,
+        )
+        unresolved_missing_components = (
+            [] if activated_component_lag is not None else missing_components
+        )
+        unresolved_unexpected_components = (
+            [] if activated_component_lag is not None else unexpected_components
+        )
 
         cik_mismatches: list[dict[str, str]] = []
         successor_lineage_matches: list[dict[str, object]] = []
@@ -238,16 +255,24 @@ def roll_forward_sp500_coverage(
             "reviewed_successor_lineage_matches": successor_lineage_matches[:100],
             "future_effective_releases": future_changes[:100],
             "candidate_release_parse_errors": candidate_errors[:100],
+            "accepted_activation_component_lag": activated_component_lag,
         }
         mismatch_count = (
-            len(missing_components)
-            + len(unexpected_components)
+            len(unresolved_missing_components)
+            + len(unresolved_unexpected_components)
             + len(identity_issues)
             + len(cik_mismatches)
         )
         accepted = not blocking_candidates and mismatch_count == 0
         status = "accepted_no_change" if accepted else "blocked_review_required"
-        if accepted and future_changes:
+        if accepted and activated_component_lag is not None:
+            detail = (
+                "No new constituent change is effective through the requested date. "
+                "The independent component file still reflects the exact pre-activation "
+                "set, and its bounded lag is reconciled by an immutable activation "
+                "receipt plus dated post-event holdings evidence."
+            )
+        elif accepted and future_changes:
             detail = (
                 "No constituent change is effective through the requested date and "
                 "no reference drift was found. Future official changes remain pending "
@@ -926,6 +951,95 @@ def _blocked_detail(
     return "; ".join(parts) + ". Manual event review is required; no dates were extended."
 
 
+def _accepted_activation_component_lag(
+    store: Store,
+    *,
+    universe_id: str,
+    target: date,
+    reviewed_tickers: set[str],
+    component_tickers: set[str],
+    missing_components: list[str],
+    unexpected_components: list[str],
+) -> dict[str, object] | None:
+    """Reconcile one short-lived, receipt-proved component-provider lag.
+
+    The independent component file remains the normal current-set gate.  For at
+    most seven calendar days after a governed activation, it may still expose the
+    exact pre-event set.  We accept that lag only when the immutable receipt
+    hashes both complete sets, its event rows explain every difference, and its
+    dated post-event IVV evidence confirms every addition and deletion.  Any
+    extra or missing symbol continues to fail closed.
+    """
+
+    if not missing_components and not unexpected_components:
+        return None
+    rows = store.query(
+        """
+        SELECT activation_id, activation_payload_json
+        FROM universe_constituent_change_activations
+        WHERE universe_id = ? AND status = 'accepted'
+        ORDER BY activated_at DESC, activation_id DESC
+        """,
+        (universe_id,),
+    )
+    for row in rows:
+        try:
+            payload = json.loads(str(row["activation_payload_json"]))
+            receipt = payload["receipt"]
+            changes = payload["change_rows"]
+            reconciliation = payload["post_event_reconciliation"]["review"]
+            effective = date.fromisoformat(str(receipt["effective_date"]))
+            holdings_as_of = date.fromisoformat(str(reconciliation["as_of"]))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            receipt.get("activation_id") != row["activation_id"]
+            or receipt.get("universe_id") != universe_id
+            or receipt.get("status") != "accepted"
+            or not str(receipt.get("policy_version", "")).startswith(
+                "governed-sp500-constituent-activation."
+            )
+            or not effective <= holdings_as_of <= target
+            or (target - effective).days > MAX_ACTIVATED_COMPONENT_LAG_DAYS
+            or _canonical_list_sha256(component_tickers)
+            != receipt.get("before_member_set_sha256")
+            or _canonical_list_sha256(reviewed_tickers)
+            != receipt.get("after_member_set_sha256")
+        ):
+            continue
+        additions = sorted(
+            str(change.get("ticker", "")).upper()
+            for change in changes
+            if isinstance(change, dict) and change.get("action") == "addition"
+        )
+        deletions = sorted(
+            str(change.get("ticker", "")).upper()
+            for change in changes
+            if isinstance(change, dict) and change.get("action") == "deletion"
+        )
+        holdings_tickers = {
+            str(ticker).upper() for ticker in reconciliation.get("tickers", [])
+        }
+        if (
+            not additions
+            or len(additions) != len(deletions)
+            or additions != missing_components
+            or deletions != unexpected_components
+            or not set(additions).issubset(holdings_tickers)
+            or set(deletions) & holdings_tickers
+        ):
+            continue
+        return {
+            "activation_id": str(row["activation_id"]),
+            "effective_date": effective.isoformat(),
+            "holdings_as_of": holdings_as_of.isoformat(),
+            "additions": additions,
+            "deletions": deletions,
+            "lag_days": (target - effective).days,
+        }
+    return None
+
+
 def _reviewed_lineage_ciks(
     store: Store,
     security_ids: list[str],
@@ -960,14 +1074,12 @@ def _set_sha256(values: set[str]) -> str:
     return hashlib.sha256("\n".join(sorted(values)).encode("utf-8")).hexdigest()
 
 
-def _canonical_json(value: object) -> str:
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    )
+def _canonical_list_sha256(values: set[str]) -> str:
+    encoded = _canonical_json(sorted(values)).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+_canonical_json = canonical_json
 
 
 def _aware_utc(value: datetime) -> datetime:

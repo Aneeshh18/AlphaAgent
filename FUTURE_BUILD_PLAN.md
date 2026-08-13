@@ -39,51 +39,109 @@ append-only case events. The optional SMTP timer files are installed and
 native-verified but remain disabled; the three core data/backup timers remain
 enabled.
 
-The 2026-07-30 live read-only research baseline reaches the 2026-07-30 decision
-close: readiness is `READY`, validation has zero failures and three warnings,
-and coverage is 503 members, 500/503 PIT filings, and 503/503 reviewed prices.
-Raw verification passes for 4,252 payloads and 4,424 parsed replays. Backup
-`backups/aios-20260730T092832Z` verifies 4,262 files and passed the production
-non-destructive restore drill with zero hard validation failures. The isolated
-release checkpoint passed the full suite, repository-wide Ruff, bytecode
-compilation, reproducible wheel builds, exact source-to-wheel verification, and
-clean-install smoke. That is historical checkpoint evidence, not proof for the
-changing workspace or a future candidate; each candidate must regenerate the
-complete proof after its source has stabilized.
+The current 2026-08-08 live research baseline reaches the 2026-08-07 decision
+close: readiness is `READY`, validation has zero failures and four warnings,
+and coverage is 503 members with 503/503 PIT filings and reviewed prices.
+The official EA deletion and FERG addition was activated through one
+content-addressed, backup-bound transaction. The immutable receipt binds the
+official event, reviewed reference manifests, before/after membership hashes,
+FERG price evidence and the simulation-only boundary. The activation itself
+did not manufacture fundamentals; a later governed refresh accepted 323 rows
+and withheld 24 ambiguous storage keys.
 
-Company Facts v3 is not part of that certified baseline. The reviewed candidate
-replays 500 payloads, emits 1,119,730 rows, rejects 42 future-period rows,
-withholds 17,860 unsupported-context rows and 26,152 ambiguous storage keys,
-and emits zero duplicate keys. Its disposable database makes 394/503 QV scores
-structurally computable only before freshness and lineage gates. All 1,270,623
-live fundamental rows and the candidate remain unlineaged, leaving zero issuers
-eligible for governed v3 activation. Promotion is blocked until a source-lineaged
-migration, explicit freshness policy, candidate diff, and restore proof pass.
-The new `companyfacts-v3-plan --as-of YYYY-MM-DD` surface can classify already
-captured exact v2 evidence and optionally publish a content-addressed review
-plan. It is read-only, performs no provider fetch, and has no activation path.
+Backup `backups/aios-20260808T085804Z` verifies 8,536 files and 775,651,621
+bytes and passed a disposable restore drill over 7,977 raw payloads and 11,601
+parsed replays. The current release candidate
+passes 1,075 tests, repository-wide Ruff, bytecode compilation, diff whitespace checks,
+byte-identical wheel builds, exact source-to-wheel verification, and
+clean-install smoke. Every later candidate must regenerate this evidence.
 
-Predecessor trial `us-qv-forward-8559d86b6a02` is archived unchanged; it was
-not re-hashed, backdated, or executed. Active trial
-`us-qv-forward-72c4560a442d` started prospectively from the 2026-07-27 close,
-has one registered proposal, and has zero executions. The account remains
-$100,000 simulated cash with zero holdings and no broker connection. On
-2026-07-29 the full read-only paper review passed after the 2026-07-28 close and
-provider finalization. It deliberately produced no execution command and no
-simulation was recorded; the proposal is now expired and remains registered.
-The durable ledger records one successful July 30 job for the July 29 session,
-covering 503 members, 2,515 member-price rows, 98,428 macro rows, and zero job
-warnings. A current normal-session report-only check verifies all three timers
-and the scheduler-runtime incident is resolved. `current_refresh_partial`
-remains open. A later natural cycle exposed contradictory HTTP content-
-encoding metadata across SEC and universe sources; the shared transport now
-forces identity bytes and bulk refresh opens a bounded circuit after three
-consecutive transport errors. A natural recovery run is still required before
-closing the current daily, filing, and scheduler incidents. FDXF and HONA were accepted as explicit zero-row gaps with score
-withholding preserved; the acknowledged XOM case remains unresolved pending
-predecessor-successor evidence. Unattended operations are not currently claimed.
-Repeated natural cycles and a reviewed recovery remain evidence to obtain rather
-than claim in advance.
+Company Facts v3 is not part of that certified baseline. **Re-verified live
+against production on 2026-08-12**, superseding the stale 394/503 figure
+below: `companyfacts-v3-plan --as-of 2026-08-10` now reports **500/500**
+issuers with any accepted evidence pass every lineage check —
+`_current_lineage_matches` verifies `ingest_run_id`, `source_snapshot_id`,
+`source_rowset_sha256`, and per-row `source_row_sha256` all agree with the
+stored evidence, row for row. The remaining 3 S&P 500 members (FDXF, HONA,
+XOM) have no accepted Company Facts evidence at all yet — a pre-existing
+reviewed gap unrelated to v3. **The source-lineaged migration requirement is
+already satisfied; it was not a remaining blocker, the earlier count was
+stale.**
+
+The v2-to-v3 delta is large — 26,356 rows added, 41,794 removed, 326,467
+changed out of ~1.17M, across **all 500** eligible issuers, not a few
+outliers. This is not a bug: `_select_metric_storage_rows` in `edgar.py`
+explains it directly. v2 runs with `preserve_legacy_winner=True`, meaning
+when a filing has genuinely conflicting economics for the same
+(period_end, as_of_date, metric) key, v2 silently keeps the *first* row
+arbitrarily to avoid a duplicate storage key. v3 runs with
+`preserve_legacy_winner=False` and withholds the entire conflicting key
+instead of guessing — the same fail-closed philosophy this codebase applies
+everywhere else. v3 also adds `taxonomy_aware=True` XBRL-taxonomy-aware
+extraction. The size of the delta is the correctness fix becoming visible,
+not evidence of a defect.
+
+**Built 2026-08-12** as `src/aios/companyfacts_v3_activation.py`, mirroring
+`universe_change_activation.py`'s proven pattern exactly:
+`prepare_companyfacts_v3_activation()` verifies an explicit, human-chosen
+issuer scope is fully eligible, takes a fresh verified backup, and publishes
+an immutable content-addressed plan; `activate_companyfacts_v3()` re-verifies
+CAS against freshly recomputed live evidence (rejecting if anything drifted
+since review), proves the exact transaction on a disposable restore of that
+backup before touching anything live, then commits once in one DuckDB
+transaction and writes an append-only receipt to the new
+`companyfacts_v3_activations` table. Mutation reuses the frozen `Store`'s own
+`upsert_fundamentals` (which already versions into `fundamental_versions`)
+for added/changed keys, and tombstones (`is_deleted=TRUE`) a key v3
+correctly withholds that v2 had silently kept — the "future shrinking
+replacement path" `ARCHITECTURE.md` flagged as needing explicit
+confirmation, backup, and compare-and-set evidence. One
+`fundamental_evidence_generations` row pins the resulting `version_sequence`
+boundary per activation. CLI-wired as `companyfacts-v3-prepare` and
+`companyfacts-v3-activate`. No provider fetch anywhere in this path — v3 is
+a re-parse of the same already-captured, already-verified payload bytes v2
+used.
+
+Verified correct end-to-end against a real scratch copy of the production
+database (one real issuer, 68 added / 720 changed / 35 removed, matching the
+plan's predicted counts exactly) and via 6 unit tests covering the happy
+path, confirm/actor/backup/CAS rejections, and an ineligible-issuer refusal.
+
+**Run to completion against the real production universe, 2026-08-12,
+user-directed.** All 500 eligible issuers migrated across 11 activation
+batches (5 + 9×50 + 45): `companyfacts-v3-plan` now reports 0 eligible / 500
+ineligible (all on v3). Batch 10 (the final 45) caught a real bug before it
+touched anything live — three tickers (BG, XOM, BLK) legitimately have two
+different issuer_ids each (a CIK-successor reincorporation event), and
+`fundamentals`' primary key is `(ticker, period_end, as_of_date, metric)`,
+not issuer-scoped. The activation's post-write verification query was
+ticker-only-scoped, so it picked up an unrelated issuer's legacy rows as
+noise and correctly refused inside the disposable-restore-first step, before
+`activate_companyfacts_v3` ever opened the live database. Fixed: an explicit
+pre-write collision guard (refuse if any touched key already belongs to a
+different issuer_id) plus issuer_id-scoped delete/verification queries.
+Re-verified via a scratch-copy repro that no actual key collision existed
+for BG/XOM/BLK (their old/new CIK filing dates don't overlap) — this was a
+false-negative in the safety check, not evidence of real corruption risk,
+but the added guard is now real protection either way. Full 1282-test suite,
+ruff, and frozen-bundle re-checked clean after the fix and again after the
+final batch. The metric-level (not just count-level) candidate-diff report
+remains the one soft gap for future migrations of this kind — the per-issuer
+delta counts already in the plan are what CAS and disposable-proof rely on
+for safety, so this is a reviewability nicety, not a safety gap.
+The `companyfacts-v3-plan --as-of YYYY-MM-DD` surface remains read-only and
+performs no provider fetch or mutation itself; activation is the separate
+`companyfacts-v3-prepare`/`companyfacts-v3-activate` path above.
+
+The expired 2026-07-27 proposal and predecessor trial
+`us-qv-forward-72c4560a442d` are archived byte-identically with a no-fill
+disposition. Active trial `us-qv-forward-ea4fc2788c4d` began prospectively from
+the 2026-08-07 close, has one registered proposal for the 2026-08-10 close and
+has zero executions. The account remains $100,000 simulated cash with zero
+holdings and no broker connection. Daily, filings and backup services all have
+successful terminal runs, the daily producer receipt certifies the exact
+August 7 session, and the operating ledger has no blocker. FDXF, HONA and XOM
+remain explicit reviewed gaps with score withholding preserved.
 
 ## Priority decision
 
@@ -97,21 +155,24 @@ than claim in advance.
 | Backup-first local schema upgrade | **Now — implemented; live run pending lease availability** | Opening a new `Store` must not silently migrate DuckDB or the incident ledger before a recovery point exists | One confirmed command owns the lease, checkpoints without application migration, verifies a complete backup, rehearses on exact copies, hashes every old DuckDB/SQLite relation, applies each migration, and emits a checksum-chained phase journal; exact-attempt recovery is implemented, while defective-code rollback still requires the release-pinned producer |
 | Pre-swap semantic restore gate | **Now — implemented** | Manifest hashes alone cannot prove that a backup can safely become live state | Stage the complete candidate first; require application-version parity, openable/zero-hard-failure DuckDB, valid paper/forward envelopes and active cross-references, full raw replay, and no immutable merge conflict before safety backup or live publication; later publication failures use paper rollback/safety backup while raw additions and the stale incident remain forward-only |
 | Governed artifact publication boundary | **Now — implemented** | A caller-selected output path must never overwrite an account, database, immutable input, backup, or source file | Resolve before work; project artifacts stay under `data/` but outside governed state; refuse symlink/hard-link aliases; atomically publish single files and reviewed batch names without replacement; proposals remain confined to their validated namespace |
-| Final forward-library persistence CAS | **Next intentional policy version** | A cooperative CLI lease is not a universal transaction for arbitrary direct-library callers | Add final trial/proposal identity checks at the forward-library persistence boundaries, then begin a new prospective trial; never rewrite the active trial's hashed policy file in place |
-| Expired-proposal rollover lifecycle | **Now — governed v4 preview and dormant transaction engine implemented; activation disabled** | The unchanged trial has one expired registered proposal and retrospective fills remain forbidden | Stable payload binds exact account/trial/proposal files, execution registry, readiness, proposal blueprint, successor policy, paths and no-fill disposition; keep `available_in_this_build=false` until owner TTL, backup-freshness, retention, writer-coordination and recovery constants are approved, then prove the engine only in a naturally prospective window |
+| Stale backtest artifacts are not comparable | **Documented 2026-08-12; archive or re-run before citing** | An engine revision silently moved the same window's result by 23 points | `qv_sp500_pit_2023-08_2024-12.json` reports +74.2% and `qv_sp500_pit_schema_v4_2023-08_2024-12.json` reports +51.1% for a **byte-identical config** (same window, `top_n`, costs, taxes, universe, 5 completed periods). Root-caused: quality scores are identical for every shared name, but **value scores changed**, and the four names that dropped out (AVGO, NVDA, ORLY, LRCX) had implausible value percentiles in the old run — AVGO scored 85.6 and ORLY 98.2 as *cheap* in April 2024 while trading at premium multiples. The old value factor was defective and accidentally bought the AI trade inside a Quality+Value portfolio; ~23 points of the old "outperformance" came from that bug. **Treat every pre-`schema_v4` backtest artifact as void.** Registered experiments still carry no engine identity, so nothing detects this automatically |
+| Position-weight cap is inert at defaults | **Open — decide intent, low effort** | A risk limit that can never bind gives false assurance | `PortfolioRiskPolicy.maximum_position_weight = 0.1` with `minimum_positions = 10` and an equal-weighted `top_n = 10` puts every position at exactly 1/10 = 0.10, precisely on the cap, so it cannot trigger in the default configuration — confirmed in real artifacts where every audited position reports `target_weight = 0.1`. Either lower the cap, raise `top_n`, or state explicitly that it exists only to bound non-default configurations. The sector cap (0.25) does still bind at 3+ names in one sector and is unaffected |
+| Paper account identity collision | **Open — next intentional policy version; do not hotfix** | Every account `paper-init` creates carries the same hardcoded `account_id`, so the cross-account proposal guard cannot fire | `paper.py:178` hardcodes `"account_id": "us-qv-supervised-sandbox"`, so the check at `paper.py:640` (`proposal.account_id != account.account_id`) is a no-op between any two locally-created accounts: a proposal built for one sandbox can be executed against another and pass validation. Also causes spurious `unregistered proposal exists` drift on a second trial, because `_unregistered_proposal_issues` filters by `account_id`. Derive the ID from the account file identity instead. **`paper.py` is inside the frozen bundle — fixing it drifts every active trial, so it must land in a deliberate policy version alongside a planned restart, never as a standalone hotfix.** Until then, run exactly one paper account/trial |
+| Final forward-library persistence CAS | **Done 2026-08-12** | A cooperative CLI lease is not a universal transaction for arbitrary direct-library callers | `register_forward_proposal`/`replace_drifted_forward_trial` now hold `paper.py`'s cross-process file lock (exposed as public `document_write_lock`) for their full read-modify-write, plus a `before_replace` compare-and-set check mirroring `paper.py`'s own `_require_document_unchanged` pattern exactly — no longer a blind `os.replace`. Both trials drifted as a result (frozen file changed); restart is a separate, not-yet-taken step |
+| Expired-proposal rollover lifecycle | **Now — governed v4 activation live-proven** | Retrospective fills remain forbidden, while expired cycles need a safe successor | Stable plan, explicit confirmation, verified backup, fixed locks, fresh gates, final CAS, byte-identical archives, atomic swap and checksum-chained recovery receipt all passed in a naturally prospective window |
 | Research Fast Path v1 | **Now — implemented** | A 29–33 second cold screen was the main daily research bottleneck | Dashboard-only decision-scoped batch facade, exact QV/QVML scalar parity, 12-query bound, read-only/temp-relation cleanup tests, serialized cold builds, no persistent score cache |
 | Fundamental evidence generations v1 | **Now — row-version and factor-read contract implemented; paper activation deferred** | Filing-date PIT alone cannot prevent a fact accepted later from changing an earlier decision | Version the resolved post-merge projection, tombstone governed deletions, reject duplicate keys, and fail when latest history cannot reconstruct current rows; next pin reference routing, prices, membership, macro and policy, then introduce a complete boundary only in a new prospective paper schema |
 | Recoverable exact-date U.S. daily workflow | **Now — implemented** | Separate timer stamps did not prove a full run survived logout, and benchmark-last ordering could leave identity windows one session behind | SPY first, universe second, members/macro third, exact-date readiness last; durable job lifecycle, restart, startup catch-up, linger, live 503-member proof |
 | Local incident ledger and systemd failure capture | **Now — implemented** | Scheduled and application failures must survive analytical DB lock/open failures | Deduplicated open/repeat/acknowledge/resolve/reopen lifecycle, immutable schema-checked CLI inspection, safe structured service evidence, dashboard history, backup archive |
 | Immutable raw-data snapshots | **Now — active U.S. transport gate implemented** | Provider history can change; later anomaly work needs exact ingest evidence | Active SEC, yfinance, FRED, Treasury and reviewed Tiingo paths capture and replay honestly; backup/restore drill passes; every future adapter needs the same gate |
-| Company Facts v3 governed activation | **Next — read-only planner implemented; activation unavailable** | Higher structural score computability cannot override stale or unlineaged inputs | Use `companyfacts-v3-plan --as-of ...` to review exact captured v2 evidence without fetching or mutation; then add source-lineaged migration, metric freshness, reviewed candidate diff, restore proof, and a separately governed activation contract; zero issuers are eligible today |
+| Company Facts v3 governed activation | **Done — full 500-issuer production migration complete 2026-08-12** | Higher structural score computability cannot override stale or unreviewed inputs | `companyfacts-v3-plan` reviews without mutating; `companyfacts-v3-prepare`/`companyfacts-v3-activate` back up, CAS-verify, prove disposable rollback, then atomically upsert/tombstone into `fundamentals` with append-only `fundamental_versions` history. All 500 eligible issuers migrated across 11 batches; a real shared-ticker (CIK-successor) verification-scoping bug was caught by the disposable-proof step before touching production, then fixed and re-verified |
 | Channel-neutral notification outbox | **Now — implemented** | Channels are replaceable transports, not the source of incident truth | Atomic incident/message writes, stable idempotency, exclusive leases, bounded retries, dead letters, safe attempt audit, local no-network proof, backup/restore coverage |
 | SMTP email delivery adapter | **Implemented; live activation deferred** | The user selected email but deferred setup; destination and credentials still cannot be inferred | Private SMTP config, one exact-route test, owner-confirmed receipt, explicit enable; historical held messages remain quarantined |
 | Governed proposal stress review v1 | **Now — implemented** | Proposal risk should be challenged before adding prediction complexity | CLI and Paper Trial use one registered-proposal CAS service; exact PIT evidence and immutable sources bind every result; mark shocks and the statistical proxy stay separate; missing evidence fails closed |
-| Data-quality anomaly review cases | **Now — SEC coverage v1 implemented** | Suspect changes must be reviewed, never silently repaired | Preview is non-persistent; explicit record creates source-bound deduplicated cases; acknowledgement and disposition are audited; missing evidence withholds; remaining rule families stay gated below |
-| Research experiment registry | **Before new factor experiments** | Prevents accidental cherry-picking and untraceable results | Every run records code/data/policy identity, assumptions, exclusions, metrics, artifacts, and exploratory/frozen/holdout status |
-| Role-based configuration boundaries | **Before hosted or India operation** | Operator actions, research policy, account assumptions, secrets, and data have different change controls | Named policy versions are immutable; policy change starts a new forward trial; secrets are never exported |
-| India adapter foundation | **Before any NSE/BSE ingest** | Market dimensions cannot be bolted onto U.S.-implicit rows safely | Market, exchange, currency, calendar, settlement, action source, benchmark, security type, ISIN, and provider-symbol intervals are first-class and parity-tested |
+| Data-quality anomaly review cases | **Now — SEC coverage v1 plus 6 rule families implemented and CLI-wired** | Suspect changes must be reviewed, never silently repaired | Preview is non-persistent; explicit record creates source-bound deduplicated cases; acknowledgement and disposition are audited; missing evidence withholds; `anomaly-scan --rule/--all-rules/--factor-model` live since the bundle narrowed |
+| Research experiment registry | **Now — implemented and CLI-wired** | Prevents accidental cherry-picking and untraceable results | Every run records code/data/policy identity, assumptions, exclusions, metrics, artifacts, and exploratory/frozen/holdout status; `backtest-qv --register-experiment`, `list-experiments`, `compare-experiments` |
+| Role-based configuration boundaries | **Domains 2-4 built (`policy_domains.py`); India ingest still gated** | Operator actions, research policy, account assumptions, secrets, and data have different change controls | Named policy versions are immutable; policy change starts a new forward trial; secrets are never exported |
+| India adapter foundation | **I1 (market contracts) and I2 (source licensing) complete; blocked on data, not schema** | Market dimensions cannot be bolted onto U.S.-implicit rows safely | Market, exchange, currency, calendar, settlement, action source, benchmark, security type, ISIN, and provider-symbol intervals are first-class and parity-tested; see `INDIA_SOURCE_MATRIX.md` for the open licensing gate on prices and constituent history |
 
 ### Release artifact acceptance
 
@@ -403,12 +464,57 @@ paper/proposal/trial state, or contacts a broker.
 
 Remaining rule families must detect, but never silently correct:
 
-- sudden share-count changes and impossible valuation jumps;
-- duplicate or conflicting filings;
-- abnormal price gaps and split/dividend mismatches;
-- changed ticker/provider mappings;
-- factor percentile jumps;
-- coverage deterioration versus the previous comparable run.
+- ~~sudden share-count changes and impossible valuation jumps~~ — **built** as
+  `share_count_jump@1.0.0`, scope `us-equity-shares:<universe>`;
+- ~~duplicate or conflicting filings~~ — **built** as
+  `conflicting_filings@1.0.0`, scope `us-equity-filings:<universe>`;
+- ~~abnormal price gaps and split/dividend mismatches~~ — **built** as
+  `price_action_mismatch@1.0.0`, scope `us-equity-prices:<universe>`;
+- ~~changed ticker/provider mappings~~ — **built** as `mapping_drift@1.0.0`,
+  scope `us-equity-mappings:<universe>`;
+- ~~factor percentile jumps~~ — **built** as `factor_percentile_jump@1.0.0`,
+  scope `us-equity-factors:<universe>`;
+- ~~coverage deterioration versus the previous comparable run~~ — **built** as
+  `coverage_deterioration@1.0.0`, scope `us-equity-coverage:<universe>`.
+
+Each new family writes into its own ledger scope, so its monotonic
+source-boundary advances independently of the SEC coverage rule and of every
+other family. The built rules refuse to emit a partial scan: incomplete
+corporate-action evidence, absent retained fetch evidence, an out-of-range
+universe, or a baseline from another universe or a later date withholds the
+whole scan rather than reporting a subset. The one deliberate exception is a
+stored non-positive `shares_out`, which is a finding rather than a reason to
+withhold — raising on it withheld all 503 members over 80 historical rows and
+hid the very defect the rule exists to surface. No rule writes to any table.
+
+`factor_percentile_jump` is the one rule with no stored history to read: composite
+scores are computed on demand from point-in-time evidence, and no factor-score
+table exists. `measure_universe_factor_percentiles()` therefore returns the
+snapshot and the caller keeps it to feed the next scan's `baseline`, the same
+contract `coverage_deterioration` uses. The 0-100 score maps stay deliberately
+out of the scan evidence — two 503-entry mappings would not fit the 64 KiB
+limit — so evidence carries a `factor_set_sha256` plus counts. Only members
+scored on both sides are compared: an added or newly withheld member is a
+coverage question, not a factor jump. A QV baseline is refused against a QVML
+scan, because a definition change is not a move.
+
+Because `fundamentals` is issuer-level while membership is security-level, the
+issuer-keyed rules group members by `issuer_id` before scanning. The live
+S&P 500 holds three dual-class issuers (Alphabet, Fox, News Corp) whose two
+listed securities share one issuer, and the ledger rejects any scan that
+repeats a fingerprint. For the same reason a case subject carries the knowable
+`as_of_date` alongside the fiscal period: one period restated on several dates
+is several distinct review cases.
+`anomalies.run_detectors()` runs a selected subset and returns one independent
+scan per rule; `coverage_deterioration` consumes the coverage payload of the
+previous complete scan for its scope as its baseline. **CLI wiring is now
+live**: the same-day `forward-restart` narrowed the frozen policy bundle from
+31 files to the 13 that actually define trial-relevant behavior, and neither
+`cli.py` nor `alerts.py` is in that list. `anomaly-scan` now accepts
+`--rule` (repeatable), `--all-rules`, and `--factor-model`; dashboard display
+required no changes, since it already renders anomaly cases generically by
+scope. Preview mode does not open the operations ledger; only `--record`
+does.
 
 Each detection creates or updates a review case containing old/new values,
 source snapshots, rule version and suggested operator checks. Resolution must be
@@ -444,6 +550,23 @@ Register every backtest and factor experiment with:
 Frozen and holdout artifacts are append-only. The UI may compare compatible
 runs but must not silently choose the best result.
 
+**Built** as `src/aios/experiments.py`. `register_experiment()` binds every run
+to `git_fingerprint()` (exact commit SHA, dirty flag, changed *paths* only —
+never diff content, so an uncommitted secret cannot leak into a research
+artifact), `database_snapshot_sha256()` (streaming hash of the exact DuckDB
+file), `retained_evidence_coverage()` (per-dataset row count and newest
+`received_at`, canonically hashed — binds to the archive's shape without
+duplicating what `verify-raw-snapshots` already covers), the backtest
+config/metrics, and an optional parent/comparison-reason pair. `frozen` and
+`holdout` purposes refuse a dirty worktree outright; `exploratory` does not.
+Every registration is write-once via `publish_text_write_once` under
+`data/experiments/<experiment_id>.json`, so append-only is structural rather
+than convention, and `load_experiment()` re-verifies a `document_sha256` on
+every read. **CLI-wired**: `backtest-qv --output PATH --register-experiment
+--experiment-purpose ... --experiment-notes ...`, plus `list-experiments` and
+`compare-experiments ID ID...`, once the same `forward-restart` narrowed the
+frozen bundle and freed `cli.py`. No dashboard exposure yet.
+
 ## Phase 4 — Configuration boundaries and India foundation
 
 The detailed, source-reviewed execution sequence is in
@@ -462,6 +585,34 @@ Separate five configuration domains:
 Research, risk, market and account policies receive immutable names and
 versions. A material change creates a new forward trial instead of modifying an
 existing freeze.
+
+**Domains 2-4 built** as `src/aios/policy_domains.py`. Operator configuration
+(domain 1) already lives in the frozen `config.py`; secrets (domain 5) already
+live outside versioned artifacts in `.env`. What was missing was an explicit
+identity for the other three: they existed only as unversioned Python
+constants in `factors/policy.py`, `risk/policy.py`, and `backtest/costs.py`,
+visible only as a diff in the frozen-bundle file hash, never addressable by
+name.
+
+`current_research_policy()`, `current_market_profile()`, and
+`current_account_policy()` each take a caller-assigned `name`/`version` and
+return a content-addressed snapshot built by importing the real values from
+those three frozen modules — nothing hand-duplicated, so drift in the source
+changes the computed hash automatically rather than silently diverging from a
+copy. `policy_snapshot()` combines all three into one document plus a combined
+hash. `market_profile`'s fields (benchmark `SPY`, universe `sp500`, source
+names, session-close rule) are hand-declared rather than introspected, because
+the equivalent values in `market_calendar.py` are private module attributes;
+every value is a convention already repeated verbatim across this codebase's
+CLI defaults and `agent.md`'s own text, not invented for this module.
+
+`experiments.register_experiment()` now embeds a policy snapshot in every
+registered document by default (overridable via `policy=`), and
+`compare_experiments()` surfaces `research_policy_name`/`_version` and a
+`comparable_policy` flag. As of 2026-08-11 this is CLI-wired too:
+`backtest-qv --output PATH --register-experiment`, `aios list-experiments`,
+`aios compare-experiments ID ID...` — the frozen-bundle boundary that blocked
+this was narrowed by the same-day `forward-restart`.
 
 Before the first Indian row is ingested, make these dimensions first-class:
 

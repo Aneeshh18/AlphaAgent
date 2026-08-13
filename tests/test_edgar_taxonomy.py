@@ -200,7 +200,12 @@ def test_parser_version_dispatch_keeps_v2_replay_distinct_from_v3() -> None:
     snapshot = {"provider": "sec-edgar", "dataset": "companyfacts"}
 
     assert edgar.COMPANYFACTS_LEGACY_PARSER_VERSION == "sec-companyfacts-v2"
-    assert edgar.COMPANYFACTS_PARSER_VERSION == "sec-companyfacts-v2"
+    assert edgar.COMPANYFACTS_STORAGE_SAFE_V1_PARSER_VERSION == (
+        "sec-companyfacts-v2-storage-safe-v1"
+    )
+    assert edgar.COMPANYFACTS_PARSER_VERSION == (
+        "sec-companyfacts-v2-storage-safe-v2"
+    )
     assert edgar.COMPANYFACTS_NEXT_PARSER_VERSION == "sec-companyfacts-v3"
     assert (
         _replay_snapshot(
@@ -209,6 +214,17 @@ def test_parser_version_dispatch_keeps_v2_replay_distinct_from_v3() -> None:
         )
         == []
     )
+    assert _replay_snapshot(
+        {
+            **snapshot,
+            "parser_version": edgar.COMPANYFACTS_STORAGE_SAFE_V1_PARSER_VERSION,
+        },
+        payload,
+    ) == edgar.parse_sec_companyfacts_response_storage_safe_v1(payload)
+    assert _replay_snapshot(
+        {**snapshot, "parser_version": edgar.COMPANYFACTS_PARSER_VERSION},
+        payload,
+    ) == edgar.parse_sec_companyfacts_response(payload)
     assert _replay_snapshot(
         {**snapshot, "parser_version": edgar.COMPANYFACTS_NEXT_PARSER_VERSION},
         payload,

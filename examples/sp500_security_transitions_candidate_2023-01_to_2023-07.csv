@@ -1,0 +1,4 @@
+universe_id,security_id,from_ticker,to_ticker,effective_date,known_date,transition_type,source
+sp500,aios:bounded:sp500:rvty,PKI,RVTY,2023-05-16,2023-04-26,ticker_change,https://www.miaxglobal.com/alert/2023/05/15/miax-exchange-group-options-markets-corporate-action-alert-perkinelmer-inc-0
+sp500,aios:bounded:sp500:fi,FISV,FI,2023-06-07,2023-05-25,ticker_change,https://www.businesswire.com/news/home/20230525005372/en/Fiserv-to-Transfer-Listing-to-New-York-Stock-Exchange
+sp500,aios:bounded:sp500:eg,RE,EG,2023-07-10,2023-05-18,ticker_change,https://investors.everestglobal.com/news/news-details/2023/Everest-to-Rebrand-Company-Name-and-NYSE-Ticker-to-Reflect-its-Evolution-Global-Growth-and-Diversification-Strategy/default.aspx

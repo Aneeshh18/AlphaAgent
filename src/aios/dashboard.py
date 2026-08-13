@@ -14,6 +14,7 @@ Run:  .venv/bin/aios dashboard
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 from datetime import date, timedelta
@@ -69,8 +70,18 @@ from aios.dashboard_ui import (  # noqa: E402
     build_stress_review_view_model,
     notification_route_matches,
 )
+from aios.experiments import list_experiments  # noqa: E402
 from aios.factor_batch import DecisionScopedFactorStore  # noqa: E402
 from aios.factors.composite import compute_composite  # noqa: E402
+from aios.forward import (  # noqa: E402
+    DEFAULT_FORWARD_RELATIVE_PATH,
+    require_registered_forward_proposal,
+)
+from aios.maintenance import (  # noqa: E402
+    MaintenanceLockBusyError,
+    MaintenanceLockError,
+    project_maintenance_lock,
+)
 from aios.notifications import (  # noqa: E402
     smtp_email_config,
 )
@@ -79,7 +90,11 @@ from aios.operator_evidence import (  # noqa: E402
     load_operations_evidence_read_only,
     load_paper_monitor_evidence,
 )
-from aios.paper import latest_paper_decision_date  # noqa: E402
+from aios.paper import (  # noqa: E402
+    execute_paper_proposal,
+    latest_paper_decision_date,
+    review_paper_proposal_execution,
+)
 from aios.readiness import assess_us_readiness  # noqa: E402
 from aios.risk.stress import (  # noqa: E402
     build_stress_source_identity,
@@ -364,6 +379,17 @@ def load_system_operations() -> dict:
     return state
 
 
+@st.cache_data(ttl=60)
+def load_research_experiments() -> list[dict]:
+    """Load registered backtest/factor experiments for read-only display.
+
+    Reads write-once JSON directly off disk; no store connection, no ledger
+    write, nothing to invalidate beyond the cache TTL.
+    """
+    experiments_dir = settings.project_root / "data" / "experiments"
+    return list_experiments(experiments_dir=experiments_dir)
+
+
 @st.cache_data(ttl=600)
 def load_latest_backup() -> dict:
     """Hash-verify the newest local backup on a slower cache cadence."""
@@ -496,6 +522,120 @@ def _render_paper_workflow(model: PaperViewModel) -> None:
         unsafe_allow_html=True,
     )
     render_pipeline_stepper(model.stages)
+
+
+def _execute_paper_proposal_from_dashboard(
+    account_path: Path, proposal_path: Path
+) -> dict:
+    """Record one simulated fill using the exact call chain `aios paper-execute` uses.
+
+    Every safety property of the CLI command is reproduced: the maintenance
+    lease that serializes AIOS mutation workflows, the registered-proposal
+    check, and the same `confirm_simulated=True` gate inside the frozen
+    `paper.py`. This function only orchestrates that existing chain — it does
+    not implement paper-state mutation itself, and it touches no file inside
+    the active trial's frozen policy bundle.
+    """
+    previous_umask = os.umask(0o077)
+    try:
+        with project_maintenance_lock(settings.project_root, operation="paper-execute"):
+            trial_path = settings.project_root / DEFAULT_FORWARD_RELATIVE_PATH
+            require_registered_forward_proposal(
+                settings.project_root, trial_path, account_path, proposal_path
+            )
+            with store_scope(read_only=True) as store:
+                return execute_paper_proposal(
+                    account_path,
+                    proposal_path,
+                    store,
+                    confirm_simulated=True,
+                )
+    finally:
+        os.umask(previous_umask)
+
+
+def _render_paper_record_action(
+    monitor: dict, account_path: Path, proposal_path: Path
+) -> None:
+    """One deliberate, explicit confirmation to record a simulated fill.
+
+    This is the only write path in an otherwise read-only dashboard. It
+    exists so recording a paper fill does not require leaving the browser for
+    a terminal — it does not remove the human decision the CLI requires.
+    """
+    proposal = monitor.get("proposal")
+    timing = proposal.get("timing") if isinstance(proposal, dict) else None
+    timing_status = timing.get("status") if isinstance(timing, dict) else None
+    already_simulated = bool(proposal and proposal.get("already_simulated"))
+    if already_simulated or timing_status != "execution_window_open":
+        return
+
+    with st.container(border=True, key="paper_record_action"):
+        section_header(
+            "Record this simulated fill",
+            "Local simulation only. No order is sent to a broker.",
+        )
+        try:
+            with store_scope(read_only=True) as store:
+                review = review_paper_proposal_execution(
+                    account_path, proposal_path, store
+                )
+        except Exception as exc:
+            st.error("The read-only pre-fill review failed and nothing was recorded.")
+            with st.expander("Technical error details"):
+                st.code(str(exc))
+            return
+
+        st.caption(str(review.get("detail") or ""))
+        missing_count = review.get("missing_count") or 0
+        if not review.get("ready"):
+            st.warning(
+                "Not ready to record yet. "
+                f"{missing_count} required item(s) of execution evidence are missing."
+            )
+            if review.get("missing"):
+                for item in list(review["missing"])[:6]:
+                    st.write(f"- {item}")
+            return
+
+        trade_count = review.get("projected_trade_count", 0)
+        modeled_costs = review.get("projected_transaction_costs", 0.0)
+        st.write(
+            f"Projected: {trade_count} simulated trade(s), "
+            f"${modeled_costs:,.2f} modeled costs."
+        )
+        acknowledged = st.checkbox(
+            "I understand this records a local, simulation-only fill. "
+            "No broker is contacted and no real money moves.",
+            key="paper_record_ack",
+        )
+        if st.button(
+            "Record simulated fill",
+            type="primary",
+            disabled=not acknowledged,
+            key="paper_record_button",
+        ):
+            try:
+                result = _execute_paper_proposal_from_dashboard(
+                    account_path, proposal_path
+                )
+            except (MaintenanceLockBusyError, MaintenanceLockError) as exc:
+                st.warning(f"Another AIOS mutation workflow is already running. {exc}")
+                return
+            except Exception as exc:
+                st.error("Simulated execution refused.")
+                with st.expander("Technical error details"):
+                    st.code(str(exc))
+                return
+            execution = result["execution"]
+            st.success(
+                f"Simulation recorded for {execution['execution_date']}. "
+                f"{len(execution['trades'])} simulated trade(s), "
+                f"${execution['transaction_costs']:,.2f} modeled costs. "
+                "No order was sent to a broker."
+            )
+            st.cache_data.clear()
+            st.rerun()
 
 
 def _render_stress_review(
@@ -1910,6 +2050,65 @@ def _render_system_control(report: dict) -> None:
         )
 
     section_header(
+        "Research experiments",
+        "Every registered backtest binds exact code, data and policy identity "
+        "before its metrics are trusted. Comparison never picks a winner; "
+        "activation still goes through the existing forward-restart gate.",
+    )
+    try:
+        experiments = load_research_experiments()
+    except Exception as exc:
+        st.error("Research experiment registry could not be read.")
+        with st.expander("Technical detail"):
+            st.code(str(exc))
+        experiments = []
+    if experiments:
+
+        def _pct(value: object) -> str:
+            return f"{value:.1%}" if isinstance(value, (int, float)) else "unknown"
+
+        experiment_table = pd.DataFrame(
+            [
+                {
+                    "Recorded": pd.to_datetime(
+                        doc.get("recorded_at"), errors="coerce"
+                    ).strftime("%b %d, %Y %H:%M UTC"),
+                    "Experiment ID": doc["experiment_id"],
+                    "Purpose": str(doc.get("purpose", "")).title(),
+                    "Factor model": doc.get("parameters", {}).get("factor_model", "unknown"),
+                    "Universe": doc.get("parameters", {}).get("universe_id", "unknown"),
+                    "Regime return": _pct(
+                        doc.get("metrics", {}).get("regime", {}).get("cumulative_return")
+                    ),
+                    "Baseline return": _pct(
+                        doc.get("metrics", {}).get("baseline", {}).get("cumulative_return")
+                    ),
+                    "Policy": (
+                        f"{doc.get('policy', {}).get('name', 'unknown')} · "
+                        f"{doc.get('policy', {}).get('version', 'unknown')}"
+                        if doc.get("policy")
+                        else "unversioned"
+                    ),
+                    "Commit": (
+                        f"{doc.get('git', {}).get('commit_sha', 'unknown')[:8]}"
+                        f"{' (dirty)' if doc.get('git', {}).get('dirty') else ''}"
+                    ),
+                }
+                for doc in sorted(
+                    experiments, key=lambda d: d.get("recorded_at", ""), reverse=True
+                )
+            ]
+        )
+        st.dataframe(experiment_table, hide_index=True, width="stretch", height=280)
+        st.caption(
+            "Compare two or more with `aios compare-experiments ID ID...`; "
+            "register a new one with `aios backtest-qv --register-experiment "
+            "--experiment-purpose exploratory|frozen|holdout`."
+        )
+    else:
+        st.info("No research experiment has been registered yet.")
+
+    section_header(
         "Data pipeline",
         "Recent source outcomes stay visible so a failed or partial ingest cannot hide.",
     )
@@ -2174,7 +2373,7 @@ st.sidebar.divider()
 st.sidebar.markdown(
     '<div class="aios-sidebar-footer">'
     "<strong>Local simulation</strong>"
-    "<span>DuckDB · checksum protected</span>"
+    "<span>Stored on this computer · Tamper-evident</span>"
     "<span>No broker connection</span>"
     "</div>",
     unsafe_allow_html=True,
@@ -2683,6 +2882,13 @@ elif view == VIEW_PAPER:
     identity_labels = load_identity_labels(readiness["certified_research_through"])
     paper_model = build_paper_view_model(monitor)
     _render_paper_workflow(paper_model)
+
+    if monitor.get("proposal_path") and monitor.get("account_path"):
+        _render_paper_record_action(
+            monitor,
+            settings.project_root / monitor["account_path"],
+            settings.project_root / monitor["proposal_path"],
+        )
 
     st.subheader("Account Snapshot")
     _render_kpi_grid(

@@ -28,6 +28,21 @@ _LEGACY_020_COLUMN_CONTRACTS = {
         "8529aac5e613622f9a1fcc3992f38486ef5dea302b820f6f2c598102ecee4e7c",
         "05692b3a57cdf762d5f3ceae9c121992ac6329d7f777af9385543564891a408d",
     },
+    # 2026-08-11: after INDIA_BUILD_PLAN.md phase I1's additive market/venue/
+    # security_listings tables (markets, venues, market_profiles,
+    # security_listings, trading_sessions, settlement_policies, benchmarks).
+    # This dict is not a closed set — every additive schema.py change that
+    # a 0.2-simulated test fixture (current schema minus the activation
+    # table) would otherwise no longer match needs one more entry here, not
+    # a rewrite of the historical ones above.
+    "2059c73fb7c0a1cff6d8a58b953897281db3727c8120da459ce2d90aa82a187d": {
+        "d15ad5bd16c9e5c5f7c5148fd7411af588a7fea8624fe207d750c568088a8c39"
+    },
+    # 2026-08-12: after the additive companyfacts_v3_activations receipt table
+    # (governed Company Facts v3 activation).
+    "88e03ea2f1954da53fc76e916dd1d261b9f1a5564b934d4f79350b5133160d04": {
+        "022e32b49f4b23ff0a982b4ed16e737c6b598f8409824e99155f73a7f49192a6"
+    },
 }
 _LEGACY_MACRO_COLUMNS = {
     ("date", "DATE"),

@@ -322,6 +322,39 @@ CREATE TABLE IF NOT EXISTS universe_constituent_change_activations (
     CHECK (length(trim(policy_version)) > 0)
 );
 
+-- Governed Company Facts v3 parser activation. Append-only, one row per
+-- accepted batch. The mutation itself lands in `fundamentals` (upsert path)
+-- and `fundamental_versions` (append-only, `is_deleted` tombstones a key v3
+-- withholds that v2 silently kept); this table is the operational receipt
+-- binding the reviewed plan, verified backup, and disposable-rollback proof
+-- to what was actually committed.
+CREATE TABLE IF NOT EXISTS companyfacts_v3_activations (
+    activation_id              VARCHAR PRIMARY KEY,
+    activation_plan_sha256     VARCHAR NOT NULL UNIQUE,
+    review_plan_sha256         VARCHAR NOT NULL,
+    activation_run_id          VARCHAR NOT NULL UNIQUE,
+    schema_version              INTEGER NOT NULL CHECK (schema_version = 1),
+    as_of                       DATE NOT NULL,
+    issuer_ids_json             TEXT NOT NULL,
+    source_parser_version       VARCHAR NOT NULL,
+    target_parser_version       VARCHAR NOT NULL,
+    activation_payload_json     TEXT NOT NULL,
+    backup_manifest_sha256      VARCHAR NOT NULL,
+    actor                       VARCHAR NOT NULL,
+    policy_version              VARCHAR NOT NULL,
+    counts_json                 TEXT NOT NULL,
+    generation_id                VARCHAR NOT NULL,
+    version_sequence_boundary    BIGINT NOT NULL,
+    activated_at                TIMESTAMP NOT NULL,
+    status                      VARCHAR NOT NULL CHECK (status = 'accepted'),
+    created_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CHECK (regexp_full_match(activation_plan_sha256, '^[0-9a-f]{{64}}$')),
+    CHECK (regexp_full_match(review_plan_sha256, '^[0-9a-f]{{64}}$')),
+    CHECK (regexp_full_match(backup_manifest_sha256, '^[0-9a-f]{{64}}$')),
+    CHECK (length(trim(actor)) > 0),
+    CHECK (length(trim(policy_version)) > 0)
+);
+
 -- Durable markers distinguish an interrupted migration from an intentional
 -- post-backfill cleanup. Without this, reopening DuckDB could restore rows
 -- that were deliberately removed from the active table.
@@ -516,6 +549,104 @@ CREATE TABLE IF NOT EXISTS universe_membership (
     fetched_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (universe_id, ticker, effective_start)
 );
+
+-- ======================================================================
+-- First-class market contracts (INDIA_BUILD_PLAN.md phase I1).
+--   Every existing U.S. row stays exactly as it was: these are new, empty
+--   tables, not a rewrite of security_master/prices/fundamentals. A market
+--   is a country+currency+calendar identity ('us_equity', 'in_equity'), a
+--   venue is one exchange within it (NSE, BSE, NYSE), a market_profile binds
+--   one universe to its benchmark/filing/action sources, and
+--   security_listings is the venue-level fact a stable security_id already
+--   carries — one more identity layer, never a replacement for it. No
+--   shared factor/PIT/portfolio code may branch on market_id, currency, or
+--   venue_id: a synthetic non-U.S. fixture must pass the identical contracts
+--   the U.S. reference data does. See tests/test_market_contracts.py.
+-- ======================================================================
+CREATE TABLE IF NOT EXISTS markets (
+    market_id           VARCHAR PRIMARY KEY,   -- e.g. 'us_equity', 'in_equity'
+    country             VARCHAR NOT NULL,      -- ISO 3166-1 alpha-2, e.g. 'US', 'IN'
+    base_currency       VARCHAR NOT NULL,      -- ISO 4217, e.g. 'USD', 'INR'
+    timezone            VARCHAR NOT NULL,      -- IANA name, e.g. 'America/New_York'
+    default_venue_id    VARCHAR NOT NULL,
+    source              VARCHAR NOT NULL,
+    fetched_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS venues (
+    venue_id            VARCHAR PRIMARY KEY,   -- e.g. 'xnys', 'xnse', 'xbom'
+    market_id           VARCHAR NOT NULL,
+    mic                 VARCHAR,               -- ISO 10383 Market Identifier Code
+    name                VARCHAR NOT NULL,
+    source              VARCHAR NOT NULL,
+    fetched_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS market_profiles (
+    market_profile_id   VARCHAR PRIMARY KEY,   -- e.g. 'us_equity_sp500_reference'
+    market_id           VARCHAR NOT NULL,
+    primary_venue_id    VARCHAR NOT NULL,
+    universe_id         VARCHAR NOT NULL,      -- e.g. 'sp500', 'nifty50'
+    benchmark_id        VARCHAR,               -- nullable until a benchmark is reviewed
+    filing_source       VARCHAR NOT NULL,      -- e.g. 'sec-edgar', 'nse-xbrl'
+    action_source       VARCHAR NOT NULL,      -- e.g. 'yfinance', 'nse-corporate-actions'
+    source               VARCHAR NOT NULL,
+    fetched_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Complements provider_symbol_history (which bounds one data PROVIDER's
+-- returned rows to a security) with the venue-LISTING fact itself: this
+-- security traded under this symbol/series/ISIN on this exchange during this
+-- interval, independent of which data provider is later used to fetch it.
+CREATE TABLE IF NOT EXISTS security_listings (
+    security_id         VARCHAR NOT NULL,
+    venue_id             VARCHAR NOT NULL,
+    symbol               VARCHAR NOT NULL,
+    series               VARCHAR,              -- e.g. NSE 'EQ'; null where not applicable
+    isin                 VARCHAR,              -- ISO 6166; nullable until reviewed
+    security_type         VARCHAR NOT NULL DEFAULT 'common_stock',
+    currency             VARCHAR NOT NULL,
+    listed_start         DATE NOT NULL,
+    listed_end           DATE,
+    known_at             DATE NOT NULL,        -- when this listing fact was publicly knowable
+    source               VARCHAR NOT NULL,
+    fetched_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (security_id, venue_id, listed_start)
+);
+
+CREATE TABLE IF NOT EXISTS trading_sessions (
+    venue_id             VARCHAR NOT NULL,
+    session_date         DATE NOT NULL,
+    session_type         VARCHAR NOT NULL,     -- 'normal','early_close','special','closed'
+    open_time             TIME,
+    close_time             TIME,
+    notes                 VARCHAR,
+    source               VARCHAR NOT NULL,
+    fetched_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (venue_id, session_date)
+);
+
+CREATE TABLE IF NOT EXISTS settlement_policies (
+    venue_id             VARCHAR NOT NULL,
+    effective_start     DATE NOT NULL,
+    effective_end         DATE,
+    settlement_cycle     VARCHAR NOT NULL,     -- e.g. 'T+1', 'T+0_optional'
+    source               VARCHAR NOT NULL,
+    fetched_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (venue_id, effective_start)
+);
+
+CREATE TABLE IF NOT EXISTS benchmarks (
+    benchmark_id         VARCHAR PRIMARY KEY,  -- e.g. 'spy_price', 'nifty50_tri'
+    market_id             VARCHAR NOT NULL,
+    benchmark_kind         VARCHAR NOT NULL,   -- 'price_index','total_return_index'
+    provider             VARCHAR NOT NULL,
+    provider_symbol     VARCHAR NOT NULL,
+    data_start             DATE,
+    data_end             DATE,
+    source               VARCHAR NOT NULL,
+    fetched_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 # Tables we expect to exist after init. Used by the smoke test.
@@ -532,6 +663,7 @@ EXPECTED_TABLES = (
     "ingest_raw_snapshots",
     "universe_coverage_attestations",
     "universe_constituent_change_activations",
+    "companyfacts_v3_activations",
     "schema_migrations",
     "security_master",
     "security_identity_assignments",
@@ -544,4 +676,11 @@ EXPECTED_TABLES = (
     "factor_price_provenance",
     "factor_prices",
     "universe_membership",
+    "markets",
+    "venues",
+    "market_profiles",
+    "security_listings",
+    "trading_sessions",
+    "settlement_policies",
+    "benchmarks",
 )

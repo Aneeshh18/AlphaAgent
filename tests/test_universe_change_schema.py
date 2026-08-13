@@ -112,7 +112,7 @@ def test_unmarked_universe_change_activation_rows_fail_closed(tmp_path: Path) ->
         Store(database)
 
 
-def test_marked_activation_receipts_fail_until_semantic_verifier_exists(
+def test_marked_activation_receipts_fail_when_semantic_payload_is_invalid(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "unsupported-receipt.duckdb"
@@ -124,7 +124,7 @@ def test_marked_activation_receipts_fail_until_semantic_verifier_exists(
 
     blocked = Store(database, read_only=True)
     try:
-        with pytest.raises(RuntimeError, match="not yet supported"):
+        with pytest.raises(RuntimeError, match="receipt is not JSON"):
             blocked.require_universe_change_activation_schema()
     finally:
         blocked.close()

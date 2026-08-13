@@ -111,7 +111,13 @@ def test_companyfacts_v3_reads_dei_entity_shares_with_exact_pit_date() -> None:
 def test_companyfacts_v3_remains_dormant_until_next_policy_activation() -> None:
     payload = _payload(dei_rows=[_fact(value=123_456_789)])
 
-    assert edgar.COMPANYFACTS_PARSER_VERSION == "sec-companyfacts-v2"
+    assert edgar.COMPANYFACTS_LEGACY_PARSER_VERSION == "sec-companyfacts-v2"
+    assert edgar.COMPANYFACTS_STORAGE_SAFE_V1_PARSER_VERSION == (
+        "sec-companyfacts-v2-storage-safe-v1"
+    )
+    assert edgar.COMPANYFACTS_PARSER_VERSION == (
+        "sec-companyfacts-v2-storage-safe-v2"
+    )
     assert edgar.COMPANYFACTS_NEXT_PARSER_VERSION == "sec-companyfacts-v3"
     assert edgar.parse_sec_companyfacts_response(payload) == []
     assert len(edgar.parse_sec_companyfacts_response_v3(payload)) == 1
@@ -453,6 +459,18 @@ def test_companyfacts_v3_collapses_identical_same_day_storage_evidence() -> None
     assert future_periods == 0
     assert context_rejections == 0
     assert storage_conflicts == 0
+    safe_rows, safe_metadata = edgar.replay_sec_companyfacts_response(
+        payload,
+        parser_version=edgar.COMPANYFACTS_PARSER_VERSION,
+    )
+    v1_rows, v1_metadata = edgar.replay_sec_companyfacts_response(
+        payload,
+        parser_version=edgar.COMPANYFACTS_STORAGE_SAFE_V1_PARSER_VERSION,
+    )
+    assert len(safe_rows) == 1
+    assert safe_metadata["rows_rejected_storage_conflict"] == 0
+    assert len(v1_rows) == 1
+    assert v1_metadata["rows_rejected_storage_conflict"] == 0
 
 
 def test_companyfacts_v3_withholds_conflicting_same_day_storage_evidence() -> None:
@@ -498,6 +516,26 @@ def test_companyfacts_v3_withholds_conflicting_same_day_storage_evidence() -> No
     assert future_periods == 0
     assert context_rejections == 0
     assert storage_conflicts == 1
+    legacy_rows, legacy_metadata = edgar.replay_sec_companyfacts_response(
+        payload,
+        parser_version=edgar.COMPANYFACTS_LEGACY_PARSER_VERSION,
+    )
+    safe_rows, safe_metadata = edgar.replay_sec_companyfacts_response(
+        payload,
+        parser_version=edgar.COMPANYFACTS_PARSER_VERSION,
+    )
+    v1_rows, v1_metadata = edgar.replay_sec_companyfacts_response(
+        payload,
+        parser_version=edgar.COMPANYFACTS_STORAGE_SAFE_V1_PARSER_VERSION,
+    )
+    assert len(legacy_rows) == 2
+    assert legacy_metadata["rows_rejected_storage_conflict"] == 0
+    assert v1_rows == []
+    assert v1_metadata["rows_rejected_storage_conflict"] == 1
+    assert len(safe_rows) == 1
+    assert safe_rows[0]["value"] == legacy_rows[0]["value"]
+    assert safe_rows[0]["quarter_value"] == legacy_rows[0]["quarter_value"]
+    assert safe_metadata["rows_rejected_storage_conflict"] == 1
     assert edgar.parse_sec_companyfacts_response_v3(payload) == []
     assert edgar._fundamental_rejection_summary(
         {

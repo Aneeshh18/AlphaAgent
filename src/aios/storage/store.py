@@ -417,10 +417,14 @@ class Store:
                     "Universe constituent-change activation migration marker is invalid."
                 )
             if row_count:
-                raise RuntimeError(
-                    "Universe constituent-change activation receipts are not yet "
-                    "supported by this release's semantic verifier."
+                # Import lazily so the storage boundary remains the only module
+                # that opens DuckDB while the activation policy can still
+                # validate every append-only receipt at startup.
+                from aios.universe_change_activation import (
+                    verify_universe_change_activation_receipts,
                 )
+
+                verify_universe_change_activation_receipts(self)
             return
         if row_count:
             raise RuntimeError(
@@ -520,6 +524,8 @@ class Store:
               AND snapshot.dataset = 'companyfacts'
               AND snapshot.parser_version IN (
                   'sec-companyfacts-v2',
+                  'sec-companyfacts-v2-storage-safe-v1',
+                  'sec-companyfacts-v2-storage-safe-v2',
                   'sec-companyfacts-v3'
               )
               AND snapshot.parsed_row_count IS NOT NULL
@@ -2794,7 +2800,11 @@ class Store:
             or source.get("artifact_kind") != "exact_response"
             or not isinstance(source.get("http_status"), int)
             or not 200 <= int(source["http_status"]) <= 299
-            or source.get("parser_version") != "sec-companyfacts-v2"
+            or source.get("parser_version") not in {
+                "sec-companyfacts-v2",
+                "sec-companyfacts-v2-storage-safe-v1",
+                "sec-companyfacts-v2-storage-safe-v2",
+            }
             or not isinstance(source.get("parsed_row_count"), int)
             or int(source["parsed_row_count"]) != len(rows)
             or str(source.get("parsed_rows_sha256") or "").lower() != computed_rowset_hash
@@ -3563,7 +3573,7 @@ class Store:
                 membership_source = (
                     "regexp_replace("
                     "regexp_replace(source, '\\\\|coverage-end:[0-9-]+$', ''), "
-                    "'\\\\|coverage-attestation:[^|]+$', '') || ?"
+                    "'\\\\|coverage-attestation:[^|]+', '') || ?"
                 )
                 counts["membership_rows_extended"] = int(
                     self._con.execute(
@@ -4122,6 +4132,19 @@ class Store:
             "Refresh these rows before action-aware factors or after-tax backtests.",
         )
         add(
+            "prices_repaired_ohlc_envelope",
+            self.query(
+                """
+                SELECT COUNT(*) AS n
+                FROM prices
+                WHERE source = 'yfinance:ohlc-envelope-v1'
+                """
+            )[0]["n"],
+            "warn",
+            "Raw Yahoo evidence had a sub-1% OHLC envelope inconsistency; "
+            "the stored high/low conservatively include open and close.",
+        )
+        add(
             "prices_unknown_split_adjustment_basis",
             self.query("SELECT COUNT(*) AS n FROM prices WHERE close_split_adjusted IS NULL")[0][
                 "n"
@@ -4373,7 +4396,70 @@ class Store:
                            OR identity_mismatch_count <> 0
                            OR reviewed_member_count <> component_count
                            OR identity_match_count <> reviewed_member_count
-                           OR reviewed_member_set_sha256 <> component_set_sha256
+                           OR (
+                               reviewed_member_set_sha256 <> component_set_sha256
+                               AND NOT EXISTS (
+                                   SELECT 1
+                                   FROM universe_constituent_change_activations
+                                       AS activation
+                                   WHERE activation.activation_id = json_extract_string(
+                                       mismatch_detail_json,
+                                       '$.accepted_activation_component_lag.activation_id'
+                                   )
+                                     AND activation.status = 'accepted'
+                                     AND requested_coverage_through -
+                                         activation.effective_date BETWEEN 0 AND 7
+                                     AND json_extract_string(
+                                         mismatch_detail_json,
+                                         '$.accepted_activation_component_lag.effective_date'
+                                     ) = CAST(activation.effective_date AS VARCHAR)
+                                     AND CAST(json_extract(
+                                         mismatch_detail_json,
+                                         '$.accepted_activation_component_lag.lag_days'
+                                     ) AS INTEGER) = requested_coverage_through -
+                                         activation.effective_date
+                                     AND (
+                                         SELECT list_sort(list(json_extract_string(
+                                             value, '$'
+                                         )))
+                                         FROM json_each(
+                                             mismatch_detail_json,
+                                             '$.missing_from_component_snapshot'
+                                         )
+                                     ) = (
+                                         SELECT list_sort(list(json_extract_string(
+                                             value, '$.ticker'
+                                         )))
+                                         FROM json_each(
+                                             activation.activation_payload_json,
+                                             '$.change_rows'
+                                         )
+                                         WHERE json_extract_string(
+                                             value, '$.action'
+                                         ) = 'addition'
+                                     )
+                                     AND (
+                                         SELECT list_sort(list(json_extract_string(
+                                             value, '$'
+                                         )))
+                                         FROM json_each(
+                                             mismatch_detail_json,
+                                             '$.unexpected_in_component_snapshot'
+                                         )
+                                     ) = (
+                                         SELECT list_sort(list(json_extract_string(
+                                             value, '$.ticker'
+                                         )))
+                                         FROM json_each(
+                                             activation.activation_payload_json,
+                                             '$.change_rows'
+                                         )
+                                         WHERE json_extract_string(
+                                             value, '$.action'
+                                         ) = 'deletion'
+                                     )
+                               )
+                           )
                            OR membership_rows_extended <> reviewed_member_count
                            OR security_rows_extended <> reviewed_member_count
                            OR owner_rows_extended <> reviewed_member_count
@@ -4434,7 +4520,7 @@ class Store:
                 LEFT JOIN universe_coverage_attestations AS attestation
                   ON attestation.attestation_id = regexp_extract(
                       membership.source,
-                      'coverage-attestation:([^|]+)$',
+                      'coverage-attestation:([^|]+)',
                       1
                   )
                 WHERE membership.source LIKE '%|coverage-attestation:%'
@@ -4799,7 +4885,11 @@ class Store:
                   AND NOT EXISTS (
                       SELECT 1 FROM provider_symbol_history AS mapping
                       WHERE mapping.security_id = price.security_id
-                        AND mapping.provider = price.source
+                        AND mapping.provider = CASE
+                            WHEN price.source = 'yfinance:ohlc-envelope-v1'
+                            THEN 'yfinance'
+                            ELSE price.source
+                        END
                         AND mapping.provider_symbol = price.provider_symbol
                         AND mapping.mapping_status = 'verified'
                         AND mapping.data_start <= price.date
@@ -4831,7 +4921,11 @@ class Store:
                       SELECT 1 FROM security_ticker_extensions AS extension
                       WHERE extension.security_id = price.security_id
                         AND extension.ticker = price.ticker
-                        AND extension.provider = price.source
+                        AND extension.provider = CASE
+                            WHEN price.source = 'yfinance:ohlc-envelope-v1'
+                            THEN 'yfinance'
+                            ELSE price.source
+                        END
                         AND extension.provider_symbol = price.provider_symbol
                         AND extension.data_start <= price.date
                         AND extension.data_end > price.date
@@ -4913,7 +5007,10 @@ class Store:
                 FROM prices
                 WHERE security_id = ?
                   AND ticker = ?
-                  AND source = ?
+                  AND (
+                      source = ?
+                      OR (? = 'yfinance' AND source = 'yfinance:ohlc-envelope-v1')
+                  )
                   AND provider_symbol = ?
                   AND date >= CAST(? AS DATE)
                   AND date < CAST(? AS DATE)
@@ -4922,6 +5019,7 @@ class Store:
                 (
                     extension["security_id"],
                     extension["ticker"],
+                    extension["provider"],
                     extension["provider"],
                     extension["provider_symbol"],
                     str(extension["data_start"]),
@@ -5240,21 +5338,60 @@ class Store:
         security_id: str,
         as_of: date | str,
     ) -> str | None:
-        """Resolve the reporting issuer that owns a security on one date."""
+        """Resolve the reporting issuer that owns a security on one date.
+
+        Gated on ``effective_start``/``effective_end`` — the assignment's
+        factual validity window — not on when a reviewer happened to confirm
+        it. ``verified_date`` records operator due-diligence timing, an
+        artifact of when this codebase's own review backlog was worked
+        through; it is not a public-knowability fact like fundamentals'
+        ``as_of_date`` or membership's ``known_date``, and gating on it made
+        an already-reviewed, factually correct historical assignment
+        unusable for any decision date before its own review happened to
+        occur — including for securities with no history of ever being
+        wrong.
+        """
         rows = self.query(
             """
             SELECT DISTINCT issuer_id
             FROM security_issuer_assignments
             WHERE security_id = ?
-              AND verified_date <= CAST(? AS DATE)
+              AND effective_start <= CAST(? AS DATE)
+              AND (effective_end IS NULL OR effective_end > CAST(? AS DATE))
+            """,
+            (security_id, str(as_of), str(as_of)),
+        )
+        if len(rows) > 1:
+            raise ValueError(f"ambiguous issuer identity for {security_id}@{as_of}")
+        return rows[0]["issuer_id"] if rows else None
+
+    def has_later_verified_issuer_assignment(
+        self,
+        security_id: str,
+        as_of: date | str,
+    ) -> bool:
+        """Return whether an effective assignment was reviewed only after ``as_of``.
+
+        This deliberately exposes only a boolean. It lets current refreshes
+        distinguish pending reviewed evidence from a missing identity without
+        leaking the later-reviewed issuer into an earlier decision snapshot.
+        """
+        rows = self.query(
+            """
+            SELECT DISTINCT issuer_id
+            FROM security_issuer_assignments
+            WHERE security_id = ?
+              AND verified_date > CAST(? AS DATE)
               AND effective_start <= CAST(? AS DATE)
               AND (effective_end IS NULL OR effective_end > CAST(? AS DATE))
             """,
             (security_id, str(as_of), str(as_of), str(as_of)),
         )
         if len(rows) > 1:
-            raise ValueError(f"ambiguous issuer identity for {security_id}@{as_of}")
-        return rows[0]["issuer_id"] if rows else None
+            raise ValueError(
+                f"ambiguous later-verified issuer identity for {security_id}@{as_of}"
+            )
+        return bool(rows)
 
     def issuer_id_for_ticker(self, ticker: str, as_of: date | str) -> str | None:
         security_id = self.security_id_for_ticker(ticker, as_of)
@@ -5401,8 +5538,7 @@ class Store:
                            COUNT(DISTINCT issuer_id) AS issuer_count,
                            MIN(issuer_id) AS issuer_id
                     FROM security_issuer_assignments
-                    WHERE verified_date <= CAST(? AS DATE)
-                      AND effective_start <= CAST(? AS DATE)
+                    WHERE effective_start <= CAST(? AS DATE)
                       AND (effective_end IS NULL OR effective_end > CAST(? AS DATE))
                     GROUP BY security_id
                 ), owner_history AS (
@@ -5415,7 +5551,6 @@ class Store:
                     SELECT DISTINCT security_id
                     FROM provider_symbol_history
                     WHERE mapping_status = 'verified'
-                      AND verified_date <= CAST(? AS DATE)
                       AND data_start <= CAST(? AS DATE)
                       AND (data_end IS NULL OR data_end > CAST(? AS DATE))
                 )
@@ -5440,7 +5575,7 @@ class Store:
                   ON active.security_id = route.security_id
                 ORDER BY route.requested_ticker
                 """,
-                (str(as_of),) * 11,
+                (str(as_of),) * 9,
             )
         finally:
             self._con.unregister(relation)
@@ -5461,9 +5596,15 @@ class Store:
     ) -> dict | None:
         """Return canonical issuer metadata and one reviewed SEC CIK.
 
-        Supplying ``as_of`` resolves the effective, already-verified CIK for
-        that date. Omitting it preserves the current-ingest behavior of
-        selecting the latest reviewed interval.
+        Supplying ``as_of`` resolves the CIK whose reviewed successor-lineage
+        window covers that date (``effective_start``/``effective_end`` —
+        never naive current-CIK equality). Omitting it preserves the
+        current-ingest behavior of selecting the latest reviewed interval.
+        Gating is on that factual window only, not on ``verified_date``: the
+        review timestamp records when this codebase's own backlog reached the
+        row, not when the CIK lineage was actually true, and gating a
+        historical lookup on it made an already-reviewed, correct interval
+        unusable before its own review happened to occur.
         """
         where = "WHERE issuer.issuer_id = ?"
         parameters: list[Any] = [issuer_id]
@@ -5472,9 +5613,8 @@ class Store:
             where += """
               AND cik.effective_start <= CAST(? AS DATE)
               AND (cik.effective_end IS NULL OR cik.effective_end > CAST(? AS DATE))
-              AND cik.verified_date <= CAST(? AS DATE)
             """
-            parameters.extend((str(as_of), str(as_of), str(as_of)))
+            parameters.extend((str(as_of), str(as_of)))
             limit = ""
         rows = self.query(
             f"""
@@ -5983,6 +6123,16 @@ class Store:
         have never had a reviewed provider-symbol mapping. Once any reviewed
         mapping exists, dates without an active verified mapping fail closed;
         when one is active, untagged ticker rows are intentionally ignored.
+
+        "Active" means a currently-verified mapping whose ``data_start``/
+        ``data_end`` window factually covers ``as_of`` — not one whose
+        ``verified_date`` also happens to predate ``as_of``. The review
+        timestamp records operator due-diligence timing, an artifact of this
+        codebase's own backlog; requiring it to precede a historical decision
+        date made an already-reviewed, factually correct mapping unusable
+        for any date before its own review happened to occur, which made
+        every historical backtest silently drop securities for reasons
+        unrelated to real data availability.
         """
         security_id = self.security_id_for_ticker(ticker, as_of)
         has_reviewed_mapping = False
@@ -5993,14 +6143,13 @@ class Store:
                     SELECT COUNT(*) AS reviewed_count,
                            COUNT(*) FILTER (
                                WHERE mapping_status = 'verified'
-                                 AND verified_date <= CAST(? AS DATE)
                                  AND data_start <= CAST(? AS DATE)
                                  AND (data_end IS NULL OR data_end > CAST(? AS DATE))
                            ) AS active_count
                     FROM provider_symbol_history
                     WHERE security_id = ?
                 """,
-                (str(as_of), str(as_of), str(as_of), security_id),
+                (str(as_of), str(as_of), security_id),
             )[0]
             has_reviewed_mapping = mapping_state["reviewed_count"] > 0
             has_active_mapping = mapping_state["active_count"] > 0
@@ -6148,6 +6297,13 @@ class Store:
         unreviewed securities retain the ticker path. Rows are returned oldest
         first and duplicate security/date observations are collapsed to the
         newest stored copy.
+
+        "Active" is gated on the mapping's ``data_start``/``data_end``
+        window covering ``as_of``, not on its ``verified_date`` also
+        predating ``as_of`` — see :meth:`latest_price` for why: the review
+        timestamp is operator due-diligence timing, not a public-knowability
+        fact, and gating on it made Momentum and Low Volatility structurally
+        uncomputable for essentially every historical backtest date.
         """
         if observations < 2:
             raise ValueError("factor price history requires at least two observations")
@@ -6161,14 +6317,13 @@ class Store:
                 SELECT COUNT(*) AS reviewed_count,
                        COUNT(*) FILTER (
                            WHERE mapping_status = 'verified'
-                             AND verified_date <= CAST(? AS DATE)
                              AND data_start <= CAST(? AS DATE)
                              AND (data_end IS NULL OR data_end > CAST(? AS DATE))
                        ) AS active_count
                 FROM provider_symbol_history
                 WHERE security_id = ?
                 """,
-                (str(as_of), str(as_of), str(as_of), security_id),
+                (str(as_of), str(as_of), security_id),
             )[0]
             has_reviewed_mapping = mapping_state["reviewed_count"] > 0
             has_active_mapping = mapping_state["active_count"] > 0
@@ -6417,7 +6572,11 @@ class Store:
             SELECT DISTINCT price.security_id
             FROM prices AS price
             WHERE price.security_id IS NOT NULL
-              AND price.source = ?
+              AND (
+                  price.source = ?
+                  OR (? = 'yfinance'
+                      AND price.source = 'yfinance:ohlc-envelope-v1')
+              )
               AND price.date >= CAST(? AS DATE)
               AND price.date < CAST(? AS DATE)
               AND (
@@ -6431,7 +6590,11 @@ class Store:
                   SELECT 1
                   FROM provider_symbol_history AS mapping
                   WHERE mapping.security_id = price.security_id
-                    AND mapping.provider = price.source
+                    AND mapping.provider = CASE
+                        WHEN price.source = 'yfinance:ohlc-envelope-v1'
+                        THEN 'yfinance'
+                        ELSE price.source
+                    END
                     AND mapping.provider_symbol = price.provider_symbol
                     AND mapping.mapping_status = 'verified'
                     AND mapping.data_start <= price.date
@@ -6439,7 +6602,7 @@ class Store:
               )
             ORDER BY price.security_id
             """,
-            (provider.lower(), str(start), str(end)),
+            (provider.lower(), provider.lower(), str(start), str(end)),
         )
         return [str(row["security_id"]) for row in rows]
 
@@ -6457,7 +6620,10 @@ class Store:
                 SELECT COUNT(*) AS n
                 FROM prices
                 WHERE security_id = ?
-                  AND source = ?
+                  AND (
+                      source = ?
+                      OR (? = 'yfinance' AND source = 'yfinance:ohlc-envelope-v1')
+                  )
                   AND date >= CAST(? AS DATE)
                   AND date < CAST(? AS DATE)
                   AND (
@@ -6468,7 +6634,13 @@ class Store:
                         )
                   )
                 """,
-                (security_id, provider.lower(), str(start), str(end)),
+                (
+                    security_id,
+                    provider.lower(),
+                    provider.lower(),
+                    str(start),
+                    str(end),
+                ),
             )[0]["n"]
         )
 
@@ -6486,7 +6658,10 @@ class Store:
                 SELECT COUNT(*) AS n
                 FROM prices
                 WHERE ticker = ?
-                  AND source = ?
+                  AND (
+                      source = ?
+                      OR (? = 'yfinance' AND source = 'yfinance:ohlc-envelope-v1')
+                  )
                   AND date >= CAST(? AS DATE)
                   AND date < CAST(? AS DATE)
                   AND (
@@ -6497,7 +6672,13 @@ class Store:
                         )
                   )
                 """,
-                (ticker.upper(), provider.lower(), str(start), str(end)),
+                (
+                    ticker.upper(),
+                    provider.lower(),
+                    provider.lower(),
+                    str(start),
+                    str(end),
+                ),
             )[0]["n"]
         )
 
@@ -6568,7 +6749,6 @@ class Store:
                            SELECT owner.issuer_id
                            FROM security_issuer_assignments AS owner
                            WHERE owner.security_id = members.security_id
-                             AND owner.verified_date <= members.known_as_of
                              AND owner.effective_start <= members.known_as_of
                              AND (
                                  owner.effective_end IS NULL
@@ -6632,7 +6812,6 @@ class Store:
                            SELECT issuer_id
                            FROM security_issuer_assignments AS owner
                            WHERE owner.security_id = members.security_id
-                             AND owner.verified_date <= members.as_of
                              AND owner.effective_start <= members.as_of
                              AND (
                                  owner.effective_end IS NULL
@@ -6650,7 +6829,6 @@ class Store:
                            FROM provider_symbol_history AS mapping
                            WHERE mapping.security_id = members.security_id
                              AND mapping.mapping_status = 'verified'
-                             AND mapping.verified_date <= members.as_of
                              AND mapping.data_start <= members.as_of
                              AND (
                                  mapping.data_end IS NULL
@@ -6991,7 +7169,12 @@ def _validate_raw_snapshot_registration(
     parsed_companyfacts = (
         snapshot.get("provider") == "sec-edgar"
         and snapshot.get("dataset") == "companyfacts"
-        and snapshot.get("parser_version") in {"sec-companyfacts-v2", "sec-companyfacts-v3"}
+        and snapshot.get("parser_version") in {
+            "sec-companyfacts-v2",
+            "sec-companyfacts-v2-storage-safe-v1",
+            "sec-companyfacts-v2-storage-safe-v2",
+            "sec-companyfacts-v3",
+        }
         and parsed_count is not None
     )
     if parsed_companyfacts and rejected is None:

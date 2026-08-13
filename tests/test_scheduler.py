@@ -46,6 +46,9 @@ def test_rendered_scheduler_uses_supported_commands_and_no_dashboard_service(tmp
     assert "Restart=on-failure" in units["aios-us-daily.service"]
     assert "DUCKDB_LOCK_WAIT_SECONDS=300" in units["aios-us-daily.service"]
     assert "AIOS_DUCKDB_LOCK_WAIT_SECONDS" not in units["aios-us-daily.service"]
+    assert "TimeoutStartSec=45min" in units["aios-us-daily.service"]
+    assert "TimeoutStartSec=3h" in units["aios-us-filings.service"]
+    assert "TimeoutStartSec=2h" in units["aios-backup.service"]
     for service in (
         "aios-us-daily.service",
         "aios-us-filings.service",
@@ -235,6 +238,35 @@ def test_scheduler_status_does_not_report_unrun_systemd_defaults_as_passed() -> 
 
     assert all(value["last_run"] == "never" for value in status.values())
     assert all(value["service_result"] == "not-run" for value in status.values())
+    assert all(value["exit_status"] == "unknown" for value in status.values())
+
+
+def test_scheduler_status_does_not_report_running_service_as_passed() -> None:
+    def runner(command, **_kwargs):
+        if "is-enabled" in command or "is-active" in command:
+            return CompletedProcess(command, 0, "active\n", "")
+        if "show" in command and command[3].endswith(".timer"):
+            output = (
+                "LastTriggerUSec=Wed 2026-08-05 14:55:21 IST\n"
+                "NextElapseUSecRealtime=Thu 2026-08-06 11:34:29 IST\n"
+            )
+        elif "show" in command:
+            output = (
+                "ActiveState=activating\n"
+                "SubState=start\n"
+                "Result=success\n"
+                "ExecMainStatus=0\n"
+                "ExecMainStartTimestamp=Wed 2026-08-05 14:55:21 IST\n"
+                "ExecMainExitTimestamp=\n"
+            )
+        else:  # pragma: no cover - all supported status calls are above
+            output = ""
+        return CompletedProcess(command, 0, output, "")
+
+    status = user_scheduler_status(runner=runner)
+
+    assert all(value["last_run"].endswith("14:55:21 IST") for value in status.values())
+    assert all(value["service_result"] == "running" for value in status.values())
     assert all(value["exit_status"] == "unknown" for value in status.values())
 
 

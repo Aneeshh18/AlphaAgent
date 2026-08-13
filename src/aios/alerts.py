@@ -1963,6 +1963,32 @@ class AlertStore:
                 cases.append(_anomaly_case_from_row(current))
         return tuple(cases)
 
+    def latest_anomaly_scan_evidence(self, scope: str) -> dict[str, Any] | None:
+        """Return the evidence payload of the most recently recorded scan for one scope.
+
+        This is the read side of the baseline contract `coverage_deterioration`
+        and other comparison rules use: each rule's own `evidence` dict already
+        carries whatever compact payload the *next* scan in that scope needs as
+        its baseline (for example `current_coverage`), so the caller never
+        touches ledger internals to reconstruct one. Returns ``None`` when no
+        scan has ever been recorded for the scope — a legitimate first-run
+        state, not an error.
+        """
+        normalized_scope = _anomaly_text("scope", scope)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT evidence_json FROM anomaly_scans
+                WHERE scope = ?
+                ORDER BY recorded_sequence DESC
+                LIMIT 1
+                """,
+                (normalized_scope,),
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["evidence_json"])
+
     def anomaly_cases(
         self,
         *,
@@ -6570,7 +6596,6 @@ def _validate_daily_cycle_v3_readiness(
     if (
         report.get("purpose") != "paper"
         or report.get("as_of") != target
-        or report.get("generated_on") != target
         or report.get("certified_research_through") != target
         or report.get("universe_id") != "sp500"
         or report.get("benchmark_ticker") != "SPY"
@@ -6580,6 +6605,24 @@ def _validate_daily_cycle_v3_readiness(
         target_date = date.fromisoformat(target)
     except ValueError as exc:  # pragma: no cover - target validated by its receipt
         raise ValueError("daily-cycle readiness target is invalid") from exc
+    generated_on_text = _incident_action_text(
+        "daily-cycle readiness generated_on",
+        report.get("generated_on"),
+    )
+    try:
+        generated_on = date.fromisoformat(generated_on_text)
+    except ValueError as exc:
+        raise ValueError(
+            "daily-cycle readiness generated_on must be an ISO date"
+        ) from exc
+    if generated_on.isoformat() != generated_on_text:
+        raise ValueError("daily-cycle readiness generated_on must be canonical")
+    # The target is the last completed market session, while its recovery
+    # report is normally produced on the following calendar day.  Global
+    # source-freshness maxima may therefore follow the target, but never the
+    # report generation boundary; the PIT checks remain bound to ``as_of``.
+    if generated_on < target_date:
+        raise ValueError("daily-cycle readiness predates its target session")
     date_fields: dict[str, date | None] = {}
     for field_name in (
         "certified_research_from",
@@ -6617,7 +6660,7 @@ def _validate_daily_cycle_v3_readiness(
         "raw_prices_through",
     ):
         value = date_fields[field_name]
-        if value is None or value > target_date:
+        if value is None or value > generated_on:
             raise ValueError(
                 f"daily-cycle readiness {field_name} exceeds its generation date"
             )

@@ -1,0 +1,3 @@
+universe_id,index_name,ticker,effective_date,action,known_date,source,source_kind
+sp500,S&P 500,EA,2026-08-05,Deletion,2026-07-31,https://press.spglobal.com/2026-07-31-Ferguson-Enterprises-Set-to-Join-S-P-500-and-ADI-Global-Distribution-to-Join-S-P-SmallCap-600,index_announcement
+sp500,S&P 500,FERG,2026-08-05,Addition,2026-07-31,https://press.spglobal.com/2026-07-31-Ferguson-Enterprises-Set-to-Join-S-P-500-and-ADI-Global-Distribution-to-Join-S-P-SmallCap-600,index_announcement

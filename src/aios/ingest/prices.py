@@ -41,7 +41,10 @@ log = get_logger(__name__)
 STOOQ_URL = "https://stooq.com/q/d/l/"
 TIINGO_EOD_URL = "https://api.tiingo.com/tiingo/daily/{symbol}/prices"
 YFINANCE_EXPORT_SCHEMA_VERSION = 1
-YFINANCE_PARSER_VERSION = "yfinance-normalized-v2"
+YFINANCE_V2_PARSER_VERSION = "yfinance-normalized-v2"
+YFINANCE_PARSER_VERSION = "yfinance-normalized-v3"
+YFINANCE_OHLC_ENVELOPE_REPAIR_SOURCE = "yfinance:ohlc-envelope-v1"
+YFINANCE_MAX_OHLC_ENVELOPE_REPAIR_BPS = 100.0
 STOOQ_CAPTURE_PARSER_VERSION = "stooq-daily-csv-capture-v1"
 STOOQ_PARSER_VERSION = "stooq-daily-csv-v1"
 TIINGO_CAPTURE_PARSER_VERSION = "tiingo-eod-json-capture-v1"
@@ -106,13 +109,31 @@ def fetch_yfinance(
                 raise
         else:
             if df is not None and not df.empty:
-                break
-            log.warning(
-                "prices.yfinance_empty_attempt",
-                ticker=ticker,
-                attempt=attempt,
-                attempts=attempts,
-            )
+                if _has_usable_latest_close(df):
+                    break
+                # A non-empty frame whose newest row carries no usable close is
+                # the signature of a throttled/partial Yahoo response, not of
+                # authoritative data: the same ticker returns a valid close when
+                # requested on its own moments later. Without this branch the
+                # first partial response wins, breaks out on attempt 1, and
+                # surfaces downstream as a hard "Close must be positive"
+                # failure that fails the whole daily cycle. Retrying here does
+                # not weaken the fail-closed contract — genuinely absent data
+                # (for example a provider gap on a split date) still exhausts
+                # every attempt and still fails validation below.
+                log.warning(
+                    "prices.yfinance_partial_attempt",
+                    ticker=ticker,
+                    attempt=attempt,
+                    attempts=attempts,
+                )
+            else:
+                log.warning(
+                    "prices.yfinance_empty_attempt",
+                    ticker=ticker,
+                    attempt=attempt,
+                    attempts=attempts,
+                )
 
         if attempt == attempts:
             break
@@ -212,10 +233,20 @@ def fetch_yfinance(
 
 
 def parse_yfinance_normalized_export(payload: bytes) -> list[dict[str, Any]]:
-    """Replay a v2 yfinance export, retaining malformed actions for audit."""
+    """Replay a v3 export with bounded, visible OHLC envelope repair."""
     return _parse_yfinance_normalized_export(
         payload,
         reject_nonpositive_splits=False,
+        repair_ohlc_envelope=True,
+    )
+
+
+def parse_yfinance_normalized_export_v2(payload: bytes) -> list[dict[str, Any]]:
+    """Replay frozen v2 evidence without changing its parsed-row contract."""
+    return _parse_yfinance_normalized_export(
+        payload,
+        reject_nonpositive_splits=False,
+        repair_ohlc_envelope=False,
     )
 
 
@@ -224,6 +255,7 @@ def parse_yfinance_normalized_export_v1(payload: bytes) -> list[dict[str, Any]]:
     return _parse_yfinance_normalized_export(
         payload,
         reject_nonpositive_splits=True,
+        repair_ohlc_envelope=False,
     )
 
 
@@ -231,6 +263,7 @@ def _parse_yfinance_normalized_export(
     payload: bytes,
     *,
     reject_nonpositive_splits: bool,
+    repair_ohlc_envelope: bool,
 ) -> list[dict[str, Any]]:
     """Decode one canonical yfinance library export into provider rows."""
     try:
@@ -268,8 +301,7 @@ def _parse_yfinance_normalized_export(
         if row_date > normalization_through:
             raise ValueError(f"yfinance export contains an incomplete session: {row_date}")
         seen_dates.add(row_date)
-        rows.append(
-            {
+        row = {
                 "ticker": ticker,
                 "date": row_date.isoformat(),
                 "open": _f(provider_row.get("open")),
@@ -290,7 +322,9 @@ def _parse_yfinance_normalized_export(
                 "split_normalization_through": normalization_through.isoformat(),
                 "source": "yfinance",
             }
-        )
+        if repair_ohlc_envelope:
+            row["ohlc_envelope_adjusted"] = _repair_yfinance_ohlc_envelope(row)
+        rows.append(row)
     rows.sort(key=lambda row: row["date"])
     cumulative_later_splits = 1.0
     for row in reversed(rows):
@@ -309,6 +343,37 @@ def _parse_yfinance_normalized_export(
         for row in rows
         if requested_start <= date.fromisoformat(row["date"]) < completed_end
     ]
+
+
+def _repair_yfinance_ohlc_envelope(row: dict[str, Any]) -> bool:
+    """Conservatively include open/close in a slightly malformed daily range.
+
+    Yahoo occasionally returns a completed-session open a few basis points
+    outside its own high/low. The exact provider response remains immutable raw
+    evidence. Only finite positive rows within one percent are normalized; the
+    stored source label keeps the repair visible and a larger discrepancy is
+    left untouched for the eligibility gate to reject.
+    """
+
+    values = [row.get(field) for field in ("open", "high", "low", "close")]
+    if any(
+        value is None or not math.isfinite(float(value)) or float(value) <= 0
+        for value in values
+    ):
+        return False
+    open_value, high_value, low_value, close_value = (float(value) for value in values)
+    repaired_high = max(open_value, high_value, low_value, close_value)
+    repaired_low = min(open_value, high_value, low_value, close_value)
+    gap = max(repaired_high - high_value, low_value - repaired_low)
+    if gap == 0:
+        return False
+    gap_bps = gap / close_value * 10_000.0
+    if gap_bps >= YFINANCE_MAX_OHLC_ENVELOPE_REPAIR_BPS:
+        return False
+    row["high"] = repaired_high
+    row["low"] = repaired_low
+    row["source"] = YFINANCE_OHLC_ENVELOPE_REPAIR_SOURCE
+    return True
 
 
 # ----------------------------------------------------------------------
@@ -769,7 +834,7 @@ def relabel_provider_price_rows(
                 "ticker": active_tickers.pop(),
                 "security_id": security_id,
                 "provider_symbol": provider_symbol,
-                "source": provider,
+                "source": str(row.get("source") or provider),
             }
         )
     return output
@@ -928,6 +993,28 @@ def _f(x: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return parsed if math.isfinite(parsed) else None
+
+
+def _has_usable_latest_close(frame: pd.DataFrame) -> bool:
+    """Return whether the newest returned row carries a finite positive close.
+
+    Used only to decide whether a non-empty response is worth retrying. It
+    deliberately inspects the frame's own last row rather than a specific
+    calendar date, because a legitimate response may end before the newest
+    session (a holiday, an early run, or a bounded request window) and must
+    not be retried for that reason alone.
+    """
+    if frame.empty:
+        return False
+    columns = frame.columns
+    if isinstance(columns, pd.MultiIndex):
+        close_columns = [name for name in columns if name[0] == "Close"]
+    else:
+        close_columns = [name for name in columns if name == "Close"]
+    if not close_columns:
+        return False
+    parsed = _f(frame.iloc[-1][close_columns[0]])
+    return parsed is not None and parsed > 0
 
 
 def _validate_yfinance_storage_rows(rows: list[dict[str, Any]]) -> None:

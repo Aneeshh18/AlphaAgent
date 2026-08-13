@@ -24,7 +24,7 @@ A feature is not complete because a screen, schema, test double, or successful
 backtest exists. Evidence must be exact for the claimed operating mode and
 decision date.
 
-## Current evidence snapshot — 2026-07-30
+## Current evidence snapshot — 2026-08-07
 
 This is a dated snapshot, not a permanent certification. Refresh it with
 `aios preflight`, exact-date `aios readiness`, `aios validate`,
@@ -32,11 +32,13 @@ This is a dated snapshot, not a permanent certification. Refresh it with
 and release verification before making a new claim.
 
 - Supervised research and registered-proposal stress review are available.
-- The certified U.S. decision close is 2026-07-30: 503 reviewed members,
-  503/503 stable identities and reviewed prices, and 500/503 PIT filing
-  coverage.
-- Quality + Value has 302 complete scores; 201 names are withheld rather than
-  estimated.
+- The certified U.S. decision close is 2026-08-07: 503 reviewed members and
+  503/503 stable identities, reviewed prices and PIT filing coverage.
+- The official EA deletion and FERG addition was activated atomically from the
+  reviewed event and reference manifests. Activation receipt
+  `uca-event-87d33f15572441efbedd7b47a1226b64` binds the before/after sets,
+  source hashes, backup, price evidence and no-broker/no-paper-mutation
+  boundary. Disposable activation and rollback both passed.
 - SEC Company Facts v3 remains a blocked candidate, not an active data policy.
   Its reviewed replay processes 500 payloads, emits 1,119,730 rows, rejects 42
   future-period rows, withholds 17,860 unsupported-context rows and 26,152
@@ -51,11 +53,16 @@ and release verification before making a new claim.
   already-captured v2 evidence and may publish a content-addressed review
   artifact, but it performs no provider fetch or state mutation and exposes no
   activation path.
-- Validation has zero hard failures and three warning families.
+- Validation has zero hard failures and four visible warning families. The
+  active yfinance v3 parser preserves raw payloads and repairs only sub-1%
+  high/low-envelope inconsistencies; 16 affected rows remain source-labeled.
 - The paper account has $100,000 simulated cash, zero holdings, zero
   executions, and no broker connection.
-- The active forward policy is unchanged, but its one registered proposal is
-  expired. Proposal creation and retrospective paper recording are blocked.
+- The expired 2026-07-27 proposal and predecessor trial are archived
+  byte-identically with a no-fill disposition. Active trial
+  `us-qv-forward-ea4fc2788c4d` contains one prospective 2026-08-07 proposal for
+  the 2026-08-10 close; paper recording is waiting for that close and cannot be
+  performed early.
 - The hardened rollover lifecycle now separates a stable
   `forward-rollover-plan.v4` payload from volatile preflight/operations
   observations. `--write-plan` publishes only a content-addressed,
@@ -63,24 +70,33 @@ and release verification before making a new claim.
   consumes only that artifact and adds a fresh verified backup, fixed-order
   locks, final gates/CAS, one atomic active-trial swap, append-only phase
   evidence, confirmed recovery, and restore reconciliation. The mechanism is
-  implemented, but live activation is currently gate-blocked and must remain
-  so unless current operations, readiness, and deadline checks are all clean
-  in a naturally prospective window.
-- One natural daily cycle completed successfully on the active host on
-  2026-07-30. A current normal-session report-only check verified all three
-  user timers enabled and waiting with successful latest results, scheduled
-  next runs, and linger enabled. Unattended operation remains blocked by one
-  acknowledged XOM SEC evidence case and the fundamentals-refresh warning.
-- A fresh 2026-07-30 backup is checksum-valid: 4,262 files, 397,657,272 bytes,
-  manifest SHA-256
-  `a3081e23103997e3f94b0f9066cbc8ed6c446b1b9958fb75b8dad73ed5afabce`.
-- That exact backup passed the production disposable restore drill: 4,252 raw
-  payloads, 4,424 parsed replays, and zero hard validation failures.
-- The last certified release checkpoint passed the full suite,
-  repository-wide Ruff, bytecode compilation, reproducible wheel builds, exact
-  source-to-wheel verification, and clean-install smoke. Those results are
-  historical checkpoint evidence only; every release candidate must regenerate
-  the complete proof from its stabilized source.
+  live-proven. Plan SHA-256
+  `443f6efbcbfa640c4a1c9c63044399d36ba089eb58327ed9d366a882095aba5d`
+  produced append-only attempt `1dc9b874d2b4410e839eda62e5c3d887`, terminal
+  phase `verified`, without changing the account or recording a fill.
+- Daily, filings and backup services now have real successful terminal runs.
+  The daily job certified 503 members, 2,513 member price rows, five SPY rows,
+  98,507 macro rows and research through 2026-08-07. Filings attempted 499/499
+  issuers with zero hard failures. The operating ledger has no blocker after
+  evidence-bound recovery review.
+- The three explicit SEC zero-row cases are now resolved as reviewed evidence
+  gaps with scores still withheld. The fundamentals-refresh incident has a
+  producer-verified reconciliation proof; no research row or readiness gate was
+  changed by those dispositions.
+- Membership activation did not manufacture FERG company facts. A later
+  governed refresh accepted 323 source-bound rows and visibly withheld 24
+  ambiguous storage keys; the 503/503 filing gate now passes.
+- Final backup `backups/aios-20260808T085804Z` verifies 8,536 files and 775,651,621
+  bytes with manifest SHA-256
+  `81eb571e6a479065335aac8fe6457c4305b6d824613ffef30a49e561f02e5f4f`,
+  and passed a disposable restore drill over 7,977 raw payloads and 11,601
+  parsed replays. The prospective rollover also created
+  and bound a separate verified pre-cutover backup.
+- Repository-wide Ruff, bytecode compilation and diff whitespace checks pass.
+  The full source suite passes 1,075 tests.
+  Two independent wheels are byte-identical and the clean-install release
+  verifier passes; candidate SHA-256 is
+  `448c9f77031bf24084636ade283f932c71163e7505535a273877dd8365745287`.
 - The hosted read-model candidate remains isolated and excluded after
   adversarial review. No hosted-service claim is valid.
 - SMTP is incomplete and off. No external incident-delivery claim is valid.
@@ -95,14 +111,14 @@ claim, or permission to trade.
 
 | Gate | State | Current evidence | Exit condition |
 |---|---|---|---|
-| Exact-date readiness | Supported | 2026-07-30 passes historical-research and paper readiness | Re-run for every claimed decision date |
+| Exact-date readiness | Supported | 2026-08-07 is the latest certified close | Re-run for every claimed decision date and activate later reviewed constituent changes through the governed path |
 | PIT universe and identity | Supported | 503 members; 503/503 stable security identities | Every member remains date-bound to reviewed security, issuer, CIK, and provider intervals |
 | Prices, actions, benchmark, and calendar | Supported for current research | 503/503 reviewed prices; SPY and the U.S. calendar reach the certified close | Current action-safe coverage remains sufficient; historical warnings stay excluded from unsupported claims |
-| PIT filings and macro | Supported with visible gaps | 500/503 filing coverage; release-dated macro is available | Missing evidence remains withheld and source-bound |
+| PIT filings and macro | Supported with visible gaps | 503/503 filing coverage; release-dated macro is available; ambiguous source keys remain withheld | Missing evidence remains withheld and source-bound |
 | Research scores | Supported with withholding | The active state has 302/503 complete QV scores and withholds 201; a disposable v3 candidate makes 394/503 structurally computable only before freshness and lineage gates | Keep the candidate count out of safe-use claims; never fill missing scores with estimates; require freshness-qualified, source-lineaged governed replay before promotion |
 | Raw provenance and replay | Partially supported | Active U.S. transports have immutable, checksum-verified evidence, but all 1,270,623 live fundamental rows remain unlineaged | Migrate every promoted v3 issuer to explicit source-row lineage and prove exact replay without inferring lineage for legacy rows |
 | Fundamental system-time generations | Row-version and factor-read contract implemented; paper activation deferred | Post-merge rows and deletion tombstones are append-only; latest-version reconstruction is a hard data-quality invariant; named IDs pin scalar and batch fundamental rows and fail closed on unknown IDs | Pin reference identity routing, prices, membership, macro and policy under one complete generation; bind it into a new prospective proposal schema without modifying the active frozen trial |
-| Data-quality review | Partially supported | FDXF/HONA are resolved as explicit zero-row gaps with withholding preserved; XOM remains acknowledged pending predecessor-successor evidence | Preserve explicit gaps; complete reviewed XOM lineage and add a first-class expected-new-issuer review state |
+| Data-quality review | Partially supported | FDXF, HONA, and XOM are resolved as explicit evidence gaps with withholding preserved; FERG is a reviewed new-issuer identity/price candidate whose ambiguous v2 facts were refused | Preserve explicit gaps and add a first-class expected-new-issuer review state without weakening score gates |
 | Company Facts v3 selection | Parser and read-only planner implemented; activation unavailable | The 500-payload replay emits 1,119,730 rows, rejects 42 future-period rows, withholds 17,860 unsupported-context rows and 26,152 ambiguous storage keys, and emits zero duplicate keys; `companyfacts-v3-plan --as-of ...` rechecks exact local v2 evidence without fetch or mutation | Zero issuers are currently eligible: add source-lineaged governed migration, explicit freshness gates, candidate-DB diff, restore proof, and a separately governed activation contract before promotion |
 | Experiment governance | Code gap | Backtests are engineering evidence, not registered experiments | Append-only exploratory, frozen, and holdout registry binds code, data, policy, assumptions, and artifacts |
 | Long-history event coverage | Evidence required | Complete pre-August-2023 announcement and delisting provenance is not claimed | Extend source-reviewed history independently of current-use certification |
@@ -115,9 +131,9 @@ and honestly labeled.
 
 ## 2. Recurring supervised paper simulation
 
-**Current claim:** read-only paper status and stress review are supported. A new
-proposal or paper fill is not currently available because the registered
-proposal expired.
+**Current claim:** recurring local paper governance is supported. The active
+proposal is prospective and must wait for the 2026-08-10 reviewed close; no fill
+has been recorded.
 
 | Gate | State | Current evidence | Exit condition |
 |---|---|---|---|
@@ -127,7 +143,7 @@ proposal expired.
 | Registered-proposal stress review | Supported | Exact proposal, policy, PIT evidence, and final CAS are required | Preserve fail-closed withholding and read-only default |
 | Explicit close-window recording | Supported in code | Confirmation and close-to-next-open timing are enforced | Complete one naturally valid proposal-to-fill cycle without retrospective action |
 | Forward policy integrity | Supported | Active trial reports unchanged | Never rewrite its frozen policy sources in place |
-| Expired-proposal lifecycle | Governed v4 lifecycle implemented; live activation remains gate-dependent | Preview binds the exact predecessor/account/readiness/blueprint/policy/path boundary while volatile time and operations evidence stay outside its hash; activation requires the persisted plan, exact SHA, explicit confirmation, fresh gates, verified backup, locks, final CAS, atomic cutover and durable recovery | Prove the command in a planned naturally prospective window; preserve the active trial until every live gate passes |
+| Expired-proposal lifecycle | Governed v4 lifecycle live-proven | The predecessor and proposal were archived byte-identically; the content-addressed plan, backup, final CAS, atomic swap and terminal recovery receipt all verify | Preserve the new active trial and use the same path for every later expired cycle |
 | Final forward-library CAS | Code gap | Cooperative CLI lease does not cover arbitrary library callers | Add final account/trial/proposal identity checks in a new policy version |
 | Recurring cycle evidence | Evidence required | Zero paper executions and zero holdings | Observe proposal, review, explicit simulation, mark, backup, and recovery in normal use |
 | Current-holdings stress | Code gap | Stress review covers the pending proposal only | Add a separate evidence-bound workflow after valid simulated holdings exist |
@@ -138,19 +154,19 @@ window is missed, use a later certified close.
 
 ## 3. Unattended local operations
 
-**Current claim:** not ready. Automation code exists, but current operating
-evidence has unresolved blockers. “Unattended” applies to data refresh,
-monitoring, and backup—not autonomous portfolio approval or execution.
+**Current claim:** supported for local data refresh, monitoring and backup on
+this workstation. It does not include autonomous portfolio approval or
+execution.
 
 | Gate | State | Current evidence | Exit condition |
 |---|---|---|---|
-| Recoverable daily workflow | Certified through August 3 | A complete benchmark-first cycle certified the exact close; a later already-current run bound the successful job receipt and fresh readiness report to the open incident generation | Observe the next naturally scheduled session and retain the same producer-verified evidence without operator intervention |
-| Scheduler runtime | Installed; current runtime blocked | Unit files are enabled but the user bus was unavailable to report waiting times; daily, filings, and backup service incidents remain open after the failed cycle | Reload/reinstall the verified units, confirm linger and live timer state, then observe successful natural runs |
+| Recoverable daily workflow | Supported | The successful job certified the exact 2026-08-07 session, 503 members and current readiness | Continue to fail closed on new events or provider failures |
+| Scheduler runtime | Installed and live | Daily, filings and backup services all reached `Result=success`, `ExecMainStatus=0` within their service ceilings | Recheck timer/runtime state and terminal producer evidence after every release |
 | Incident and job ledger | Supported | Durable open/repeat/acknowledge/resolve history exists | Every actionable failure remains visible and source-bound |
-| Current operating queue | Blocked | The acknowledged XOM SEC case, pending August 5 FERG/EA event import, current filing/backup/systemd failures, and legacy unproven resolutions remain visible; the former daily-cycle failure now has producer-verified recovery | Complete source review/import, observe natural service recovery, and resolve or attest each remaining incident only with current-generation proof |
+| Current operating queue | Supported | No operational blocker remains; FERG membership, identity, prices and accepted fundamentals are live, with ambiguous keys still withheld | Keep every later failure visible until evidence-bound recovery |
 | Notification outbox | Supported locally | Retry, lease, dead-letter, and no-network proof exist | Preserve idempotency and immutable delivery history |
 | External alert delivery | External decision / evidence required | TLS-only SMTP adapter exists; configuration and receipt proof are absent | Private config, one exact-route receipt test, owner confirmation, and explicit enablement |
-| Backup and restore | Supported for the current checkpoint | The 2026-08-02 backup-first state upgrade created and reverified 4,785 files / 423,279,406 bytes with checksum-chained completion evidence | Repeat the disposable restore/replay drill for the final release candidate and after material governed-state changes |
+| Backup and restore | Supported for the current checkpoint | The backup service succeeded; the newer post-refresh checkpoint contains 8,536 files / 775,651,621 bytes and passed manifest verification plus a disposable restore drill | Repeat the service and drill for every release candidate |
 | Cross-store concurrency | Partially supported | Supported CLI writers share a maintenance lease | Complete final library-level CAS and keep unsupported direct writers outside production |
 | Broader anomaly detection | Code gap | Only SEC coverage v1 exists | Add shares, valuation, filing, price/action, mapping, factor-jump, and deterioration rules incrementally |
 | Availability objective | External decision | Current deployment depends on one local machine and user service manager | Define acceptable uptime, recovery, and host-failure behavior before claiming an operational service |

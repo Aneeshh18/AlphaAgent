@@ -11,7 +11,6 @@ outside this contract.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import re
@@ -19,6 +18,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Protocol
+
+from aios.canonical import canonical_json, canonical_sha256
 
 HOSTED_RESEARCH_DOCUMENT_KIND = "aios.hosted-research-snapshot"
 HOSTED_RESEARCH_SCHEMA_VERSION = "hosted-research-snapshot.v1"
@@ -909,15 +910,8 @@ def _reject_unsafe_text(value: str, *, label: str) -> None:
         raise ValueError(f"{label} contains secret-shaped text")
 
 
-def _canonical_json(value: Any) -> str:
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    )
+_canonical_json = canonical_json
 
 
 def _json_sha256(value: Any) -> str:
-    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+    return canonical_sha256(value)

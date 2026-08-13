@@ -266,6 +266,63 @@ def test_daily_cycle_producer_proof_rejects_nonready_or_mismatched_report(
         )
 
 
+def test_daily_cycle_proof_accepts_source_freshness_after_target_session(
+    tmp_path,
+) -> None:
+    store = AlertStore(tmp_path / "daily-next-day-source.sqlite3")
+    opened = store.emit(_daily_alert(), now=BASE_TIME)
+    context = store.recovery_context(opened.fingerprint)
+    assert context is not None
+    report = _ready_daily_report()
+    report["generated_on"] = "2026-07-31"
+    report["macro_releases_through"] = "2026-07-31"
+
+    recovery = build_daily_cycle_recovery_evidence(
+        context,
+        _successful_daily_job(store),
+        report,
+        assessed_at=DAILY_ASSESSED_AT,
+    )
+
+    resolved = store.resolve_fingerprint(
+        opened.fingerprint,
+        recovery=recovery,
+        now=BASE_TIME + timedelta(minutes=3),
+    )
+    assert resolved is not None
+    assert resolved.state == "resolved"
+
+
+def test_daily_cycle_proof_rejects_source_freshness_after_generation(
+    tmp_path,
+) -> None:
+    store = AlertStore(tmp_path / "daily-future-source.sqlite3")
+    opened = store.emit(_daily_alert(), now=BASE_TIME)
+    context = store.recovery_context(opened.fingerprint)
+    assert context is not None
+    job = _successful_daily_job(store)
+    predated = _ready_daily_report()
+    predated["generated_on"] = "2026-07-29"
+    with pytest.raises(ValueError, match="predates its target session"):
+        build_daily_cycle_recovery_evidence(
+            context,
+            job,
+            predated,
+            assessed_at=DAILY_ASSESSED_AT,
+        )
+
+    report = _ready_daily_report()
+    report["macro_releases_through"] = "2026-07-31"
+
+    with pytest.raises(ValueError, match="exceeds its generation date"):
+        build_daily_cycle_recovery_evidence(
+            context,
+            job,
+            report,
+            assessed_at=DAILY_ASSESSED_AT,
+        )
+
+
 def test_daily_cycle_proof_rejects_wrong_incident_domain(tmp_path) -> None:
     store = AlertStore(tmp_path / "daily-wrong-domain.sqlite3")
     opened = store.emit(

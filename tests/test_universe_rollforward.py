@@ -9,11 +9,56 @@ from aios.storage.store import Store
 from aios.universe_rollforward import (
     COMPONENT_SNAPSHOT_URL,
     OFFICIAL_ARCHIVE_URL,
+    _accepted_activation_component_lag,
+    _canonical_list_sha256,
     parse_component_snapshot,
     parse_press_archive,
     parse_sp500_constituent_changes,
     roll_forward_sp500_coverage,
 )
+
+
+class _ActivationReceiptStore:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+    def query(self, _sql: str, _params: tuple[str]) -> list[dict[str, str]]:
+        return [
+            {
+                "activation_id": self.payload["receipt"]["activation_id"],
+                "activation_payload_json": json.dumps(
+                    self.payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+        ]
+
+
+def _activation_lag_payload() -> dict:
+    before = {"AAA", "BBB"}
+    after = {"AAA", "GAM"}
+    return {
+        "receipt": {
+            "activation_id": "uca-event-test",
+            "universe_id": "sp500",
+            "status": "accepted",
+            "policy_version": "governed-sp500-constituent-activation.v1",
+            "effective_date": "2026-07-25",
+            "before_member_set_sha256": _canonical_list_sha256(before),
+            "after_member_set_sha256": _canonical_list_sha256(after),
+        },
+        "change_rows": [
+            {"action": "addition", "ticker": "GAM"},
+            {"action": "deletion", "ticker": "BBB"},
+        ],
+        "post_event_reconciliation": {
+            "review": {
+                "as_of": "2026-07-25",
+                "tickers": ["AAA", "GAM"],
+            }
+        },
+    }
 
 
 def _press_html(
@@ -63,6 +108,58 @@ def _change_detail_html(*, effective_date: str = "July 25, 2026") -> bytes:
           <td>Beta Incorporated</td><td>BBB</td><td>Industrials</td></tr>
     </table></body></html>
     """.encode()
+
+
+def test_exact_immutable_activation_reconciles_short_component_lag() -> None:
+    payload = _activation_lag_payload()
+    result = _accepted_activation_component_lag(
+        _ActivationReceiptStore(payload),  # type: ignore[arg-type]
+        universe_id="sp500",
+        target=datetime(2026, 7, 27, tzinfo=UTC).date(),
+        reviewed_tickers={"AAA", "GAM"},
+        component_tickers={"AAA", "BBB"},
+        missing_components=["GAM"],
+        unexpected_components=["BBB"],
+    )
+
+    assert result == {
+        "activation_id": "uca-event-test",
+        "effective_date": "2026-07-25",
+        "holdings_as_of": "2026-07-25",
+        "additions": ["GAM"],
+        "deletions": ["BBB"],
+        "lag_days": 2,
+    }
+
+
+def test_activation_receipt_never_hides_an_extra_component_difference() -> None:
+    payload = _activation_lag_payload()
+    result = _accepted_activation_component_lag(
+        _ActivationReceiptStore(payload),  # type: ignore[arg-type]
+        universe_id="sp500",
+        target=datetime(2026, 7, 27, tzinfo=UTC).date(),
+        reviewed_tickers={"AAA", "GAM", "ZZZ"},
+        component_tickers={"AAA", "BBB"},
+        missing_components=["GAM", "ZZZ"],
+        unexpected_components=["BBB"],
+    )
+
+    assert result is None
+
+
+def test_activation_receipt_component_lag_expires_fail_closed() -> None:
+    payload = _activation_lag_payload()
+    result = _accepted_activation_component_lag(
+        _ActivationReceiptStore(payload),  # type: ignore[arg-type]
+        universe_id="sp500",
+        target=datetime(2026, 8, 2, tzinfo=UTC).date(),
+        reviewed_tickers={"AAA", "GAM"},
+        component_tickers={"AAA", "BBB"},
+        missing_components=["GAM"],
+        unexpected_components=["BBB"],
+    )
+
+    assert result is None
 
 
 def _multi_index_change_detail_html() -> bytes:

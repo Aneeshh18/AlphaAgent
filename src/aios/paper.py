@@ -1136,6 +1136,18 @@ def _paper_account_write_lock(account_path: Path) -> Iterator[None]:
         yield
 
 
+@contextmanager
+def document_write_lock(document_path: Path) -> Iterator[None]:
+    """Public export of the write-once document lock for other frozen modules.
+
+    `forward.py`'s trial persistence needs the exact same cross-process
+    mutual exclusion this module already uses for account/proposal writes,
+    rather than a second, potentially-divergent locking implementation.
+    """
+    with _paper_document_write_lock(document_path):
+        yield
+
+
 def _write_paper_document(
     path: Path,
     *,

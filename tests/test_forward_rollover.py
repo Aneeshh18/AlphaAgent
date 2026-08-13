@@ -430,7 +430,7 @@ def test_preview_is_deterministic_and_changes_no_governed_state(tmp_path) -> Non
     )
 
     assert first.source_eligible is True
-    assert first.activation_available is False
+    assert first.activation_available is True
     assert first.plan_sha256 == repeated.plan_sha256
     assert first.plan_sha256 == later.plan_sha256
     assert first.checked_at != later.checked_at
@@ -1192,13 +1192,13 @@ def test_preview_selects_latest_unresolved_by_evidence_not_list_order(
     assert preview.plan["predecessor"]["proposal_id"] == "paper-2026-07-27-test"
 
 
-def test_current_release_keeps_plan_bound_rollover_activation_disabled() -> None:
+def test_current_release_exposes_only_plan_bound_rollover_activation() -> None:
     project_root = Path(__file__).resolve().parents[1]
 
     assert not (project_root / "src/aios/rollover.py").exists()
     assert callable(execute_forward_rollover_from_plan)
     assert ForwardRolloverResult.__name__ == "ForwardRolloverResult"
-    assert rollover_module.ROLLOVER_ACTIVATION_ENABLED is False
+    assert rollover_module.ROLLOVER_ACTIVATION_ENABLED is True
 
 
 def test_preview_binds_complete_policy_set_and_disposable_production_intent(

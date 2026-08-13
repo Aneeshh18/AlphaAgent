@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from aios.canonical import canonical_json, canonical_sha256
 from aios.market_calendar import us_equity_sessions
 from aios.raw_snapshots import (
     VerifiedRawSnapshot,
@@ -690,8 +691,26 @@ def build_universe_change_plan(
     )
     if event_sessions != [effective_date] or not prior_sessions:
         raise ValueError("official effective date is not a reviewed U.S. equity session")
-    if prior_coverage != prior_sessions[-1]:
-        raise ValueError("certified state does not reach the prior U.S. equity session")
+    prior_is_session = us_equity_sessions(
+        prior_coverage,
+        prior_coverage + timedelta(days=1),
+    ) == [prior_coverage]
+    uncovered_pre_event_sessions = us_equity_sessions(
+        prior_coverage + timedelta(days=1),
+        effective_date,
+    )
+    # A stopped automatic reviewer can legitimately leave a short unchanged
+    # gap before the announced effective date (for example coverage through
+    # Monday for a Wednesday-open replacement).  The exact archive replay
+    # above already proves that no second event was omitted.  Keep the gap
+    # tightly bounded instead of requiring an unsafe synthetic no-change
+    # certification for the intervening close.
+    if (
+        not prior_is_session
+        or prior_coverage > prior_sessions[-1]
+        or len(uncovered_pre_event_sessions) > 5
+    ):
+        raise ValueError("certified state is too stale for the constituent event")
     if target_coverage < effective_date:
         raise ValueError("source attestation did not review the effective date")
     future_release_evidence: list[dict[str, Any]] = []
@@ -1337,6 +1356,7 @@ def _validate_attestation_projection(
         "reviewed_successor_lineage_matches",
         "future_effective_releases",
         "candidate_release_parse_errors",
+        "accepted_activation_component_lag",
     }
     if set(mismatch) != expected_mismatch_fields:
         raise ValueError("source attestation mismatch detail has an unsupported shape")
@@ -1353,6 +1373,11 @@ def _validate_attestation_projection(
     ):
         if mismatch.get(field) != []:
             raise ValueError("source attestation contains unrelated review blockers")
+    if mismatch.get("accepted_activation_component_lag") is not None:
+        raise ValueError(
+            "universe-change activation cannot consume an already reconciled "
+            "component-lag attestation"
+        )
     if mismatch["future_effective_releases"] != expected_future_releases:
         raise ValueError("source attestation future-release evidence is inconsistent")
     mismatch_count = len(expected_missing) + len(expected_unexpected)
@@ -1465,15 +1490,8 @@ def _json_safe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def _canonical_json(payload: Any) -> str:
-    return json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    )
+_canonical_json = canonical_json
 
 
 def _canonical_payload_sha256(payload: Any) -> str:
-    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+    return canonical_sha256(payload)

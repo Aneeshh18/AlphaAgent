@@ -1023,9 +1023,26 @@ and observations to the decision date, verifies accepted issuer-scoped ingest
 evidence and the current issuer relation, replays the archived v2 parse and the
 candidate v3 parser, and classifies each issuer without provider access. By
 default it publishes nothing; `--write-plan` creates only a content-addressed
-review artifact under `data/reports/companyfacts_replays/plans`. No v3
-activation path exists in this build, and the planner cannot mutate DuckDB, raw
-snapshots, paper state, or broker state.
+review artifact under `data/reports/companyfacts_replays/plans`. The planner
+itself never mutates DuckDB, raw snapshots, paper state, or broker state.
+
+A separate, explicit activation path exists in `companyfacts_v3_activation.py`
+(CLI: `companyfacts-v3-prepare`, `companyfacts-v3-activate`), mirroring
+`universe_change_activation.py`'s prepare/backup/CAS/disposable-proof/atomic-
+commit/receipt pattern. It never fetches from a provider — v3 is a re-parse
+of the same already-captured, already-verified payload bytes v2 used.
+Mutation reuses the frozen `Store.upsert_fundamentals` (already versions into
+`fundamental_versions`) for added/changed keys and tombstones
+(`is_deleted=TRUE`) a key v3 withholds that v2 had silently kept, with one
+`fundamental_evidence_generations` row pinning the resulting boundary and one
+append-only receipt in `companyfacts_v3_activations`. Run to completion
+against the full 500-issuer production universe on 2026-08-12 (11 batches);
+`fundamentals`' primary key is `(ticker, period_end, as_of_date, metric)`,
+not issuer-scoped, and three tickers (BG, XOM, BLK) legitimately carry two
+different issuer_ids each from a CIK-successor event — the disposable-proof
+step caught a ticker-only-scoped verification query missing that before it
+ever touched live state; fixed with an explicit cross-issuer collision guard
+and issuer_id-scoped queries, then re-verified.
 
 Reference import remains one atomic transaction. Data ingestion is isolated per
 accepted issuer and security so a network/provider failure cannot hide or roll

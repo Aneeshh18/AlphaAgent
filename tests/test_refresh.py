@@ -16,6 +16,7 @@ class FakeStore:
     def __init__(self, members: list[dict]) -> None:
         self.members = members
         self.issuers_with_fundamentals: set[str] = set()
+        self.later_verified_issuer_assignments: set[str] = set()
 
     def universe_membership_on(self, universe_id: str, as_of: date) -> list[dict]:
         assert universe_id == "sp500"
@@ -25,6 +26,14 @@ class FakeStore:
     def issuer_id_for_security(self, security_id: str, as_of: date) -> str | None:
         assert as_of == date(2026, 7, 21)
         return {"sec-a": "issuer-a", "sec-b": "issuer-b"}.get(security_id)
+
+    def has_later_verified_issuer_assignment(
+        self,
+        security_id: str,
+        as_of: date,
+    ) -> bool:
+        assert as_of == date(2026, 7, 21)
+        return security_id in self.later_verified_issuer_assignments
 
     def provider_symbol_mappings(self, security_id: str, **kwargs) -> list[dict]:
         assert kwargs == {
@@ -252,6 +261,52 @@ def test_current_us_refresh_warns_for_reviewed_pre_filing_issuer() -> None:
     ]
 
 
+def test_current_us_refresh_keeps_later_reviewed_issuer_pending() -> None:
+    store = FakeStore([{"ticker": "NEW", "security_id": "sec-new"}])
+    store.later_verified_issuer_assignments.add("sec-new")
+    attempted: list[str] = []
+
+    result = refresh_us_current(
+        "2026-07-21",
+        today=date(2026, 7, 21),
+        store=store,  # type: ignore[arg-type]
+        minimum_members=1,
+        maximum_members=10,
+        include_prices=False,
+        include_macro=False,
+        issuer_ingester=lambda issuer: attempted.append(issuer) or 1,
+    )
+
+    assert result.ok is True
+    assert result.failures == ()
+    assert result.issuers_attempted == 0
+    assert attempted == []
+    assert [(warning.kind, warning.identity) for warning in result.warnings] == [
+        ("fundamentals_pending", "sec-new")
+    ]
+
+
+def test_current_us_refresh_fails_for_unreviewed_missing_issuer() -> None:
+    store = FakeStore([{"ticker": "NEW", "security_id": "sec-new"}])
+
+    result = refresh_us_current(
+        "2026-07-21",
+        today=date(2026, 7, 21),
+        store=store,  # type: ignore[arg-type]
+        minimum_members=1,
+        maximum_members=10,
+        include_prices=False,
+        include_macro=False,
+        issuer_ingester=lambda _issuer: 1,
+    )
+
+    assert result.ok is False
+    assert result.warnings == ()
+    assert [(failure.kind, failure.identity) for failure in result.failures] == [
+        ("issuer_identity", "sec-new")
+    ]
+
+
 def test_current_us_refresh_fails_if_established_issuer_returns_no_rows() -> None:
     store = FakeStore([{"ticker": "AAA", "security_id": "sec-a"}])
     store.issuers_with_fundamentals.add("issuer-a")
@@ -388,3 +443,50 @@ def test_current_us_refresh_cli_records_zero_exit_degradation(
     assert [alert.code for alert in emitted] == ["current_refresh_partial"]
     assert emitted[0].payload["identities"] == ["ABC"]
     assert recovered == []
+
+
+def test_current_us_refresh_cli_does_not_open_incident_for_expected_pending_facts(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    emitted = []
+    monkeypatch.setattr(cli, "settings", SimpleNamespace(project_root=tmp_path))
+
+    def fake_refresh(_as_of, **_kwargs) -> USRefreshResult:
+        return USRefreshResult(
+            as_of="2026-07-21",
+            universe_id="sp500",
+            members=503,
+            issuers_attempted=499,
+            securities_attempted=0,
+            macro_rows=0,
+            fundamental_rows=100,
+            price_rows=0,
+            benchmark_rows=0,
+            failures=(),
+            warnings=(
+                RefreshFailure(
+                    "fundamentals_pending",
+                    "sec-new",
+                    "effective issuer evidence was reviewed later",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(refresh_module, "refresh_us_current", fake_refresh)
+    monkeypatch.setattr(cli, "_emit_operational_alert", emitted.append)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "refresh-us-current",
+            "--as-of",
+            "2026-07-21",
+            "--no-prices",
+            "--no-macro",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "fundamentals_pending sec-new" in result.output
+    assert emitted == []

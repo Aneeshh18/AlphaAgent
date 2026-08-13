@@ -31,6 +31,9 @@ In-house, minimal-cost, institutional-style investment intelligence system (Path
 > `companyfacts-v3-plan --as-of YYYY-MM-DD` command to re-evaluate exact local
 > evidence; this build deliberately provides no v3 activation path.
 
+> **Using the dashboard?** [`DASHBOARD_GUIDE.md`](./DASHBOARD_GUIDE.md) is a
+> plain-language walkthrough of the app itself — no CLI commands required.
+
 ## Quick start
 
 ```bash
@@ -339,16 +342,20 @@ files. Peak working sets were about 1.10 GiB for QV and 1.19 GiB for QVML, so
 cold dashboard builds are serialized. These are local engineering
 measurements, not a cross-machine latency guarantee.
 
-The current-date gate is real rather than implied. At the 2026-07-30 live
-read-only checkpoint the reviewed decision date is 2026-07-30: 503 S&P 500
-members have
-stable security identities,
-500 have PIT company filings, all 503 have current action-safe prices, SPY is
-current through the same close, and the latest required macro release is dated
-2026-07-30. Validation reports zero hard failures and three visible warnings;
-readiness is `READY`. Active trial `us-qv-forward-72c4560a442d` has one
-registered 2026-07-27 proposal and zero executions. Predecessor
-`us-qv-forward-8559d86b6a02` remains archived unchanged.
+The current-date gate is real rather than implied. At the 2026-08-08 live
+checkpoint the reviewed decision date is 2026-08-07: all 503 S&P 500 members
+have stable security identities, current action-safe prices and PIT company
+filings, and SPY and mandatory macro evidence reach the same close.
+The official EA-to-FERG replacement is live through a governed atomic
+activation whose immutable receipt binds the official event, reviewed identity
+manifests, backup and exact before/after membership sets. A later governed FERG
+refresh accepted 323 source-bound rows and withheld 24 ambiguous storage keys.
+Validation has zero hard failures and four visible warnings; August 7 readiness
+is `READY`. Active trial
+`us-qv-forward-ea4fc2788c4d` has one prospective 2026-08-07 proposal for the
+August 10 close and zero executions. Expired predecessor
+`us-qv-forward-72c4560a442d` and its proposal are archived byte-identically
+without a fill.
 
 The broader 2025-to-current stateful engineering backtest now completes all six
 periods. It applies the reviewed HES→CVX conversion, liquidates MTCH and PAYC
@@ -361,8 +368,8 @@ after-tax, or personal investment claim.
 |---|---|---|
 | Supervised U.S. research | available now | keep `aios readiness` and `aios validate` non-failing |
 | Advisory proposal stress review | available now in the CLI and Paper Trial for the registered simulation-only proposal; no artifact is stored by default | keep the forward trial unchanged and exact PIT identity, action-safe price, row-level liquidity, revenue, proposal, and source evidence sufficient |
-| Local U.S. paper simulation | sandbox exists with $100,000 cash, zero holdings/executions, and no broker; the expired registered proposal now has a stable content-addressed v4 rollover-plan contract | use read-only status, stress review, preview, and optional `--write-plan` while live activation is blocked; activate only in a later prospective window after every fresh readiness, operations, deadline, backup, lock, and CAS gate passes |
-| U.S. technical-beta completion | historical gate, recoverable daily workflow, retry-safe outbox, and deferred SMTP adapter complete; one successful July 30 job is durable evidence and a current normal-session check verifies all three timers | complete the acknowledged XOM evidence review, clear the fundamentals warning through governed evidence, and accumulate repeated natural guarded cycles; email activation remains optional and deferred |
+| Local U.S. paper simulation | sandbox has $100,000 cash, zero holdings/executions and no broker; governed v4 rollover activated one later prospective proposal without filling the expired cycle | wait for the reviewed August 10 close, then use explicit paper review and confirmation inside the valid recording window |
+| U.S. technical-beta completion | atomic constituent activation, current readiness, daily, filings, backup and prospective rollover are live-proven; retry-safe outbox and deferred SMTP adapter remain | keep later cycles green and regenerate release proof for every candidate; email activation remains optional and deferred |
 | Controlled real-capital pilot | not approved; at least 8–12 weeks of untouched forward monitoring after freeze | broker reconciliation, alerts, price versioning, and user-approved tax/risk policy |
 | India market build | next major phase after the U.S. technical gate | NSE/BSE identity, membership, filings, actions, calendars, taxes, benchmarks, and parity tests |
 
@@ -448,7 +455,7 @@ required elapsed forward-test period cannot be compressed by adding compute.
   separately from the certified research window and returns a failing exit code
   when current paper-use evidence is incomplete. The dashboard refuses dates
   outside the reviewed window instead of silently using raw rows. The current
-  reviewed U.S. decision date is 2026-07-30. `validate`, `readiness`, and
+  reviewed U.S. decision date is 2026-08-07. `validate`, `readiness`, and
   `health` use read-only DuckDB connections. An omitted readiness date resolves
   from reviewed market evidence rather than the local calendar. When a gate is blocked, health
   labels the examined date as a candidate rather than certified. A newer price
@@ -577,16 +584,17 @@ required elapsed forward-test period cannot be compressed by adding compute.
   extend the manually reviewed path through 2026-07-21. The first immutable
   no-change attestation advanced current operating coverage through 2026-07-22;
   later independently archived attestations advanced it through 2026-07-23,
-  2026-07-24, 2026-07-30, and finally the pre-effective 2026-08-03 close, all
-  without inventing an announcement date. The announced FERG/EA replacement is
-  still a hard boundary at its August 5 effective date. This does not claim a
-  complete 1996-present announcement archive.
-- **Stable identities:** 533 membership intervals link to 529 internal security
+  2026-07-24, 2026-07-30, and the pre-effective 2026-08-03 close, all without
+  inventing an announcement date. The official FERG/EA replacement was then
+  activated atomically with reviewed source, identity, backup and post-event
+  holdings evidence; no-change review now reaches 2026-08-07. This does not
+  claim a complete 1996-present announcement archive.
+- **Stable identities:** 569 membership intervals link to 561 internal security
   IDs. Four source-verified ticker transitions are joined; ordinary index
   replacements and WRK→SW remain separate. Bounded ticker-derived IDs are
   labeled provisional instead of masquerading as authoritative identifiers.
-- **Issuer/provider identities:** 528 reviewed issuers now have historical SEC
-  CIK assignments across 531 dated security-owner intervals, while 534 provider-symbol
+- **Issuer/provider identities:** 565 reviewed issuers now have historical SEC
+  CIK assignments across 1,071 dated security-owner intervals, while 1,075 provider-symbol
   intervals explicitly mark verified, unavailable, or wrong-security aliases.
   Fundamentals route by issuer ID and prices by security ID. This prevents old
   Physicians Realty `DOC` history from contaminating Healthpeak and prevents
@@ -685,7 +693,7 @@ required elapsed forward-test period cannot be compressed by adding compute.
 
 Current U.S. membership, stable identity, action-safe prices, SPY, PIT filings,
 macro evidence, risk checks, and supervised paper state now reach the reviewed
-2026-07-30 decision close. The benchmark-first daily workflow, free-source
+2026-08-07 decision close. The benchmark-first daily workflow, free-source
 universe review, health, backup/recovery,
 scheduler controls, local incident ledger, systemd failure/recovery handlers,
 retry-safe notification outbox, fail-closed SMTP adapter, and local dashboard
@@ -694,20 +702,15 @@ until local credentials and a real receipt test are supplied. The six-period
 stateful rerun and its held-security evidence are complete. Three core timers are installed;
 the daily service passed live 503-member July 23 and July 24 catch-ups and a
 no-download systemd recovery proof, and it remains active after desktop logout while the
-computer is on. Predecessor `us-qv-forward-8559d86b6a02` is archived unchanged.
-Active trial `us-qv-forward-72c4560a442d` began prospectively from the
-2026-07-27 close, has one registered proposal, and has zero executions. The
-2026-07-29 full read-only review passed and stopped at an explicit human
-decision; it produced no execution command and recorded no simulation. The
-host-verified guarded daily run passed at 13:12 IST. A current normal-session
-check verifies all three user timers active and waiting. The current operations
-projection has one open warning incident, `current_refresh_partial`, plus one
-acknowledged medium-severity SEC coverage case for XOM. FDXF and HONA were
-accepted as explicit zero-row gaps with score withholding preserved. Unattended
-operation is therefore not currently claimed. The next operational-evidence
-gate is completion of the XOM review and governed reconciliation of the
-fundamentals warning; it must not be claimed in advance. Untouched elapsed
-observation continues while immutable
+computer is on. The EA-to-FERG event is atomically activated from official and
+reviewed manifests, and FERG identity, prices and accepted fundamentals are
+live while ambiguous keys remain withheld. Daily, filings and backup services have successful terminal
+evidence and the operating queue has no blocker. Expired trial
+`us-qv-forward-72c4560a442d` and its proposal are archived byte-identically;
+active trial `us-qv-forward-ea4fc2788c4d` began prospectively from the
+2026-08-07 close, has one proposal for the August 10 close, and has zero
+executions. The account remains $100,000 cash with zero holdings and no broker.
+Untouched elapsed observation continues while immutable
 evidence is extended beyond the now-live SEC Company Facts/Submissions path.
 No-change days can advance
 automatically; a real S&P

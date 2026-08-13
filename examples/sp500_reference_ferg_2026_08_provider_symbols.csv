@@ -1,0 +1,2 @@
+provider,provider_symbol,security_id,data_start,data_end,mapping_status,verified_date,source
+yfinance,FERG,aios:bounded:sp500:ferg,2026-08-05,2026-08-07,verified,2026-08-07,https://query1.finance.yahoo.com/v8/finance/chart/FERG

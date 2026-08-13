@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from aios.artifacts import publish_text_write_once
+from aios.canonical import canonical_json
 from aios.ingest.edgar import (
     COMPANYFACTS_CAPTURE_PARSER_VERSION,
     COMPANYFACTS_NEXT_PARSER_VERSION,
@@ -316,6 +317,61 @@ def persist_companyfacts_v3_plan(
     if read_companyfacts_v3_plan(destination) != plan:
         raise RuntimeError("published Company Facts replay plan failed verification")
     return destination
+
+
+def scoped_source_evidence(
+    store: Store, *, issuer_id: str, as_of: date | str
+) -> dict[str, Any] | None:
+    """Return the newest accepted, decision-scoped Company Facts evidence for one issuer.
+
+    Mirrors the per-issuer scoping `preview_companyfacts_v3_replay` performs
+    internally, but returns the full evidence row (including its raw-payload
+    location) that the persisted review plan's public `source` projection
+    deliberately omits. The governed v3 activation module needs this to
+    re-verify and re-parse the exact payload at activation time rather than
+    trusting anything cached in a plan file.
+    """
+    decision_as_of = _normalize_as_of(as_of)
+    ingest_columns = _table_columns(store, "ingest_log")
+    subject_columns = {"subject_type", "subject_id"} & ingest_columns
+    if subject_columns and subject_columns != {"subject_type", "subject_id"}:
+        raise ValueError("Company Facts planner found an incomplete ingest subject schema")
+    evidence_rows = store.query(
+        _SOURCE_EVIDENCE_SQL.format(
+            subject_type=("outcome.subject_type" if subject_columns else "NULL AS subject_type"),
+            subject_id=("outcome.subject_id" if subject_columns else "NULL AS subject_id"),
+            rejection_codes=(
+                "outcome.rejection_codes"
+                if "rejection_codes" in ingest_columns
+                else "NULL AS rejection_codes"
+            ),
+        )
+    )
+    observations = []
+    for row in evidence_rows:
+        normalized = _normalize_evidence_row(row)
+        if _scoped_issuer_id(normalized) != issuer_id:
+            continue
+        try:
+            received_on = _observation_date(normalized.get("received_at"))
+        except ValueError:
+            continue
+        if received_on > decision_as_of:
+            continue
+        observations.append(normalized)
+    if not observations:
+        return None
+    return max(observations, key=_evidence_order_key)
+
+
+def verified_companyfacts_payload_bytes(root: Path, evidence: dict[str, Any]) -> bytes:
+    """Verify and return one exact captured Company Facts payload.
+
+    Public wrapper so the governed v3 activation module reuses the same
+    hardened evidence verification the read-only planner uses, rather than a
+    second implementation that could silently diverge from it.
+    """
+    return _verified_payload_bytes(root, evidence)
 
 
 def read_companyfacts_v3_plan(path: Path) -> dict[str, Any]:
@@ -1355,14 +1411,7 @@ def _payload_sha256(payload: dict[str, Any]) -> str:
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
 
-def _canonical_json(value: Any) -> str:
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    )
+_canonical_json = canonical_json
 
 
 def _is_lower_sha256(value: Any) -> bool:

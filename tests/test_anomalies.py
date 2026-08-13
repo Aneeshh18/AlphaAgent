@@ -26,6 +26,7 @@ from aios.anomalies import (
 )
 from aios.ingest.edgar import (
     COMPANYFACTS_CAPTURE_PARSER_VERSION,
+    COMPANYFACTS_LEGACY_PARSER_VERSION,
     COMPANYFACTS_NEXT_PARSER_VERSION,
     COMPANYFACTS_PARSER_VERSION,
     canonical_sec_fundamental_row_sha256,
@@ -210,7 +211,7 @@ def test_sec_coverage_scan_builds_one_evidence_bound_case_per_missing_issuer(
         "subject_tagged_and_payload_verified",
     }
     replay = first.evidence["ingest"]["zero_row_replay_proof"]
-    assert replay["parser_version"] == COMPANYFACTS_PARSER_VERSION
+    assert replay["parser_version"] == COMPANYFACTS_LEGACY_PARSER_VERSION
     assert replay["decision_evidence_as_of"] == "2026-07-27"
     assert replay["replayed_rows"] == 0
     assert replay["decision_visible_valid_rows"] == 0

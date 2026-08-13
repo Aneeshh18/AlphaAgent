@@ -40,6 +40,9 @@ MANAGED_SERVICE_NAMES = SERVICE_NAMES + LEGACY_SERVICE_NAMES
 ALERT_SERVICE_NAME = "aios-alert@.service"
 STATUS_QUERY_TIMEOUT_SECONDS = 5.0
 SCHEDULED_LOCK_WAIT_SECONDS = 30 * 60
+DAILY_SERVICE_TIMEOUT = "45min"
+FILINGS_SERVICE_TIMEOUT = "3h"
+BACKUP_SERVICE_TIMEOUT = "2h"
 FLOCK_PATH = Path("/usr/bin/flock")
 UNIT_NAMES = (
     "aios-us-daily.service",
@@ -92,7 +95,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=DUCKDB_LOCK_WAIT_SECONDS=300
 UMask=0077
 Nice=10
-TimeoutStartSec=45min
+TimeoutStartSec={DAILY_SERVICE_TIMEOUT}
 """
     units = {
         "aios-us-daily.service": (
@@ -121,6 +124,11 @@ TimeoutStartSec=45min
                 "[Unit]\nDescription=AIOS weekly SEC filing refresh\n",
                 1,
             )
+            .replace(
+                f"TimeoutStartSec={DAILY_SERVICE_TIMEOUT}",
+                f"TimeoutStartSec={FILINGS_SERVICE_TIMEOUT}",
+                1,
+            )
             + (
                 f"ExecStart={serialized_launcher} refresh-us-current "
                 "--no-prices --no-macro\n"
@@ -137,6 +145,11 @@ TimeoutStartSec=45min
             common_service.replace(
                 "[Unit]\n",
                 "[Unit]\nDescription=AIOS weekly verified local backup\n",
+                1,
+            )
+            .replace(
+                f"TimeoutStartSec={DAILY_SERVICE_TIMEOUT}",
+                f"TimeoutStartSec={BACKUP_SERVICE_TIMEOUT}",
                 1,
             )
             + f"ExecStart={serialized_launcher} backup\n"
@@ -316,6 +329,8 @@ def _scheduler_status(
                 runner,
                 SERVICE_BY_TIMER[timer],
                 (
+                    "ActiveState",
+                    "SubState",
                     "Result",
                     "ExecMainStatus",
                     "ExecMainStartTimestamp",
@@ -323,16 +338,23 @@ def _scheduler_status(
                 ),
             )
             last_trigger = timer_properties.get("LastTriggerUSec", "never")
-            service_last_run = service_properties.get(
-                "ExecMainExitTimestamp",
-                service_properties.get("ExecMainStartTimestamp", "never"),
-            )
+            service_exit = service_properties.get("ExecMainExitTimestamp")
+            service_start = service_properties.get("ExecMainStartTimestamp")
+            service_last_run = service_exit or service_start or "never"
             # A service can also be started manually for a recovery proof. Its
             # actual execution time is newer and more useful than the timer's
             # last trigger; fall back to the trigger only before any service run.
             last_run = service_last_run if service_last_run != "never" else last_trigger
             service_result = service_properties.get("Result", "not-run")
             exit_status = service_properties.get("ExecMainStatus", "unknown")
+            service_active = service_properties.get("ActiveState") in {
+                "active",
+                "activating",
+                "reloading",
+            }
+            if service_start and not service_exit and service_active:
+                service_result = "running"
+                exit_status = "unknown"
             # systemd reports Result=success and ExecMainStatus=0 for a freshly
             # loaded oneshot service even when it has never executed. Do not turn
             # those defaults into a false successful-run claim.

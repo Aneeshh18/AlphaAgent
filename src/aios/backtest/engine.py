@@ -43,6 +43,14 @@ from aios.factors.policy import (
 from aios.macro.regime import MacroRegimeSnapshot, compute_regime
 from aios.storage.store import Store, get_store
 
+# Below this many completed rebalances, no return gap is interpretable — the
+# quantity being measured is dominated by which handful of names happened to
+# be selected. Set at 20 because a quarterly strategy needs roughly five
+# years before period count alone stops being the binding constraint, and
+# this repository's own history shows two short windows reversing the
+# ranking of two strategies against the same benchmark.
+MINIMUM_PERIODS_FOR_ANY_INFERENCE = 20
+
 
 @dataclass(frozen=True)
 class QVBacktestConfig:
@@ -302,6 +310,16 @@ class BacktestMetrics:
     total_taxes: float = 0.0
     total_turnover: float = 0.0
     daily_observations: int = 0
+    # Risk-adjusted return assuming a 0% risk-free rate. Stated explicitly
+    # because a Sharpe quoted without its rate assumption is not comparable
+    # to anyone else's.
+    sharpe_ratio: float | None = None
+    # t-statistic of the mean period return against zero. This tests only
+    # "did this make money", never "did this beat the benchmark" — the
+    # latter is the question that matters and lives in
+    # `strategy_vs_benchmark_significance` on the result, because it needs
+    # both return series.
+    return_t_stat: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -351,12 +369,63 @@ class QVBacktestResult:
     def comparison_periods(self) -> int:
         return sum(period.status == "complete" for period in self.periods)
 
+    def strategy_vs_benchmark_significance(self) -> dict[str, Any]:
+        """Test the only question that matters: did this beat buy-and-hold?
+
+        Cumulative return alone cannot answer that. A strategy holding ten
+        equal-weighted names over a handful of rebalances can beat or trail
+        an index by double digits on noise, and this repository has already
+        produced exactly that: two windows in which the ranking of two
+        strategies against the same benchmark reverses completely.
+
+        This pairs the strategy and benchmark daily returns *by date* — an
+        unpaired comparison would silently compare different trading days —
+        and reports the mean daily excess with its t-statistic. It never
+        returns a pass/fail flag, because a threshold would just relocate
+        the cherry-picking rather than remove it. `verdict` states what the
+        sample can and cannot support, in words.
+        """
+        results: dict[str, Any] = {}
+        strategy_by_date = {
+            point.date: point.net_daily_return
+            for point in self.regime_equity_curve
+            if point.net_daily_return is not None
+        }
+        for ticker, curve in self.benchmark_equity_curves.items():
+            benchmark_by_date = {
+                point.date: point.daily_return
+                for point in curve
+                if point.daily_return is not None
+            }
+            shared_dates = sorted(strategy_by_date.keys() & benchmark_by_date.keys())
+            excess = [
+                float(strategy_by_date[day]) - float(benchmark_by_date[day])
+                for day in shared_dates
+            ]
+            _sharpe, t_stat = _sharpe_and_t_stat(excess, 252.0)
+            mean_daily_excess = sum(excess) / len(excess) if excess else None
+            results[ticker] = {
+                "paired_observations": len(excess),
+                "completed_periods": self.comparison_periods,
+                "mean_daily_excess_return": mean_daily_excess,
+                "excess_return_t_stat": t_stat,
+                "verdict": _significance_verdict(
+                    t_stat,
+                    self.comparison_periods,
+                    len(excess),
+                ),
+            }
+        return results
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "config": asdict(self.config),
             "tickers": list(self.tickers),
             "regime_metrics": self.regime_metrics.to_dict(),
             "baseline_metrics": self.baseline_metrics.to_dict(),
+            "strategy_vs_benchmark_significance": (
+                self.strategy_vs_benchmark_significance()
+            ),
             "benchmark_metrics": {
                 ticker: metrics.to_dict() for ticker, metrics in self.benchmark_metrics.items()
             },
@@ -1369,6 +1438,64 @@ def _compute_benchmark_metrics(
     return _metrics_from_equity_curve(returns, aligned, 0.0, 0.0, 0.0)
 
 
+def _significance_verdict(
+    t_stat: float | None,
+    completed_periods: int,
+    paired_observations: int,
+) -> str:
+    """State plainly what this sample can support, so a reader cannot over-read it.
+
+    Deliberately conservative. A rebalance count in the single digits cannot
+    establish an edge no matter how large the return gap looks, and saying so
+    in the artifact is the only thing that reliably stops a lucky window from
+    being promoted as a finding.
+    """
+    if t_stat is None or paired_observations < 2:
+        return "insufficient data: no paired observations to compare"
+    if completed_periods < MINIMUM_PERIODS_FOR_ANY_INFERENCE:
+        return (
+            f"not interpretable: {completed_periods} completed rebalance(s) is "
+            "far too few to separate skill from luck, whatever the return gap"
+        )
+    if abs(t_stat) < 2.0:
+        return (
+            f"indistinguishable from noise (t={t_stat:.2f}): this result is "
+            "consistent with chance and must not be reported as an edge"
+        )
+    return (
+        f"statistically suggestive (t={t_stat:.2f}) but unconfirmed: daily "
+        "returns are autocorrelated, so this overstates significance; treat "
+        "as a hypothesis for out-of-sample testing, never as a validated edge"
+    )
+
+
+def _sharpe_and_t_stat(
+    returns: list[float],
+    periods_per_year: float,
+) -> tuple[float | None, float | None]:
+    """Return an annualized Sharpe (0% risk-free) and a t-stat against zero.
+
+    Both are ``None`` below two observations or at zero dispersion, where
+    neither quantity is defined. Reporting ``0.0`` there would read as a
+    measured result rather than an absent one.
+
+    The t-statistic treats period returns as independent, which overstates
+    significance when returns are autocorrelated. It is a floor on the
+    evidence required, never a proof of skill — and with the handful of
+    rebalances a short window produces, it will correctly stay small.
+    """
+    if len(returns) < 2:
+        return None, None
+    mean = sum(returns) / len(returns)
+    variance = sum((value - mean) ** 2 for value in returns) / (len(returns) - 1)
+    deviation = sqrt(variance)
+    if deviation <= 0:
+        return None, None
+    sharpe = (mean / deviation) * sqrt(periods_per_year)
+    t_stat = mean / (deviation / sqrt(len(returns)))
+    return sharpe, t_stat
+
+
 def _metrics_from_equity_curve(
     period_returns: list[float],
     curve: list[EquityCurvePoint],
@@ -1395,6 +1522,7 @@ def _metrics_from_equity_curve(
         if len(daily_returns) > 1
         else 0.0
     )
+    sharpe, t_stat = _sharpe_and_t_stat(daily_returns, 252.0)
     return BacktestMetrics(
         completed_periods=len(period_returns),
         cumulative_return=cumulative_return,
@@ -1407,6 +1535,8 @@ def _metrics_from_equity_curve(
         total_taxes=total_taxes,
         total_turnover=total_turnover,
         daily_observations=len(curve),
+        sharpe_ratio=sharpe,
+        return_t_stat=t_stat,
     )
 
 
@@ -1439,6 +1569,7 @@ def _metrics_from_returns(
         if len(returns) > 1
         else 0.0
     )
+    sharpe, t_stat = _sharpe_and_t_stat(returns, 4.0)
     return BacktestMetrics(
         completed_periods=len(returns),
         cumulative_return=equity - 1.0,
@@ -1450,6 +1581,8 @@ def _metrics_from_returns(
         total_transaction_costs=total_costs,
         total_taxes=total_taxes,
         total_turnover=total_turnover,
+        sharpe_ratio=sharpe,
+        return_t_stat=t_stat,
     )
 
 

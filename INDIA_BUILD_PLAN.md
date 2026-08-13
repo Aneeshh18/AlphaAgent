@@ -83,6 +83,77 @@ retune factors or overwrite the existing forward trial.
 
 ### I1 - Add first-class market contracts
 
+**Started 2026-08-11.** Seven new, purely additive tables exist in the live
+schema: `markets`, `venues`, `market_profiles`, `security_listings`,
+`trading_sessions`, `settlement_policies`, `benchmarks`. Applied to the real
+production database (not just a fixture) — verified against real row counts
+before/after, zero existing rows touched. A `us_equity` market/venue/
+market_profile/benchmark row and 569 `security_listings` rows now exist,
+backfilled from the already-verified `universe_membership` history; the
+backfill script is idempotent (checked by running it twice).
+
+The exit gate's core claim — shared factor/identity/PIT/readiness code needs
+no market-specific branching — is now proven, not assumed:
+`tests/test_market_contracts.py` builds one synthetic ISIN-identified,
+INR-denominated security on a synthetic NSE-shaped venue and runs it through
+the *exact* `compute_composite`, `security_id_for_ticker`,
+`universe_identity_labels`, `universe_data_coverage`, and
+`assess_us_readiness` the U.S. reference data uses — no `.NS`, no `NSE`, no
+currency branch anywhere in those call paths. All three tests pass. One real,
+if cosmetic, finding surfaced along the way: `readiness.py`'s success/failure
+detail strings hardcode the words "S&P 500" regardless of `rules.universe_id`
+— the actual numeric checks are correctly parameterized, only the English
+description text is wrong. `readiness.py` is frozen; this is a fix for the
+next policy version, not a blocker.
+
+Adding these tables also broke three existing backup/restore compatibility
+tests — a real regression, not a false alarm. `operations.py`'s
+`_LEGACY_020_COLUMN_CONTRACTS` pins exact column/constraint hashes for two
+historical "0.2" schema snapshots that test fixtures reconstruct by taking
+*today's* live schema and removing one specific table; adding tables changes
+what "today's live schema minus that table" hashes to, so a third pinned
+entry was required (not a redesign — this dict is meant to grow every time
+schema.py changes, exactly as the existing two-entry history shows). Fixed,
+verified, documented in the dict itself so the next schema change knows the
+pattern to follow.
+
+**I1 substantially complete (2026-08-11).** `src/aios/markets.py` is the
+validated registration/read layer over those tables, because raw SQL let a
+caller insert an invalid timezone, a fabricated currency, or a listing whose
+`known_at` postdated the interval it claimed to cover. It enforces:
+
+- ISO 3166-1 alpha-2 country, ISO 4217 currency, IANA timezone (validated
+  through `zoneinfo`, not a regex), ISO 10383 MIC shape;
+- **ISO 6166 ISIN check-digit validation** — a transposed ISIN is otherwise a
+  silent identity error that routes data to the wrong company, which is
+  precisely the failure class this system exists to prevent. Verified against
+  real ISINs (Apple `US0378331005`, Reliance `INE002A01018`, Vodafone
+  `GB0002634946`) and confirmed to reject single-digit corruptions of each;
+- half-open `[listed_start, listed_end)` intervals, and a refusal when
+  `known_at` postdates `listed_end`;
+- referential checks: a venue must belong to a registered market, a listing
+  to a registered venue *and* an existing `security_master` security.
+
+`active_listing()` takes `as_of` and `known_as_of` **separately**, mirroring
+`universe_membership`'s `effective_*` / `known_date` split. Collapsing them
+would reintroduce look-ahead bias through the identity layer. Pinned by
+`tests/test_markets.py` (17 tests), including the case that matters: a
+listing whose interval covers March but whose `known_at` is August is
+correctly invisible to a March decision and visible to a September one.
+
+Real India identities are now registered in the live database — `in_equity`
+(IN / INR / Asia/Kolkata), venue `xnse` (MIC XNSE, National Stock Exchange of
+India Limited) and venue `xbom` (MIC XBOM, BSE Limited). These are verifiable
+ISO/registry facts, not market data; no Indian price, fundamental, or
+membership row exists yet and none may until I2's source gate passes.
+
+Still deferred from I1, deliberately: `trading_sessions` and
+`settlement_policies` remain empty. Populating them requires the real NSE
+holiday calendar and the dated T+1/optional-T+0 settlement rules, which are
+I2/I4 inputs — inventing placeholder sessions now would be fabricated
+evidence. Neither blocks I2.
+
+
 Add versioned entities rather than scattered string columns:
 
 - `markets`: country, base currency, timezone and default calendar;
@@ -105,6 +176,45 @@ calendar, PIT, factor, portfolio, and readiness contracts without `.NS`, INR,
 or NSE logic inside shared factor code.
 
 ### I2 - Run a source and licensing spike
+
+**Executed 2026-08-11. Findings in [`INDIA_SOURCE_MATRIX.md`](./INDIA_SOURCE_MATRIX.md)
+— read that before any India ingest work.**
+
+Headline result: **the free-scraping path is closed, on NSE's own stated
+terms, on two independent grounds.** Both clauses were retrieved and
+independently confirmed from the canonical Terms of Use page:
+
+- Clause 4 prohibits "any systematic or automated data collection activities
+  (including scraping, data mining, data extraction and data harvesting)"
+  — no personal-use or research exemption exists;
+- Clause 3 prohibits using the data "for any gaming, virtual trading or
+  simulation activities under any circumstances whatsoever" — which
+  describes this project's backtest and paper-trading simulation directly,
+  and would bar the use even for lawfully obtained data.
+
+`robots.txt` is permissive and contradicts Clause 4. That contradiction is
+real, but a crawler convention is not a licence grant; the Terms bind.
+
+Every free scraper library and Kaggle dataset examined (`jugaad-data`,
+`nsepy`, `eod2`, `nsetools`) sources from nseindia.com and therefore inherits
+this defect — a permissive *code* licence never conveys rights to the *data*.
+This is the same test that eliminated yfinance for U.S. commercial use, and
+NSE's prohibition is stricter than Yahoo's.
+
+The constructive half: licensed access is genuinely affordable. NSE's own
+tariff has a Students/Researchers tier (₹18,000/yr indicative, 2020 document)
+and prices internal non-redistributed use at a quarter of display use; NSE's
+data policy explicitly contemplates fee waivers for "Researchers, Students
+etc." Among third parties, **Twelve Data ($29/mo) has the only licence whose
+grant is "internal business purposes" rather than "personal, non-commercial"**
+— the distinction that determines whether the licence survives the project
+growing beyond a hobby. Tiingo, despite already being integrated for U.S.
+data, covers no Indian equities at all.
+
+**Blocking open item:** dated historical Nifty 50 constituents remain
+unresolved. Without survivorship-safe membership, no honest India backtest is
+possible — this is the gate, not the price of prices.
+
 
 For each source, capture exact response bytes or label a library-only artifact
 as `normalized_provider_export`. Record access method, terms URL, request rate,

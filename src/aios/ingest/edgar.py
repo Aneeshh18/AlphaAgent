@@ -48,7 +48,8 @@ FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 COMPANYFACTS_BULK_URL = "https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip"
 COMPANYFACTS_CAPTURE_PARSER_VERSION = "sec-companyfacts-capture-v1"
 COMPANYFACTS_LEGACY_PARSER_VERSION = "sec-companyfacts-v2"
-COMPANYFACTS_PARSER_VERSION = "sec-companyfacts-v2"
+COMPANYFACTS_STORAGE_SAFE_V1_PARSER_VERSION = "sec-companyfacts-v2-storage-safe-v1"
+COMPANYFACTS_PARSER_VERSION = "sec-companyfacts-v2-storage-safe-v2"
 COMPANYFACTS_NEXT_PARSER_VERSION = "sec-companyfacts-v3"
 DEI_ENTITY_SHARES_CONCEPT = "EntityCommonStockSharesOutstanding"
 SUBMISSIONS_CAPTURE_PARSER_VERSION = "sec-submissions-capture-v1"
@@ -841,14 +842,19 @@ def _fundamental_storage_key(row: dict[str, Any]) -> tuple[Any, ...]:
 
 def _select_metric_storage_rows(
     rows: list[dict[str, Any]],
+    *,
+    preserve_legacy_winner: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Produce at most one unambiguous v3 row for every database key.
+    """Produce at most one unambiguous row for every database key.
 
     Repeated filings on one day commonly restate the same fact under identical
     economics and fiscal semantics. Those rows collapse deterministically while
     retaining every exact source locator. If the same PIT key disagrees on
-    fiscal period, statement, value, quarter value, or unit, the entire key is
-    withheld rather than letting insertion order choose an answer.
+    fiscal period, statement, value, quarter value, or unit, v3 withholds the
+    entire key. The storage-safe v2 compatibility parser instead preserves the
+    first provider row's economics explicitly, matching the frozen legacy
+    projection while preventing duplicate database keys. Conflicting peers are
+    still counted as rejected evidence.
     """
 
     grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
@@ -859,19 +865,26 @@ def _select_metric_storage_rows(
     rejected_conflicts = 0
     for key in sorted(grouped, key=lambda item: tuple(str(value) for value in item)):
         candidates = grouped[key]
-        economic_values = {
-            (
+        def economic_value(candidate: dict[str, Any]) -> tuple[Any, ...]:
+            return (
                 candidate.get("fiscal_period"),
                 candidate.get("statement"),
                 candidate.get("value"),
                 candidate.get("quarter_value"),
                 candidate.get("unit"),
             )
-            for candidate in candidates
-        }
+
+        economic_values = {economic_value(candidate) for candidate in candidates}
         if len(economic_values) != 1:
             rejected_conflicts += 1
-            continue
+            if not preserve_legacy_winner:
+                continue
+            first_economics = economic_value(candidates[0])
+            candidates = [
+                candidate
+                for candidate in candidates
+                if economic_value(candidate) == first_economics
+            ]
         source_locators = sorted(
             {
                 json.dumps(
@@ -882,6 +895,7 @@ def _select_metric_storage_rows(
                     allow_nan=False,
                 )
                 for candidate in candidates
+                if _SOURCE_FACT_LOCATOR_KEY in candidate
             }
         )
         selected_row = min(
@@ -894,14 +908,15 @@ def _select_metric_storage_rows(
                 allow_nan=False,
             ),
         ).copy()
-        selected_row.pop(_SOURCE_FACT_LOCATOR_KEY)
-        selected_row["source_fact_locator"] = json.dumps(
-            [json.loads(locator) for locator in source_locators],
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        )
+        selected_row.pop(_SOURCE_FACT_LOCATOR_KEY, None)
+        if source_locators:
+            selected_row["source_fact_locator"] = json.dumps(
+                [json.loads(locator) for locator in source_locators],
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
         selected.append(selected_row)
     return selected, rejected_conflicts
 
@@ -968,6 +983,8 @@ def _companyfacts_provider_rows(
     cik: int,
     *,
     taxonomy_aware: bool = False,
+    storage_safe: bool = False,
+    preserve_legacy_winner: bool = False,
 ) -> tuple[list[dict[str, Any]], int, int, int]:
     """Parse the identity-neutral, PIT-safe rows consumed from Company Facts."""
     facts = _validate_companyfacts_payload(payload, cik)
@@ -1052,8 +1069,11 @@ def _companyfacts_provider_rows(
             rows.append(provider_row)
 
     rejected_storage_conflicts = 0
-    if taxonomy_aware:
-        rows, rejected_storage_conflicts = _select_metric_storage_rows(rows)
+    if taxonomy_aware or storage_safe:
+        rows, rejected_storage_conflicts = _select_metric_storage_rows(
+            rows,
+            preserve_legacy_winner=preserve_legacy_winner,
+        )
     return (
         rows,
         rejected_future_periods,
@@ -1083,10 +1103,22 @@ def replay_sec_companyfacts_response(
         cik = int(decoded["cik"])
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("Company Facts payload has no valid CIK") from exc
-    if parser_version == COMPANYFACTS_PARSER_VERSION:
+    if parser_version == COMPANYFACTS_LEGACY_PARSER_VERSION:
         taxonomy_aware = False
+        storage_safe = False
+        preserve_legacy_winner = False
+    elif parser_version == COMPANYFACTS_STORAGE_SAFE_V1_PARSER_VERSION:
+        taxonomy_aware = False
+        storage_safe = True
+        preserve_legacy_winner = False
+    elif parser_version == COMPANYFACTS_PARSER_VERSION:
+        taxonomy_aware = False
+        storage_safe = True
+        preserve_legacy_winner = True
     elif parser_version == COMPANYFACTS_NEXT_PARSER_VERSION:
         taxonomy_aware = True
+        storage_safe = True
+        preserve_legacy_winner = False
     else:
         raise ValueError(
             f"unsupported SEC Company Facts parser version: {parser_version}"
@@ -1100,6 +1132,8 @@ def replay_sec_companyfacts_response(
         decoded,
         cik,
         taxonomy_aware=taxonomy_aware,
+        storage_safe=storage_safe,
+        preserve_legacy_winner=preserve_legacy_winner,
     )
     metadata = {
         "parser_version": parser_version,
@@ -1118,6 +1152,26 @@ def replay_sec_companyfacts_response(
 
 def parse_sec_companyfacts_response_v2(payload: bytes) -> list[dict[str, Any]]:
     """Replay archived v2 rows without applying the dormant v3 repair."""
+    rows, _metadata = replay_sec_companyfacts_response(
+        payload,
+        parser_version=COMPANYFACTS_LEGACY_PARSER_VERSION,
+    )
+    return rows
+
+
+def parse_sec_companyfacts_response_storage_safe_v1(
+    payload: bytes,
+) -> list[dict[str, Any]]:
+    """Replay archived v1 storage-safe withholding semantics exactly."""
+    rows, _metadata = replay_sec_companyfacts_response(
+        payload,
+        parser_version=COMPANYFACTS_STORAGE_SAFE_V1_PARSER_VERSION,
+    )
+    return rows
+
+
+def parse_sec_companyfacts_response_storage_safe(payload: bytes) -> list[dict[str, Any]]:
+    """Replay the active v2 metric policy with one deterministic row per key."""
     return parse_sec_companyfacts_response(payload)
 
 
@@ -1228,10 +1282,22 @@ def extract_fundamentals(
         ),
         cik,
     )
-    if companyfacts_parser_version == COMPANYFACTS_PARSER_VERSION:
+    if companyfacts_parser_version == COMPANYFACTS_LEGACY_PARSER_VERSION:
         taxonomy_aware = False
+        storage_safe = False
+        preserve_legacy_winner = False
+    elif companyfacts_parser_version == COMPANYFACTS_STORAGE_SAFE_V1_PARSER_VERSION:
+        taxonomy_aware = False
+        storage_safe = True
+        preserve_legacy_winner = False
+    elif companyfacts_parser_version == COMPANYFACTS_PARSER_VERSION:
+        taxonomy_aware = False
+        storage_safe = True
+        preserve_legacy_winner = True
     elif companyfacts_parser_version == COMPANYFACTS_NEXT_PARSER_VERSION:
         taxonomy_aware = True
+        storage_safe = True
+        preserve_legacy_winner = False
     else:
         raise ValueError(
             f"unsupported SEC Company Facts parser version: {companyfacts_parser_version}"
@@ -1245,6 +1311,8 @@ def extract_fundamentals(
         facts,
         cik,
         taxonomy_aware=taxonomy_aware,
+        storage_safe=storage_safe,
+        preserve_legacy_winner=preserve_legacy_winner,
     )
     companyfacts_snapshot_id: str | None = None
     companyfacts_rowset_sha256: str | None = None
@@ -1386,7 +1454,10 @@ def ingest_issuer(
                 "SEC Company Facts v3 live mutation is unavailable in this build; "
                 "use the read-only governed replay planner."
             )
-        if companyfacts_parser_version != COMPANYFACTS_PARSER_VERSION:
+        if companyfacts_parser_version not in {
+            COMPANYFACTS_LEGACY_PARSER_VERSION,
+            COMPANYFACTS_PARSER_VERSION,
+        }:
             raise ValueError(
                 "unsupported SEC Company Facts parser version: "
                 f"{companyfacts_parser_version}"

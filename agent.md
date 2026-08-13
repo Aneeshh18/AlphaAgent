@@ -18,34 +18,84 @@ implement a later milestone before its listed dependencies and exit gates. Use
   personal buy/sell advice exists.
 - Normal operation must not require DuckDB or Streamlit knowledge.
 
-## Verified checkpoint — 2026-07-30
+## Verified checkpoint — 2026-08-07
 
-Current U.S. decision close: **2026-07-29**.
+Current U.S. decision close: **2026-08-07**.
+
+- S&P Dow Jones Indices announced EA's deletion and FERG's addition effective
+  before the 2026-08-05 open. The event is now live through governed activation
+  receipt `uca-event-87d33f15572441efbedd7b47a1226b64`, which binds the
+  official event, reviewed reference manifests, backup, exact member-set hashes
+  and staged price evidence. FERG is SEC CIK `0002011641`. A later governed
+  refresh accepted 323 source-bound rows and withheld 24 ambiguous storage
+  keys.
+- Current live preflight reports supervised research, operations and proposal
+  stress review available. Paper recording is waiting for the prospective
+  2026-08-10 close. Real capital remains disabled.
+- The paper account remains simulation-only with $100,000 cash and zero
+  holdings/executions. Expired trial `us-qv-forward-72c4560a442d` and its
+  proposal are archived byte-identically with no fill. Active trial
+  `us-qv-forward-ea4fc2788c4d` has one prospective proposal.
+- Reference-batch endpoint review now accepts a half-open window ending today
+  or tomorrow only when verified today. Historical reviews retain the stricter
+  filings-on-both-sides rule.
 
 - `aios health --report-only`: healthy for supervised research and paper
-  monitoring; database integrity is 0 failures/3 warnings and the active
+  monitoring; database integrity is 0 failures/4 warnings and the active
   forward policy is unchanged.
 - 503 dated S&P 500 members; 503/503 stable security identities.
-- 500/503 members have PIT fundamentals; 503/503 have identity-safe prices.
-- Company Facts v3 remains a blocked candidate. Its reviewed replay processes
-  500 payloads, emits 1,119,730 rows, rejects 42 future-period rows, withholds
-  17,860 unsupported-context rows and 26,152 ambiguous storage keys, and emits
-  zero duplicate keys. The disposable candidate makes 394/503 QV scores
-  structurally computable only before freshness and lineage gates.
-- All 1,270,623 live fundamental rows and all candidate rows remain unlineaged.
-  Zero issuers are currently eligible for governed v3 activation; do not
-  promote the parser or its structural score count until lineage, freshness,
-  candidate-diff, and restore gates pass.
+- 503/503 members have PIT fundamentals and identity-safe prices.
+- Company Facts v3: **re-verified live 2026-08-12**, source lineage is not
+  the blocker. `companyfacts-v3-plan --as-of 2026-08-10` shows 500/500
+  issuers with accepted evidence pass every lineage check
+  (`ingest_run_id`/`source_snapshot_id`/row-hash all match stored evidence);
+  the earlier "394/503, zero eligible" figures were stale. FDXF, HONA, XOM
+  still have no accepted evidence at all — unrelated pre-existing gap.
+- The v2→v3 delta is real and large — 26,356 added, 41,794 removed, 326,467
+  changed rows across all 500 eligible issuers, out of ~1.17M. Root cause
+  understood, not guessed: v2 sets `preserve_legacy_winner=True` and silently
+  keeps an arbitrary first row when a filing has genuinely conflicting
+  economics for one storage key; v3 sets it `False` and withholds the whole
+  key instead — fail-closed, same philosophy as the rest of this codebase,
+  not a bug.
+- **Activation write path built and verified 2026-08-12** as
+  `src/aios/companyfacts_v3_activation.py`, mirroring
+  `universe_change_activation.py`'s proven prepare/backup/CAS/disposable-
+  proof/atomic-commit/receipt pattern. `companyfacts-v3-prepare` and
+  `companyfacts-v3-activate` are CLI-wired. Mutation reuses the frozen
+  `Store.upsert_fundamentals` (already versions into `fundamental_versions`)
+  for added/changed keys and tombstones (`is_deleted=TRUE`) a key v3
+  withholds that v2 had silently kept — the "future shrinking replacement
+  path" `ARCHITECTURE.md` flagged as needing explicit confirmation, backup,
+  and compare-and-set evidence. One `fundamental_evidence_generations` row
+  pins the resulting `version_sequence` boundary per activation, in the new
+  `companyfacts_v3_activations` receipt table. Verified against a real
+  production scratch copy (one issuer, 68 added/720 changed/35 removed,
+  exact match to plan prediction) and 6 unit tests.
+- **Run to completion 2026-08-12, user-directed.** All 500 eligible issuers
+  migrated across 11 batches; `companyfacts-v3-plan` now reports 0 eligible,
+  500 ineligible (all on v3). Batch 10 caught a real bug before it touched
+  production: three tickers (BG, XOM, BLK) legitimately have two different
+  issuer_ids (CIK-successor reincorporation), and `fundamentals`' primary
+  key is `(ticker, period_end, as_of_date, metric)`, not issuer-scoped. The
+  post-write verification query was ticker-only, so it saw the other
+  issuer's unrelated legacy rows as noise and correctly refused inside the
+  disposable-restore-first step — production was never touched by the
+  failing batch. Fixed with a pre-write cross-issuer collision guard plus
+  issuer_id-scoped delete/verification queries; confirmed via repro that no
+  actual key collision existed for BG/XOM/BLK in practice (a false-negative,
+  not a near-miss), then re-ran clean. Full suite/ruff/frozen-bundle
+  re-verified after the fix and again after the final batch.
 - `aios companyfacts-v3-plan --as-of YYYY-MM-DD` now classifies already-captured
   exact v2 evidence and optionally publishes a content-addressed review plan.
   It is read-only, performs no provider fetch or governed-state mutation, and
   exposes no v3 activation path.
 - 503/503 have recent prices with reviewed dividend/split fields.
-- SPY benchmark/calendar is reviewed through 2026-07-29. The current raw source
-  clocks are prices 2026-07-29, filings 2026-07-24, and macro releases
-  2026-07-29.
-- The immutable archive verifier checks 4,252 unique payloads and replays 4,424
-  parsed artifacts.
+- SPY benchmark/calendar and the full reviewed member set are certified through
+  2026-08-07. Current source clocks for prices, filings and mandatory macro
+  releases reach 2026-08-07.
+- The immutable archive verifier checks 7,977 unique payloads and replays
+  11,601 parsed artifacts across 12,647 fetch observations.
 - A prior replay-aware AAPL SEC ingest proved that the transport can link 4,102
   canonical Company Facts rows
   (parsed SHA-256
@@ -54,24 +104,19 @@ Current U.S. decision close: **2026-07-29**.
   `5b0495ce0bc6f27cc5147cc63617a6423ed53ef52b49ab1626d99c0dd39c7cde`)
   to one successful reviewed-issuer run. That transport proof is not current
   live-row lineage and does not make AAPL or any other issuer v3-eligible.
-- Database quality: zero hard failures, three visible warning categories.
-- The last certified release checkpoint passed the full suite,
-  repository-wide Ruff, bytecode compilation, reproducible wheel builds, exact
-  source-to-wheel verification, and clean-install smoke. That result is
-  historical checkpoint evidence only; regenerate the complete proof for every
-  release candidate after source stabilization.
-- `aios preflight --review-paper` passed read-only and returned only
-  `aios forward-rollover` as the next safe command. That command defaults to
-  preview. The v4 activation mechanism exists, but current live gates block it.
-  Account, proposal, trial, DuckDB, and operations hashes were unchanged; no
-  simulation was recorded.
-- Host scheduler verification found the daily, filings, and backup timers
-  active and waiting with successful latest results and linger enabled. The
-  July 30 naturally triggered daily service completed with status 0. A current
-  normal-session check reverified that runtime; `current_refresh_partial` is
-  the only open operating incident. FDXF and HONA are resolved as explicit
-  zero-row gaps with withholding preserved. XOM remains acknowledged pending
-  predecessor-successor evidence; it is not an operating incident.
+- Database quality: zero hard failures, four visible warning categories.
+- The current source passes 1,075 tests, repository-wide Ruff, bytecode
+  compilation and diff checks. Independent wheels are byte-identical, and the
+  exact source-to-wheel plus clean-install verifier passes. Candidate SHA-256 is
+  `448c9f77031bf24084636ade283f932c71163e7505535a273877dd8365745287`.
+- `aios preflight --json` is read-only. It now reports operations verified and
+  the paper proposal waiting for the scheduled close.
+- Daily, filings and backup services all reached `Result=success` and
+  `ExecMainStatus=0`. The daily job certified 503 members and the exact August 7
+  session; filings attempted 499/499 issuers with no hard failure; the current
+  backup passed manifest verification and a disposable restore drill. No
+  operational blocker remains. FDXF, HONA, and XOM are resolved as explicit
+  reviewed gaps with score withholding preserved.
 - Governed anomaly-review v1 compares reviewed membership with accepted SEC
   fundamentals, fails closed on missing or conflicting source evidence, and
   makes explicit `--record` append an immutable scan and lifecycle events while
@@ -132,28 +177,29 @@ Current local row counts:
 
 | Table | Rows |
 |---|---:|
-| securities | 561 |
-| security_master | 560 |
-| security_identity_assignments | 568 |
-| issuer_master | 564 |
-| issuer_cik_history | 1,063 |
-| security_issuer_assignments | 1,070 |
-| provider_symbol_history | 1,074 |
+| securities | 562 |
+| security_master | 561 |
+| security_identity_assignments | 569 |
+| issuer_master | 565 |
+| issuer_cik_history | 1,064 |
+| security_issuer_assignments | 1,071 |
+| provider_symbol_history | 1,075 |
 | security_conversions | 1 |
 | security_ticker_extensions | 2 |
 | factor_price_provenance | 543 |
 | factor_prices | 131,252 |
-| prices | 524,854 |
-| fundamentals | 1,270,623 |
+| prices | 528,381 |
+| fundamentals | 1,279,612 |
 | fundamentals_quarantine | 42 |
-| macro | 733,945 |
-| universe_membership | 568 |
-| universe_coverage_attestations | 7 |
-| raw_payloads | 4,252 |
-| raw_snapshots | 5,440 |
-| ingest_raw_snapshots | 5,440 |
+| macro | 915,001 |
+| universe_membership | 569 |
+| universe_coverage_attestations | 19 |
+| raw_payloads | 7,977 |
+| raw_snapshots | 12,647 |
+| ingest_raw_snapshots | 12,647 |
 
-All 1,270,623 rows in `fundamentals` are currently unlineaged.
+All 1,279,612 rows in `fundamentals` are currently unlineaged at the row level;
+immutable raw and ingest-run evidence remains available separately.
 
 Operational note for 2026-07-22: the naturally triggered weekday refresh first
 failed on transient FRED DNS resolution and isolated Yahoo empty responses. A
@@ -323,10 +369,11 @@ Not approved:
 
 The paper account at `data/paper/us_qv_sandbox.json` remains entirely simulated:
 $100,000 cash, zero holdings, zero executions, and no broker connection. Active
-trial `us-qv-forward-72c4560a442d` began prospectively from the 2026-07-27
-decision close and has one registered, approved simulation-only proposal for
-the 2026-07-28 session. Predecessor `us-qv-forward-8559d86b6a02` is archived
-unchanged. Do not restart the active trial or treat the proposal as a holding.
+trial `us-qv-forward-ea4fc2788c4d` began prospectively from the 2026-08-07
+decision close and has one registered, approved simulation-only proposal
+(`paper-2026-08-07-35266fec0591`) for the 2026-08-10 session. Predecessor
+`us-qv-forward-72c4560a442d` is archived unchanged with a no-fill disposition.
+Do not restart the active trial or treat the proposal as a holding.
 
 ## Completed U.S. stateful engineering gate
 
@@ -405,6 +452,8 @@ period is neither long nor an untouched holdout.
 | `src/aios/scheduler.py` | bounded systemd-user timer lifecycle |
 | `src/aios/alerts.py` | independent incidents, jobs, anomaly cases, and SQLite notification outbox |
 | `src/aios/anomalies.py` | source-bound, fail-closed data-quality detectors |
+| `src/aios/canonical.py` | the single canonical JSON contract every evidence hash uses |
+| `src/aios/markets.py` | validated market/venue/dated-listing identity (India phase I1) |
 | `src/aios/notifications.py` | channel boundary and bounded local dispatcher |
 | `src/aios/dashboard.py` | decision-first, read-only Streamlit control room |
 | `src/aios/dashboard_ui.py` | pure scoped-status and next-action presentation model |
@@ -602,20 +651,15 @@ manual.
 
 ## Immediate plan
 
-1. Start with `aios preflight`. As of 2026-07-30, supervised research is
-   certified through 2026-07-29, while the registered 2026-07-27 proposal's
-   simulation window is expired and no simulation was recorded. Never force a
-   retrospective fill, delete or overwrite the registered proposal, or claim a
-   replacement can be created: that active proposal currently blocks proposal
-   creation. Read-only status, stress review, checksum-bound rollover preview,
-   and optional stable plan publication are usable. The v4 activation mechanism
-   is implemented, but live activation remains gate-blocked while operations
-   evidence is unresolved. Do not restart the unchanged active forward trial.
-2. The durable ledger records one successful July 30 job for the July 29
-   session, and a current normal-session check verifies all three timers.
-   Complete the acknowledged XOM evidence review, reconcile the fundamentals
-   warning only through governed evidence, and accumulate repeated natural
-   guarded cycles plus one bounded recovery exercise.
+1. Start with `aios preflight`. As of 2026-08-08, supervised research is
+   certified through 2026-08-07 and operations are verified. The active
+   2026-08-07 proposal is prospective for the 2026-08-10 close. Wait for that
+   close; never record early or retrospectively.
+2. The EA-to-FERG change is atomically active, current readiness passes, and
+   daily, filings and backup services have successful terminal evidence. Keep
+   FERG's 24 ambiguous storage keys withheld. For every new constituent event,
+   repeat the exact plan, source-hash CAS, backup, disposable
+   activation/rollback, explicit confirmation and immutable-receipt workflow.
 3. Observe normal use of the completed institutional dashboard and keep visual
    regression screenshots with any Streamlit upgrade. Ranked-row navigation,
    failure-first System Health, four-stage Paper Trial, responsive stacking, and
@@ -645,28 +689,249 @@ manual.
    deduplicated case/event history, explicit owner/disposition controls, and
    read-only dashboard visibility. The 2026-07-27 and current certified
    2026-07-29 boundaries are recorded in operations schema v6. FDXF/HONA are
-   accepted explicit gaps; XOM remains under human review. The stale-proposal
-   v3 stable plan contract is implemented; next design the fixed operations
-   gate, atomic active-pointer cutover, and crash reconciliation after XOM is
-   genuinely reviewed, then add the remaining anomaly rule families,
-   experiment registration, and versioned configuration boundaries.
+   accepted explicit gaps; XOM is also resolved without manufacturing evidence.
+   The stale-proposal v4 lifecycle is live-proven through one no-fill successor
+   activation. Five further rule families are now implemented as library
+   detectors: `price_action_mismatch@1.0.0` (scope `us-equity-prices:*`) flags a
+   close-to-close move past the review threshold on an action-complete session
+   that declares no split and no dividend;
+   `coverage_deterioration@1.0.0` (scope `us-equity-coverage:*`) compares
+   current coverage with the previous comparable measurement and stays silent
+   without a baseline; `mapping_drift@1.0.0` (scope
+   `us-equity-mappings:*`) reports a security holding two overlapping verified
+   windows at one provider, or one provider symbol claimed by two securities on
+   the same date; `share_count_jump@1.0.0` (scope `us-equity-shares:*`) flags
+   implausible `shares_out` movement between consecutive point-in-time filings;
+   and `conflicting_filings@1.0.0` (scope `us-equity-filings:*`) reports one
+   issuer/metric/period key resolving to more than one stored value.
+   `anomalies.run_detectors()` runs a selected subset and returns
+   one independent scan per rule. Each family owns its scope so its monotonic
+   source-boundary advances independently; `rule_bundle_version` and the
+   single-rule `executed_rules` contract are unchanged. The sixth and final
+   family, `factor_percentile_jump@1.0.0` (scope `us-equity-factors:*`), is now
+   built: it compares each member's 0-100 composite percentile against the
+   previous comparable measurement and reports a move past the threshold as an
+   inputs question, never a score adjustment. All six rule families are
+   complete and, as of 2026-08-11, wired into `aios anomaly-scan --rule
+   RULE_ID` (repeatable) and `--all-rules`, plus `--factor-model` for the
+   factor rule. Preview mode never opens the operations ledger, matching the
+   legacy single-rule command exactly, which means `coverage_deterioration`
+   and `factor_percentile_jump` always preview baseline-free (their real
+   baseline is only fetched under `--record`) — a deliberate, documented
+   trade for zero-footprint preview, not an oversight.
+   `coverage_deterioration`'s baseline comes from
+   `AlertStore.latest_anomaly_scan_evidence(scope)`, a new read method (the
+   ledger already carries its small `current_coverage` payload).
+   `factor_percentile_jump`'s baseline cannot: a 503-name score map does not
+   fit the ledger's 64 KiB evidence limit, so it has its own tiny write-once
+   store, `anomalies.record_factor_percentile_baseline()` /
+   `latest_factor_percentile_baseline()`, under
+   `data/anomaly_baselines/factor_percentiles/<universe>-<model>/<date>.json`,
+   entirely outside the operations ledger. Recorded for real against
+   production on 2026-08-11: 45 review cases (5 `price_action_mismatch`, 40
+   `share_count_jump`) for 2026-08-07, confirmed visible in the dashboard's
+   existing Operations anomaly table with zero dashboard code changes — that
+   table was already generic across rule_id, never hardcoded to the SEC rule.
+
+   A genuine second, parallel forward paper trial for QVML now runs alongside
+   the certified QV trial, live as of 2026-08-11 — real, ongoing, out-of-sample
+   observation, not another backtest. `data/paper/us_qvml_sandbox.json`
+   ($100,000 simulated, isolated from the QV account) and
+   `data/paper/us_qvml_forward_trial.json` (trial `us-qv-forward-89ebd906b8d7`,
+   registered proposal `us-qvml-2026-08-10.json`, targets CINF/HST/MPC/CF/DVA/
+   EIX/CVS/EXPE/OXY/EOG). Getting here required two real fixes, both in
+   non-frozen `cli.py`:
+   - `paper-propose`, `paper-review`, `paper-execute`, and `paper-status` all
+     hardcoded the forward-trial path to the single default
+     (`aios.forward.DEFAULT_FORWARD_RELATIVE_PATH`) with no override — a
+     second trial was structurally impossible to operate before this. All
+     four now accept `--trial`, defaulting to the original path, so every
+     existing invocation is unaffected.
+   - `create_paper_proposal` (frozen `paper.py`) always reads
+     `row.qv_score`/`row.qv_rank` off whatever `composite_computer` returns
+     and always calls it with `include_market_factors=False`; there is no
+     parameter to select QVML. `paper-propose --factor-model qvml` passes
+     `_qvml_selecting_composite_computer` through that exact injection
+     point: it calls the real `compute_composite(..., include_market_factors=
+     True)` (ignoring the frozen caller's `False`) and copies each row's
+     already-independently-ranked `qvml_score`/`qvml_rank` onto
+     `qv_score`/`qv_rank` before returning — a dependency injection, not an
+     edit to frozen selection logic. The one honesty gap this cannot close:
+     `payload["strategy"]` is a hardcoded `"qv"` literal in frozen
+     `paper.py`, so every QVML proposal also gets a write-once sidecar,
+     `<proposal>.factor_model_override.json`, declaring the override
+     explicitly, plus a prominent CLI warning at creation time. Read that
+     sidecar, not the `strategy` field, to know what a proposal actually is.
+   Watch both with `aios paper-status --account ... --trial ...` and
+   `aios forward-status --trial ... --account ...`; nothing here executes a
+   trade or requires real money. Real evidence about whether QVML helps
+   accumulates here, one real session at a time — not from re-running the
+   backtest that motivated trying it.
+
+   Next: versioned configuration boundaries.
+
+   Experiment registration is now built as `src/aios/experiments.py`
+   (`register_experiment`, `load_experiment`, `list_experiments`). Every
+   backtest/factor run binds an exact Git commit, dirty-worktree fingerprint
+   (changed paths only, never diff content), a streaming SHA-256 of the exact
+   DuckDB file, retained raw-evidence coverage, backtest parameters and
+   metrics, and an optional parent/comparison-reason pair. `frozen` and
+   `holdout` purposes refuse a dirty worktree; every purpose is write-once
+   under `data/experiments/<experiment_id>.json`, so append-only is enforced
+   by the filesystem primitive, not just documented. Verified against the real
+   402 MB `data/aios.duckdb` and the live repo's actual git state (66 dirty
+   files at verification time) into a scratch directory outside `data/`; the
+   round-tripped document matched exactly and its integrity hash re-verified.
+   The 2026-08-11 `forward-restart` (below) narrowed the frozen bundle to 13
+   files and removed `cli.py`/`alerts.py`/`storage/store.py` from it, so this
+   boundary is now lifted for the active trial: `backtest-qv --output PATH
+   --register-experiment [--experiment-purpose ...] [--experiment-notes ...]`
+   registers inline, `aios list-experiments` and `aios compare-experiments
+   ID ID...` are real CLI commands. `compare_experiments()` still never picks
+   a winner; adopting a variant is still a deliberate
+   `forward-restart --confirm-restart`.
+
+   The dashboard's Paper Trial page now has one write path: when the timing
+   stage reads "Review Now," a panel offers the exact same review the CLI's
+   `paper-review` performs, then — after an explicit checkbox acknowledgement
+   — a button that runs the identical call chain `paper-execute` uses
+   (`project_maintenance_lock`, `require_registered_forward_proposal`,
+   `execute_paper_proposal(confirm_simulated=True)`), all imported from the
+   frozen `aios.paper`/`aios.forward`/`aios.maintenance` modules without
+   editing any of them. `src/aios/dashboard.py` is not itself in the frozen
+   bundle. The dashboard remains otherwise entirely read-only; this is not
+   unattended execution — the checkbox is the same deliberate human
+   confirmation the CLI requires, relocated into the browser. Verified with
+   six new `AppTest` cases in `tests/test_dashboard_app.py`, including a real
+   simulated checkbox-check-then-click through the fake write path and the
+   refused-write error path; a live headless `streamlit run` smoke test also
+   passed.
+
+   A dashboard-jargon sweep found the app already follows its own "everyday
+   labels, technical codes in expanders" rule everywhere except one place: the
+   sidebar footer named the database engine ("DuckDB · checksum protected").
+   Fixed to "Stored on this computer · Tamper-evident". No broader dashboard
+   rewrite was warranted or performed — inventing edits where the rule was
+   already followed would not have made the product more usable.
+   `DASHBOARD_GUIDE.md` is a new plain-language walkthrough of the app itself
+   (no CLI), linked from `README.md` and `BEGINNER_GUIDE.md`.
+
+   Phase 4's research/market/account configuration domains are built as
+   `src/aios/policy_domains.py`. Each domain gets a caller-assigned
+   `name`/`version` and a content hash computed by importing the real values
+   from `factors/policy.py`, `risk/policy.py`, and `backtest/costs.py` — all
+   three frozen — rather than duplicating them by hand, so drift in the
+   source changes the hash automatically. `market_profile` is hand-declared
+   (benchmark `SPY`, universe `sp500`, session-close rule) rather than
+   introspected, because the equivalent `market_calendar.py` values are
+   private module attributes; every value matches an existing repo-wide
+   convention, none invented. `experiments.register_experiment()` embeds this
+   snapshot by default, and `compare_experiments()` now flags whether two
+   runs shared a named policy identity via `comparable_policy`. Item 8
+   (pre-August-2023 delisting/announcement provenance back to 1996) is
+   deliberately not attempted here: it requires real S&P DJI archival
+   research across ~28 years, and fabricating "verified" historical events
+   would corrupt the one property this system actually has — trustworthy
+   evidence. It remains open, and should stay open until real primary-source
+   research is done, not synthesized.
+
+   All five were verified read-only against the live 503-member database for
+   the 2026-08-07 decision date, and each resulting scan passes the ledger's
+   own `_prepare_anomaly_scan` contract with all four safety counters at zero:
+   prices 5 findings, shares 40, coverage/mappings/filings 0. Unit tests alone
+   did not establish this — their fakes accept any dataset label, give every
+   member a distinct issuer, and never exercise the ledger — so five defects
+   reached the live path and are now fixed and regression-tested:
+   the price rule bounded itself on dataset `prices` when the archive labels
+   every price response `daily-prices`, so it withheld every scan; a stored
+   non-positive `shares_out` raised instead of being reported, withholding all
+   503 members over 80 historical rows; the issuer-keyed rules iterated members
+   rather than issuers and repeated a fingerprint for the three dual-class
+   issuers, which the ledger rejects; a case subject omitted `as_of_date`, so
+   one restated period collapsed into one fingerprint; and every new rule used
+   a descriptive `confidence` string when the ledger accepts only
+   `low`/`medium`/`high`, which alone made all five unrecordable.
+   `factor_percentile_jump` was verified the same way. There is no stored
+   factor-score history, so `measure_universe_factor_percentiles()` returns the
+   snapshot and the caller keeps it as the next scan's baseline, matching the
+   coverage rule's contract; the 503-entry score maps stay out of scan evidence
+   because two of them exceed the 64 KiB limit. Against the live database it is
+   correctly silent between consecutive sessions and fires across a real gap:
+   comparing 2026-07-24 with 2026-08-07 reports KLAC at -48.2 percentile points
+   and, from 2026-07-31, VRTX at +25.0. Note that decision dates on or before
+   roughly 2026-07-10 currently score zero members, so a baseline older than
+   that yields `compared_members = 0` and the scan stays silent — confirm the
+   factor-price freshness gate before reading that silence as health.
+   The share rule reviews the most recent `SHARES_LOOKBACK_FILINGS = 8` filings
+   per issuer. Its full retained history yields 750 findings for one date,
+   which no scan can store: ledger evidence is capped at 64 KiB and `alerts.py`
+   is frozen, so the cap cannot be raised. Pass a larger `lookback_filings`
+   deliberately for a one-off historical sweep, and expect roughly 200 findings
+   to be the practical per-scan ceiling.
    Current-holdings stress, multifactor/Monte Carlo risk, and owner-authored
    scenarios remain future work.
+0. **Run exactly one paper account and one forward trial until the
+   `account_id` collision is fixed.** `paper.py:178` hardcodes
+   `"account_id": "us-qv-supervised-sandbox"` for every account
+   `paper-init` creates, which makes the cross-account guard at
+   `paper.py:640` a no-op: a proposal built for one sandbox executes
+   against another without complaint. `paper.py` is frozen, so this waits
+   for a deliberate policy version — see `FUTURE_BUILD_PLAN.md`. The QVML
+   trial was deliberately **not** restarted on 2026-08-12 for this reason.
 8. Extend pre-August-2023 announcement and delisting provenance as a separate
-   long-history track.
+   long-history track. **Researched, not attempted, 2026-08-12** (see
+   `SP500_DATA_PROVENANCE.md`'s new section): no source found meets this
+   project's evidence bar (official S&P DJI release + independent
+   cross-check) for a full 1996-present extension without an institutional
+   CRSP/Compustat-class subscription this project isn't budgeted for.
+   S&P DJI's own press archive only goes back to 2012 on the modern domain;
+   Wikipedia's changes table is unreliable pre-2001 by its own editors'
+   admission; SEC EDGAR full-text search only indexes filings from 2001. A
+   smaller, real extension is achievable — 2012-forward via S&P DJI's own
+   archive (one release at a time, no consolidated file), optionally
+   cross-checked against 2001-forward EDGAR 8-Ks — if this is picked up
+   again. Do not lower the evidence bar to force full 1996 coverage.
 9. Follow `INDIA_BUILD_PLAN.md`: Nifty 50 first, no NSE/BSE ingest before the
-   portable schema and source/licensing gates pass.
+   portable schema and source/licensing gates pass. **Phase I1 is
+   substantially complete as of 2026-08-11**: seven additive market-contract
+   tables exist in the live schema, `src/aios/markets.py` is the validated
+   registration/read layer (ISO country/currency/timezone/MIC checks, ISIN
+   check-digit validation, half-open dated listings, and an `active_listing`
+   that takes `as_of` and `known_as_of` separately so a later-reviewed listing
+   cannot inform an earlier decision), and real `in_equity` / `xnse` / `xbom`
+   identities are registered. `tests/test_market_contracts.py` proves the
+   phase's actual exit claim — a synthetic ISIN/INR/NSE-shaped security scores
+   and resolves through the exact same `compute_composite`, identity and
+   readiness code the U.S. build uses, with no market branching in that path.
+   **Phase I2 (source/licensing review) is also complete**, written up in
+   `INDIA_SOURCE_MATRIX.md`: NSE's own Terms of Use bar both the collection
+   method (Clause 4, scraping) and the intended use (Clause 3, "simulation
+   activities... under any circumstances") for nseindia.com data, with no
+   personal/research exemption on either — a free bounded beta is **not
+   available**. A paid track is: NSE's own Students/Researchers tier
+   (~₹18,000/yr indicative, unconfirmed current) or Twelve Data ($29/mo, best
+   licence posture found — "internal business purposes," not
+   personal-non-commercial). Emails drafted to `marketdata@nse.co.in`
+   (pricing/waiver) and `indices@nse.co.in` (constituent history) but not yet
+   sent by the user. Separately, an official dated Nifty 50 constituent file
+   (`archives.nseindia.com/content/indices/IndexInclExcl.xls`) exists and is
+   PIT-correct (effective dates, not announcement dates) but only covers
+   1996–2020-07-31 and inherits the same Clause 3 block; post-2020 history
+   would need individual dated press releases, also gated.
+   **No Indian price, fundamental, or membership row exists, and none may be
+   ingested until a licensed source is actually acquired** — that decision
+   (spend or wait on NSE's reply) is the user's, not yet made.
 10. Ask the user for jurisdiction, account type, broker, and final risk limits
    only before after-tax or controlled-capital certification.
 
-The historical U.S. technical gate, exact-date daily workflow, native systemd
-verification, live catch-up, and startup no-op proof are complete. Forward trial
-`us-qv-forward-a0b63856954c` is drifted and retained only as invalidated history;
-it has zero executions. Predecessor `us-qv-forward-8559d86b6a02` is archived
-unchanged. Active trial `us-qv-forward-72c4560a442d` is policy-intact, has one
-2026-07-27 proposal, and has zero executions. Any real-capital pilot still
-needs at least 8–12 weeks of untouched forward observation plus the separate
-controlled-capital gates.
+The U.S. exact-date daily workflow, atomic constituent activation, native
+systemd services, backup/restore proof and prospective rollover are complete.
+Forward trial `us-qv-forward-a0b63856954c` is drifted and retained only as
+invalidated history. Expired trial `us-qv-forward-72c4560a442d` is archived
+unchanged with zero executions. Active trial `us-qv-forward-ea4fc2788c4d` is
+policy-intact, has one prospective proposal and zero executions. Any
+real-capital pilot still needs at least 8–12 weeks of untouched forward
+observation plus the separate controlled-capital gates.
 
 ## Core commands
 

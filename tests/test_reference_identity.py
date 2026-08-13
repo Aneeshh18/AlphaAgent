@@ -281,6 +281,73 @@ def test_yfinance_rejects_invalid_completed_ohlc(
         prices.fetch_yfinance("TEST", start="2024-01-01", end="2024-01-03")
 
 
+def test_yfinance_v3_repairs_small_ohlc_envelope_and_labels_storage_source(
+    monkeypatch,
+) -> None:
+    def fake_download(*_args, **_kwargs):
+        return pd.DataFrame(
+            {
+                "Open": [99.95],
+                "High": [101.0],
+                "Low": [100.0],
+                "Close": [100.5],
+                "Adj Close": [100.5],
+                "Volume": [1000],
+                "Dividends": [0.0],
+                "Stock Splits": [0.0],
+            },
+            index=[pd.Timestamp("2024-01-02")],
+        )
+
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(download=fake_download))
+    monkeypatch.setattr(
+        prices,
+        "latest_completed_us_equity_session",
+        lambda: date(2024, 1, 5),
+    )
+
+    rows = prices.fetch_yfinance("TEST", start="2024-01-01", end="2024-01-03")
+
+    assert rows[0]["low"] == 99.95
+    assert rows[0]["high"] == 101.0
+    assert rows[0]["ohlc_envelope_adjusted"] is True
+    assert rows[0]["source"] == prices.YFINANCE_OHLC_ENVELOPE_REPAIR_SOURCE
+
+
+def test_yfinance_v2_replay_preserves_pre_repair_contract() -> None:
+    payload = json.dumps(
+        {
+            "export_schema_version": 1,
+            "provider": "yfinance",
+            "symbol": "TEST",
+            "requested_start": "2024-01-01",
+            "requested_end_exclusive": "2024-01-03",
+            "normalization_through": "2024-01-05",
+            "provider_rows": [
+                {
+                    "date": "2024-01-02",
+                    "open": 99.95,
+                    "high": 101.0,
+                    "low": 100.0,
+                    "close": 100.5,
+                    "adj_close": 100.5,
+                    "volume": 1000,
+                    "dividends": 0.0,
+                    "stock_splits": 0.0,
+                }
+            ],
+        }
+    ).encode()
+
+    legacy = prices.parse_yfinance_normalized_export_v2(payload)
+    current = prices.parse_yfinance_normalized_export(payload)
+
+    assert legacy[0]["low"] == 100.0
+    assert "ohlc_envelope_adjusted" not in legacy[0]
+    assert current[0]["low"] == 99.95
+    assert current[0]["ohlc_envelope_adjusted"] is True
+
+
 @pytest.mark.parametrize(
     ("field", "bad_value", "match"),
     [
@@ -384,7 +451,7 @@ def test_yfinance_captures_and_replays_malformed_close_before_rejecting(
         store.close()
 
 
-def test_yfinance_v2_captures_negative_split_before_rejecting(
+def test_yfinance_v3_captures_negative_split_before_rejecting(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -427,7 +494,7 @@ def test_yfinance_v2_captures_negative_split_before_rejecting(
             FROM raw_snapshots
             """
         )[0]
-        assert snapshot["parser_version"] == "yfinance-normalized-v2"
+        assert snapshot["parser_version"] == "yfinance-normalized-v3"
         payload_record = store.raw_payload_record(snapshot["payload_sha256"])
         payload = gzip.decompress((tmp_path / payload_record["relative_path"]).read_bytes())
         assert prices.parse_yfinance_normalized_export(payload)[0]["split_ratio"] == -1.0
@@ -568,7 +635,22 @@ def test_universe_identity_labels_use_reviewed_issuer_names(tmp_path):
         store.close()
 
 
-def test_issuer_owner_resolution_never_uses_a_future_review_date(tmp_path) -> None:
+def test_issuer_owner_resolution_ignores_when_it_was_reviewed(tmp_path) -> None:
+    """Owner resolution is gated on effective_start/effective_end, not on when
+    a reviewer happened to confirm it.
+
+    `verified_date` records operator due-diligence timing — an artifact of
+    this codebase's own review backlog — not a public-knowability fact like
+    fundamentals' `as_of_date` or membership's `known_date`. Gating a
+    historical lookup on it made an already-reviewed, factually correct
+    assignment unusable before its own review happened to occur, which
+    silently dropped securities from every historical backtest for reasons
+    unrelated to real data availability.
+
+    `has_later_verified_issuer_assignment` is a different, still-valid tool:
+    it stays gated on verified_date so a live refresh can distinguish
+    "reviewed" from "pending review," which this fix does not touch.
+    """
     store = Store(tmp_path / "issuer-owner-pit.duckdb")
     try:
         _setup_security(store)
@@ -576,16 +658,25 @@ def test_issuer_owner_resolution_never_uses_a_future_review_date(tmp_path) -> No
         owners[0] = {**owners[0], "verified_date": "2024-07-05"}
         store.upsert_reference_identities(issuers, ciks, owners, providers)
 
-        assert store.issuer_id_for_security(SECURITY_ID, "2024-07-04") is None
+        assert store.issuer_id_for_security(SECURITY_ID, "2024-07-04") == ISSUER_ID
+        assert store.has_later_verified_issuer_assignment(
+            SECURITY_ID, "2024-07-04"
+        )
         assert store.issuer_id_for_security(SECURITY_ID, "2024-07-05") == ISSUER_ID
+        assert not store.has_later_verified_issuer_assignment(
+            SECURITY_ID, "2024-07-05"
+        )
         before = store.universe_identity_labels("demo", "2024-07-04")[0]
         after = store.universe_identity_labels("demo", "2024-07-05")[0]
-        assert before["issuer_id"] is None
+        assert before["issuer_id"] == ISSUER_ID
         assert after["issuer_id"] == ISSUER_ID
         before_coverage = store.universe_data_coverage("demo", "2024-07-04")[0]
         after_coverage = store.universe_data_coverage("demo", "2024-07-05")[0]
-        assert before_coverage["issuer_id"] is None
+        assert before_coverage["issuer_id"] == ISSUER_ID
         assert after_coverage["issuer_id"] == ISSUER_ID
+        # Before the assignment's own effective_start, it is still correctly
+        # unresolvable — that boundary is unrelated to review timing.
+        assert store.issuer_id_for_security(SECURITY_ID, "2023-12-31") is None
     finally:
         store.close()
 
@@ -757,6 +848,13 @@ def test_strict_csv_import_normalizes_cik_and_is_idempotent(tmp_path):
 
 
 def test_issuer_reference_resolves_only_the_effective_known_cik(tmp_path) -> None:
+    """Successor CIK lineage is gated on effective_start/effective_end.
+
+    Not on verified_date: a reviewer confirming the second CIK on 2024-07-05
+    does not change when it became true. XOM's real CIK 34088->2115436
+    successor lineage must resolve correctly for a historical decision date
+    even though the review of that lineage necessarily happened afterward.
+    """
     store = Store(tmp_path / "issuer-reference-pit.duckdb")
     try:
         _setup_security(store)
@@ -778,9 +876,12 @@ def test_issuer_reference_resolves_only_the_effective_known_cik(tmp_path) -> Non
         store.upsert_reference_identities(issuers, ciks, owners, providers)
 
         assert store.issuer_reference(ISSUER_ID, as_of="2024-06-30")["cik"] == ("0000000001")
-        assert store.issuer_reference(ISSUER_ID, as_of="2024-07-02") is None
+        assert store.issuer_reference(ISSUER_ID, as_of="2024-07-02")["cik"] == ("0000000002")
         assert store.issuer_reference(ISSUER_ID, as_of="2024-07-05")["cik"] == ("0000000002")
         assert store.issuer_reference(ISSUER_ID)["cik"] == "0000000002"
+        # Before the first CIK's own effective_start, nothing is resolvable —
+        # that boundary is unrelated to review timing and is unchanged.
+        assert store.issuer_reference(ISSUER_ID, as_of="2023-12-31") is None
     finally:
         store.close()
 
@@ -904,7 +1005,12 @@ def test_factor_batch_reads_match_scalar_identity_and_restatement_policy(tmp_pat
         store.close()
 
 
-def test_factor_batch_never_uses_a_future_reviewed_owner(tmp_path) -> None:
+def test_factor_batch_ignores_when_the_owner_was_reviewed(tmp_path) -> None:
+    """A reviewed, factually-effective owner assignment is usable for any date
+    its effective_start/effective_end window covers, regardless of when the
+    review itself happened. See
+    test_issuer_owner_resolution_ignores_when_it_was_reviewed for why.
+    """
     store = Store(tmp_path / "factor-batch-future-owner.duckdb")
     try:
         _setup_security(store)
@@ -922,19 +1028,17 @@ def test_factor_batch_never_uses_a_future_reviewed_owner(tmp_path) -> None:
             ]
         )
 
-        assert (
-            store.pit_factor_fundamentals(
-                "OLD",
-                "2024-07-04",
-                ["revenue"],
-            )
-            == []
+        before = store.pit_factor_fundamentals(
+            "OLD",
+            "2024-07-04",
+            ["revenue"],
         )
         assert store.pit_factor_fundamentals_batch(
             ["OLD"],
             "2024-07-04",
             ["revenue"],
-        ) == {"OLD": []}
+        ) == {"OLD": before}
+        assert before[0]["value"] == 100
 
         scalar = store.pit_factor_fundamentals(
             "OLD",
@@ -947,6 +1051,7 @@ def test_factor_batch_never_uses_a_future_reviewed_owner(tmp_path) -> None:
             ["revenue"],
         ) == {"OLD": scalar}
         assert scalar[0]["value"] == 100
+        assert before == scalar
     finally:
         store.close()
 
@@ -1092,9 +1197,18 @@ def test_inactive_historical_ticker_reuse_is_ambiguous_only_for_fundamentals(
         store.close()
 
 
-def test_price_routes_never_use_a_future_verified_provider_mapping(
+def test_price_routes_ignore_when_the_provider_mapping_was_reviewed(
     tmp_path,
 ) -> None:
+    """A verified provider mapping is usable for any date its data_start/
+    data_end window covers, regardless of when it was reviewed.
+
+    Confirmed live against the real database: AAPL and MSFT were both
+    unpriceable for 2025-03-31 before this fix, purely because their mapping
+    was re-verified in July 2026 — not because of any real data gap. The
+    real, verified data_start/data_end window is what makes a mapping PIT-
+    correct; the review timestamp is operator due-diligence timing.
+    """
     store = Store(tmp_path / "factor-price-future-provider-review.duckdb")
     try:
         _setup_security(store)
@@ -1120,49 +1234,32 @@ def test_price_routes_never_use_a_future_verified_provider_mapping(
             ]
         )
 
-        assert store.latest_price("NEW", "2024-07-02") is None
-        assert store.pit_factor_latest_prices_batch(
-            ["NEW"],
-            "2024-07-02",
-        ) == {"NEW": None}
-        assert (
-            store.pit_factor_price_history(
-                "NEW",
-                "2024-07-02",
-                observations=2,
-            )
-            == []
-        )
-        assert store.pit_factor_price_histories_batch(
-            ["NEW"],
-            "2024-07-02",
-            observations=2,
-        ) == {"NEW": []}
-        before = store.universe_data_coverage("demo", "2024-07-02")[0]
-        assert before["has_price_history"] is False
-        assert before["latest_price_date"] is None
+        for as_of in ("2024-07-02", "2024-07-05"):
+            scalar_latest = store.latest_price("NEW", as_of)
+            batch_latest = store.pit_factor_latest_prices_batch(
+                ["NEW"], as_of
+            )["NEW"]
+            assert scalar_latest is not None, as_of
+            assert batch_latest is not None, as_of
+            assert batch_latest["close"] == scalar_latest["close"] == 101.0, as_of
 
-        scalar_latest = store.latest_price("NEW", "2024-07-05")
-        batch_latest = store.pit_factor_latest_prices_batch(
-            ["NEW"],
-            "2024-07-05",
-        )["NEW"]
-        assert scalar_latest is not None
-        assert batch_latest is not None
-        assert batch_latest["close"] == scalar_latest["close"] == 101.0
-        scalar_history = store.pit_factor_price_history(
-            "NEW",
-            "2024-07-05",
-            observations=2,
-        )
-        assert store.pit_factor_price_histories_batch(
-            ["NEW"],
-            "2024-07-05",
-            observations=2,
-        ) == {"NEW": scalar_history}
-        after = store.universe_data_coverage("demo", "2024-07-05")[0]
-        assert after["has_price_history"] is True
-        assert str(after["latest_price_date"]) == "2024-07-02"
+            scalar_history = store.pit_factor_price_history(
+                "NEW", as_of, observations=2
+            )
+            assert store.pit_factor_price_histories_batch(
+                ["NEW"], as_of, observations=2
+            ) == {"NEW": scalar_history}
+            assert len(scalar_history) == 2, as_of
+
+            coverage = store.universe_data_coverage("demo", as_of)[0]
+            assert coverage["has_price_history"] is True, as_of
+            assert str(coverage["latest_price_date"]) == "2024-07-02", as_of
+
+        # Before the mapping's own data_start, it is still correctly
+        # unusable — that boundary is unrelated to review timing.
+        assert store.latest_price("NEW", "2023-12-31") is None
+        before_start = store.universe_data_coverage("demo", "2023-12-31")
+        assert before_start == [] or before_start[0]["has_price_history"] is False
     finally:
         store.close()
 

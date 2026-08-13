@@ -1,0 +1,13 @@
+universe_id,index_name,ticker,effective_date,action,known_date,source,source_kind
+sp500,S&P 500,GEHC,2023-01-04,Addition,2022-12-28,https://press.spglobal.com/2022-12-28-GE-HealthCare-Technologies-Set-to-Join-S-P-500-Vornado-Realty-Trust-to-Join-S-P-MidCap-400-RXO-to-Join-S-P-SmallCap-600,index_announcement
+sp500,S&P 500,VNO,2023-01-04,Deletion,2022-12-28,https://press.spglobal.com/2022-12-28-GE-HealthCare-Technologies-Set-to-Join-S-P-500-Vornado-Realty-Trust-to-Join-S-P-MidCap-400-RXO-to-Join-S-P-SmallCap-600,index_announcement
+sp500,S&P 500,PODD,2023-03-15,Addition,2023-03-10,https://press.spglobal.com/2023-03-10-Insulet-Set-to-Join-S-P-500,index_announcement
+sp500,S&P 500,SIVB,2023-03-15,Deletion,2023-03-10,https://press.spglobal.com/2023-03-10-Insulet-Set-to-Join-S-P-500,index_announcement
+sp500,S&P 500,BG,2023-03-15,Addition,2023-03-13,https://press.spglobal.com/2023-03-13-Bunge-Set-to-Join-S-P-500,index_announcement
+sp500,S&P 500,SBNY,2023-03-15,Deletion,2023-03-13,https://press.spglobal.com/2023-03-13-Bunge-Set-to-Join-S-P-500,index_announcement
+sp500,S&P 500,FICO,2023-03-20,Addition,2023-03-03,https://press.spglobal.com/2023-03-03-Fair-Isaac-Co-Set-to-Join-S-P-500-Others-to-Join-S-P-MidCap-400-and-S-P-SmallCap-600,index_announcement
+sp500,S&P 500,LUMN,2023-03-20,Deletion,2023-03-03,https://press.spglobal.com/2023-03-03-Fair-Isaac-Co-Set-to-Join-S-P-500-Others-to-Join-S-P-MidCap-400-and-S-P-SmallCap-600,index_announcement
+sp500,S&P 500,AXON,2023-05-04,Addition,2023-05-01,https://press.spglobal.com/2023-05-01-Axon-Enterprise-Set-to-Join-S-P-500-STAG-Industrial-to-Join-S-P-MidCap-400,index_announcement
+sp500,S&P 500,FRC,2023-05-04,Deletion,2023-05-01,https://press.spglobal.com/2023-05-01-Axon-Enterprise-Set-to-Join-S-P-500-STAG-Industrial-to-Join-S-P-MidCap-400,index_announcement
+sp500,S&P 500,PANW,2023-06-20,Addition,2023-06-02,https://press.spglobal.com/2023-06-02-Palo-Alto-Networks-Set-to-S-P-500-Others-to-Join-S-P-MidCap-400-and-S-P-SmallCap-600,index_announcement
+sp500,S&P 500,DISH,2023-06-20,Deletion,2023-06-02,https://press.spglobal.com/2023-06-02-Palo-Alto-Networks-Set-to-S-P-500-Others-to-Join-S-P-MidCap-400-and-S-P-SmallCap-600,index_announcement

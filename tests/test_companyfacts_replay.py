@@ -18,9 +18,10 @@ from aios.companyfacts_replay import (
 )
 from aios.ingest.edgar import (
     COMPANYFACTS_CAPTURE_PARSER_VERSION,
+    COMPANYFACTS_LEGACY_PARSER_VERSION,
     COMPANYFACTS_PARSER_VERSION,
     canonical_sec_fundamental_row_sha256,
-    parse_sec_companyfacts_response_v2,
+    replay_sec_companyfacts_response,
 )
 from aios.raw_snapshots import canonical_parsed_rows_sha256
 
@@ -163,7 +164,15 @@ def _evidence(
     payload: bytes | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     body = payload or _companyfacts_payload()
-    provider_rows = parse_sec_companyfacts_response_v2(body)
+    replay_version = (
+        COMPANYFACTS_LEGACY_PARSER_VERSION
+        if parser_version == COMPANYFACTS_CAPTURE_PARSER_VERSION
+        else parser_version
+    )
+    provider_rows, _metadata = replay_sec_companyfacts_response(
+        body,
+        parser_version=replay_version,
+    )
     payload_record = _install_payload(root, body, suffix=snapshot_id)
     parsed_count = len(provider_rows) if parsed_row_count is None else parsed_row_count
     parsed_hash = (
@@ -333,7 +342,7 @@ def test_preview_excludes_source_observations_received_after_as_of(
     assert preview.plan["excluded_evidence"][0]["reasons"] == ["received_after_as_of"]
 
 
-def test_preview_mirrors_first_winner_for_duplicate_v2_storage_keys(
+def test_preview_rejects_legacy_first_winner_for_duplicate_v2_storage_keys(
     tmp_path: Path,
 ) -> None:
     decoded = json.loads(_companyfacts_payload())
@@ -348,7 +357,11 @@ def test_preview_mirrors_first_winner_for_duplicate_v2_storage_keys(
         }
     )
     payload = json.dumps(decoded, sort_keys=True, separators=(",", ":")).encode()
-    evidence, provider_rows = _evidence(tmp_path, payload=payload)
+    evidence, provider_rows = _evidence(
+        tmp_path,
+        payload=payload,
+        parser_version=COMPANYFACTS_LEGACY_PARSER_VERSION,
+    )
     assert len(provider_rows) == 2
     store = FakeStore(
         [evidence],
@@ -363,9 +376,8 @@ def test_preview_mirrors_first_winner_for_duplicate_v2_storage_keys(
     )
 
     issuer = preview.plan["issuers"][0]
-    assert issuer["classification"] == "eligible"
-    assert issuer["v2_replay"]["provider_row_count"] == 2
-    assert issuer["v2_replay"]["storage_row_count"] == 1
+    assert issuer["classification"] == "ineligible"
+    assert issuer["reasons"] == ["unsupported_source_parser"]
 
 
 def test_preview_accepts_structured_v2_warning_only_when_replay_matches(

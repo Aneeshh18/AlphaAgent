@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import aios.forward as forward_module
 from aios.forward import (
     assess_forward_trial,
     create_forward_trial,
@@ -18,6 +19,7 @@ from aios.paper import (
     ACCOUNT_DOCUMENT_KIND,
     PROPOSAL_DOCUMENT_KIND,
     canonical_payload_sha256,
+    document_write_lock,
 )
 
 
@@ -323,3 +325,74 @@ def test_unchanged_forward_trial_cannot_be_replaced(tmp_path) -> None:
 
     assert read_forward_trial(trial).payload["trial_id"] == previous.payload["trial_id"]
     assert not (trial.parent / "forward_trials").exists()
+
+
+def test_forward_trial_write_lock_refuses_a_concurrent_mutation(tmp_path) -> None:
+    trial_path = tmp_path / "trial.json"
+
+    with (
+        document_write_lock(trial_path),
+        pytest.raises(ValueError, match="already in progress"),
+        document_write_lock(trial_path),
+    ):
+        pytest.fail("a second writer must never acquire the trial lock")
+
+
+def test_register_forward_proposal_detects_external_trial_change_before_replace(
+    tmp_path,
+) -> None:
+    """A direct-library caller racing the cooperative CLI lease must not win silently.
+
+    `_base_issues` runs early inside the locked registration path, well
+    before the final atomic write — the same shape as the existing
+    `test_paper_execution_detects_external_account_change_before_replace`
+    injection point in `test_paper.py`. Simulating an external rewrite here
+    exercises the real `before_replace` compare-and-set guard, not just the
+    mutual-exclusion lock (which alone cannot catch a caller that skips it).
+    """
+    _policy, account, proposal, trial = _baseline(tmp_path)
+    create_forward_trial(
+        tmp_path,
+        trial,
+        account,
+        proposal,
+        confirm=True,
+        now=datetime(2026, 7, 21, tzinfo=UTC),
+        policy_files=("policy.py",),
+    )
+    account_sha = canonical_payload_sha256(_account_payload())
+    next_proposal = tmp_path / "data/paper/proposals/us-qv-2026-10-01.json"
+    _write_document(
+        next_proposal,
+        PROPOSAL_DOCUMENT_KIND,
+        _proposal_payload(
+            account_sha,
+            proposal_id="next",
+            decision_date="2026-10-01",
+            generated_at="2026-10-01T22:00:00Z",
+        ),
+    )
+    before_sha256 = read_forward_trial(trial).payload_sha256
+    real_base_issues = forward_module._base_issues
+
+    def base_issues_with_external_change(*args, **kwargs):
+        raw = json.loads(trial.read_text(encoding="utf-8"))
+        raw["payload"]["audit_events"].append(
+            {"event": "external_test_change", "at": "2026-07-21T20:30:00Z"}
+        )
+        raw["payload_sha256"] = canonical_payload_sha256(raw["payload"])
+        trial.write_text(json.dumps(raw), encoding="utf-8")
+        return real_base_issues(*args, **kwargs)
+
+    original = forward_module._base_issues
+    forward_module._base_issues = base_issues_with_external_change
+    try:
+        with pytest.raises(ValueError, match="changed while this update was in progress"):
+            register_forward_proposal(tmp_path, trial, account, next_proposal)
+    finally:
+        forward_module._base_issues = original
+
+    assert read_forward_trial(trial).payload_sha256 != before_sha256
+    assert (
+        len(read_forward_trial(trial).payload.get("proposals", [])) == 1
+    ), "the racing external write must survive; the losing registration must not land"

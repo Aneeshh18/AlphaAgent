@@ -233,11 +233,12 @@ def test_forward_rollover_activation_failure_never_claims_no_state_changed(
     assert "simulated crash boundary" in payload["error"]
 
 
-def test_forward_rollover_complete_activation_contract_is_disabled_by_default(
+def test_forward_rollover_complete_activation_contract_honors_emergency_disable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(cli, "settings", _settings(tmp_path))
+    monkeypatch.setattr(rollover_module, "ROLLOVER_ACTIVATION_ENABLED", False)
 
     result = CliRunner().invoke(
         cli.app,

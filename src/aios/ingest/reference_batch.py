@@ -561,9 +561,16 @@ def build_stable_reference_batch(
         raise ValueError("verified_date cannot be in the future")
     if window_end > checked_on + timedelta(days=1):
         raise ValueError("end cannot extend beyond the day after verified_date")
-    live_half_open_endpoint = checked_on == date.today() and window_end == checked_on + timedelta(
-        days=1
-    )
+    # A current identity review may close either at today's boundary (covering
+    # completed sessions strictly before today) or tomorrow's boundary
+    # (including today once its session is complete).  In both cases the SEC
+    # ticker map and submissions response fetched on ``checked_on`` prove the
+    # endpoint without pretending that a later filing already exists.  Older
+    # windows retain the stricter filings-on-both-sides requirement.
+    live_half_open_endpoint = checked_on == date.today() and window_end in {
+        checked_on,
+        checked_on + timedelta(days=1),
+    }
     provider = provider.strip().lower()
     if provider not in {"yfinance", "tiingo"}:
         raise ValueError("stable batch certification currently supports yfinance or tiingo only")

@@ -578,3 +578,205 @@ def test_anomaly_correction_forwards_verification_scan(monkeypatch) -> None:
     ]
     assert "readiness gates were not changed" in result.output
     _assert_no_action_shortcut(result.output)
+
+
+# ----------------------------------------------------------------------
+# Multi-rule anomaly-scan (--rule / --all-rules)
+# ----------------------------------------------------------------------
+def _multi_scan(rule_id: str) -> AnomalyScan:
+    return AnomalyScan(
+        scan_id=f"scan-{rule_id}",
+        rule_bundle_version="us-equity-data-quality.v1",
+        scope=f"us-equity-test:{rule_id}",
+        source_boundary_sha256="d" * 64,
+        source_boundary_at="2026-08-07T08:00:00Z",
+        executed_rules=(f"{rule_id}@1.0.0",),
+        observations=(),
+        evidence={"rule_id": rule_id},
+    )
+
+
+def test_anomaly_scan_rejects_an_unknown_rule(isolated_scan) -> None:
+    result = CliRunner().invoke(
+        cli.app, ["anomaly-scan", "--rule", "not_a_real_rule", "--preview"]
+    )
+    assert result.exit_code == 1
+    assert "unknown anomaly rule" in result.output.lower()
+
+
+def test_anomaly_scan_multi_rule_preview_runs_selected_rules(
+    isolated_scan, monkeypatch
+) -> None:
+    _, _, _ = isolated_scan
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run_detectors(*, rules, **_kwargs):
+        calls.append(rules)
+        return (_multi_scan(rules[0]),)
+
+    monkeypatch.setattr(anomalies_module, "run_detectors", fake_run_detectors)
+    monkeypatch.setattr(
+        alerts_module,
+        "get_alert_store",
+        lambda *_a, **_k: pytest.fail("preview must not open the operations ledger"),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "anomaly-scan",
+            "--as-of",
+            "2026-08-07",
+            "--rule",
+            "price_action_mismatch",
+            "--rule",
+            "mapping_drift",
+            "--preview",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["status"] == "preview"
+    assert payload["recorded"] is False
+    assert [scan["rule_id"] for scan in payload["scans"]] == [
+        "price_action_mismatch",
+        "mapping_drift",
+    ]
+    assert calls == [("price_action_mismatch",), ("mapping_drift",)]
+    _assert_no_action_shortcut(result.output)
+
+
+def test_anomaly_scan_all_rules_expands_to_the_full_registry(
+    isolated_scan, monkeypatch
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run_detectors(*, rules, **_kwargs):
+        calls.append(rules)
+        return (_multi_scan(rules[0]),)
+
+    monkeypatch.setattr(anomalies_module, "run_detectors", fake_run_detectors)
+    monkeypatch.setattr(
+        anomalies_module,
+        "measure_universe_factor_percentiles",
+        lambda **_k: {"as_of": "2026-08-07", "factor_model": "qv", "scores": {}},
+    )
+    monkeypatch.setattr(
+        anomalies_module, "latest_factor_percentile_baseline", lambda **_k: None
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["anomaly-scan", "--as-of", "2026-08-07", "--all-rules", "--preview", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert len(payload["scans"]) == len(anomalies_module.registered_rule_ids())
+    assert {call[0] for call in calls} == set(anomalies_module.registered_rule_ids())
+
+
+def test_anomaly_scan_multi_rule_records_and_persists_factor_baseline(
+    isolated_scan, monkeypatch
+) -> None:
+    recorded_scans: list[AnomalyScan] = []
+    persisted_snapshots: list[dict] = []
+    operations_store = SimpleNamespace()
+
+    def record(scan):
+        recorded_scans.append(scan)
+        return ()
+
+    operations_store.record_anomaly_scan = record
+    operations_store.latest_anomaly_scan_evidence = lambda scope: None
+    monkeypatch.setattr(alerts_module, "get_alert_store", lambda: operations_store)
+
+    def fake_run_detectors(*, rules, **_kwargs):
+        return (_multi_scan(rules[0]),)
+
+    def fake_measure(*, store, as_of, factor_model):
+        return {
+            "as_of": "2026-08-07",
+            "universe_id": "sp500",
+            "factor_model": factor_model,
+            "scores": {"AAA": 50.0},
+        }
+
+    monkeypatch.setattr(anomalies_module, "run_detectors", fake_run_detectors)
+    monkeypatch.setattr(
+        anomalies_module, "measure_universe_factor_percentiles", fake_measure
+    )
+    monkeypatch.setattr(
+        anomalies_module, "latest_factor_percentile_baseline", lambda **_k: None
+    )
+    monkeypatch.setattr(
+        anomalies_module,
+        "record_factor_percentile_baseline",
+        lambda snapshot: persisted_snapshots.append(snapshot),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "anomaly-scan",
+            "--as-of",
+            "2026-08-07",
+            "--rule",
+            "factor_percentile_jump",
+            "--record",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert len(recorded_scans) == 1
+    assert len(persisted_snapshots) == 1
+    assert persisted_snapshots[0]["factor_model"] == "qv"
+    _assert_no_action_shortcut(result.output)
+
+
+def test_anomaly_scan_multi_rule_does_not_persist_baseline_on_preview(
+    isolated_scan, monkeypatch
+) -> None:
+    persisted_snapshots: list[dict] = []
+
+    def fake_run_detectors(*, rules, **_kwargs):
+        return (_multi_scan(rules[0]),)
+
+    monkeypatch.setattr(anomalies_module, "run_detectors", fake_run_detectors)
+    monkeypatch.setattr(
+        anomalies_module,
+        "measure_universe_factor_percentiles",
+        lambda **_k: {"as_of": "2026-08-07", "factor_model": "qv", "scores": {}},
+    )
+    monkeypatch.setattr(
+        anomalies_module, "latest_factor_percentile_baseline", lambda **_k: None
+    )
+    monkeypatch.setattr(
+        anomalies_module,
+        "record_factor_percentile_baseline",
+        lambda snapshot: persisted_snapshots.append(snapshot),
+    )
+    monkeypatch.setattr(
+        alerts_module,
+        "get_alert_store",
+        lambda: pytest.fail("preview must not open the operations ledger"),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "anomaly-scan",
+            "--as-of",
+            "2026-08-07",
+            "--rule",
+            "factor_percentile_jump",
+            "--preview",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert persisted_snapshots == []

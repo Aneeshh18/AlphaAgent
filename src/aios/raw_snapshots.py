@@ -121,7 +121,12 @@ def capture_raw_snapshot(
     elif (
         normalized_provider == "sec-edgar"
         and normalized_dataset == "companyfacts"
-        and normalized_parser_version in {"sec-companyfacts-v2", "sec-companyfacts-v3"}
+        and normalized_parser_version in {
+            "sec-companyfacts-v2",
+            "sec-companyfacts-v2-storage-safe-v1",
+            "sec-companyfacts-v2-storage-safe-v2",
+            "sec-companyfacts-v3",
+        }
         and parsed_rows_rejected is None
     ):
         raise ValueError("parsed SEC Company Facts snapshots require rejection evidence")
@@ -863,6 +868,10 @@ def _replay_snapshot(
 
         return parse_yfinance_normalized_export_v1(payload)
     if key == ("yfinance", "daily-prices", "yfinance-normalized-v2"):
+        from aios.ingest.prices import parse_yfinance_normalized_export_v2
+
+        return parse_yfinance_normalized_export_v2(payload)
+    if key == ("yfinance", "daily-prices", "yfinance-normalized-v3"):
         from aios.ingest.prices import parse_yfinance_normalized_export
 
         return parse_yfinance_normalized_export(payload)
@@ -890,6 +899,22 @@ def _replay_snapshot(
         from aios.ingest.edgar import parse_sec_companyfacts_response_v2
 
         return parse_sec_companyfacts_response_v2(payload)
+    if key == (
+        "sec-edgar",
+        "companyfacts",
+        "sec-companyfacts-v2-storage-safe-v1",
+    ):
+        from aios.ingest.edgar import parse_sec_companyfacts_response_storage_safe_v1
+
+        return parse_sec_companyfacts_response_storage_safe_v1(payload)
+    if key == (
+        "sec-edgar",
+        "companyfacts",
+        "sec-companyfacts-v2-storage-safe-v2",
+    ):
+        from aios.ingest.edgar import parse_sec_companyfacts_response_storage_safe
+
+        return parse_sec_companyfacts_response_storage_safe(payload)
     if key == ("sec-edgar", "companyfacts", "sec-companyfacts-v3"):
         from aios.ingest.edgar import parse_sec_companyfacts_response_v3
 
@@ -938,6 +963,16 @@ def _replay_snapshot_rejections(
     )
     if key not in {
         ("sec-edgar", "companyfacts", "sec-companyfacts-v2"),
+        (
+            "sec-edgar",
+            "companyfacts",
+            "sec-companyfacts-v2-storage-safe-v1",
+        ),
+        (
+            "sec-edgar",
+            "companyfacts",
+            "sec-companyfacts-v2-storage-safe-v2",
+        ),
         ("sec-edgar", "companyfacts", "sec-companyfacts-v3"),
     }:
         return None

@@ -667,6 +667,59 @@ def test_universe_change_plan_uses_prior_market_session_for_monday_event(
     assert plan.effective_date == "2026-08-03"
 
 
+def test_universe_change_plan_accepts_bounded_unchanged_pre_event_gap(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr("aios.universe_rollforward.MINIMUM_MEMBERS", 2)
+    monkeypatch.setattr("aios.universe_rollforward.MAXIMUM_MEMBERS", 3)
+    database, arguments = _create_plan_case(
+        tmp_path,
+        prior="2026-08-03",
+        boundary="2026-08-04",
+        target="2026-08-06",
+        release_date="Jul 31, 2026",
+        release_slug_date="2026-07-31",
+        effective_date="August 5, 2026",
+        expected_effective_date=date(2026, 8, 5),
+        now=datetime(2026, 8, 7, 13, 0, tzinfo=UTC),
+    )
+    read_only = Store(database, read_only=True)
+    try:
+        plan = build_universe_change_plan(store=read_only, **arguments)
+    finally:
+        read_only.close()
+
+    assert plan.prior_coverage_through == "2026-08-03"
+    assert plan.effective_date == "2026-08-05"
+    assert plan.requested_coverage_through == "2026-08-06"
+
+
+def test_universe_change_plan_rejects_stale_pre_event_gap(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr("aios.universe_rollforward.MINIMUM_MEMBERS", 2)
+    monkeypatch.setattr("aios.universe_rollforward.MAXIMUM_MEMBERS", 3)
+    database, arguments = _create_plan_case(
+        tmp_path,
+        prior="2026-07-27",
+        boundary="2026-07-28",
+        target="2026-08-06",
+        release_date="Jul 31, 2026",
+        release_slug_date="2026-07-31",
+        effective_date="August 5, 2026",
+        expected_effective_date=date(2026, 8, 5),
+        now=datetime(2026, 8, 7, 13, 0, tzinfo=UTC),
+    )
+    read_only = Store(database, read_only=True)
+    try:
+        with pytest.raises(ValueError, match="too stale"):
+            build_universe_change_plan(store=read_only, **arguments)
+    finally:
+        read_only.close()
+
+
 def test_universe_change_plan_marks_pre_event_components_as_unverified(
     monkeypatch,
     tmp_path: Path,

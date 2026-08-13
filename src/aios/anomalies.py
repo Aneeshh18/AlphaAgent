@@ -9,6 +9,7 @@ import json
 import os
 import stat
 import zlib
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -22,11 +23,15 @@ from aios.alerts import (
 from aios.alerts import (
     canonical_anomaly_fingerprint as anomaly_fingerprint,
 )
+from aios.artifacts import publish_text_write_once
+from aios.canonical import canonical_json
 from aios.config import settings
 from aios.ingest.edgar import (
     COMPANYFACTS_CAPTURE_PARSER_VERSION,
+    COMPANYFACTS_LEGACY_PARSER_VERSION,
     COMPANYFACTS_NEXT_PARSER_VERSION,
     COMPANYFACTS_PARSER_VERSION,
+    COMPANYFACTS_STORAGE_SAFE_V1_PARSER_VERSION,
     canonical_sec_fundamental_row_sha256,
     replay_sec_companyfacts_response,
 )
@@ -40,6 +45,65 @@ from aios.storage.store import Store
 RULE_BUNDLE_VERSION = "us-equity-data-quality.v1"
 SEC_RULE_ID = "sec_fundamentals_coverage_missing"
 SEC_RULE_VERSION = "1.0.0"
+SEC_SCOPE_PREFIX = "us-equity-reference"
+
+# Later rule families use their own scope namespace. The ledger enforces a
+# monotonic source boundary per case, and ``rule_bundle_version`` plus the
+# single-rule ``executed_rules`` tuple are pinned by the shipped ledger
+# contract, so a separate scope is how a new family is added without changing
+# either.
+PRICE_RULE_ID = "price_action_mismatch"
+PRICE_RULE_VERSION = "1.0.0"
+PRICE_SCOPE_PREFIX = "us-equity-prices"
+PRICE_LOOKBACK_SESSIONS = 30
+PRICE_MOVE_THRESHOLD = 0.25
+
+COVERAGE_RULE_ID = "coverage_deterioration"
+COVERAGE_RULE_VERSION = "1.0.0"
+COVERAGE_SCOPE_PREFIX = "us-equity-coverage"
+
+MAPPING_RULE_ID = "mapping_drift"
+MAPPING_RULE_VERSION = "1.0.0"
+MAPPING_SCOPE_PREFIX = "us-equity-mappings"
+
+SHARES_RULE_ID = "share_count_jump"
+SHARES_RULE_VERSION = "1.0.0"
+SHARES_SCOPE_PREFIX = "us-equity-shares"
+SHARES_METRIC = "shares_out"
+SHARES_JUMP_THRESHOLD = 0.30
+# Bound the review window the way the price rule bounds its sessions. The
+# retained filing history reaches back to 2008, and scanning all of it produced
+# 750 findings for one decision date — mostly historical restatements that are
+# known audit debt. That scan cannot be recorded at all: the ledger caps scan
+# evidence at 64 KiB, which the per-observation manifest passes at roughly 500
+# findings, and `alerts.py` is inside the frozen policy bundle so the cap
+# cannot be raised. A recent window keeps the daily detector operable; pass a
+# larger value deliberately for a one-off historical sweep.
+SHARES_LOOKBACK_FILINGS = 8
+
+# The operations ledger accepts exactly {"low", "medium", "high"} and rejects
+# any other confidence, so a descriptive label cannot be stored directly. These
+# constants keep WHY each rule is confident visible at the call site while
+# recording the level the ledger actually understands.
+#
+# Both sides of the comparison are values this system recorded exactly, so the
+# contradiction is certain even though its cause is not.
+CONFIDENCE_EXACT_COMPARISON = "high"
+# The finding depends on a value a provider reported, which may itself be the
+# thing that is wrong.
+CONFIDENCE_REPORTED_SOURCE = "medium"
+
+FACTOR_RULE_ID = "factor_percentile_jump"
+FACTOR_RULE_VERSION = "1.0.0"
+FACTOR_SCOPE_PREFIX = "us-equity-factors"
+# Composite scores are published on a 0-100 percentile scale, so the threshold
+# is in percentile points, not a fraction.
+FACTOR_JUMP_THRESHOLD = 40.0
+FACTOR_SUPPORTED_MODELS = ("qv", "qvml")
+
+FILINGS_RULE_ID = "conflicting_filings"
+FILINGS_RULE_VERSION = "1.0.0"
+FILINGS_SCOPE_PREFIX = "us-equity-filings"
 SEC_ZERO_ROW_ERROR = "SEC returned no fundamental rows"
 MAX_WARNING_RUNS = 5_000
 MAX_SEC_SNAPSHOT_STORED_BYTES = 64 * 1024 * 1024
@@ -99,7 +163,7 @@ def scan_sec_fundamental_coverage(
     if minimum_members < 1 or maximum_members < minimum_members:
         raise ValueError("invalid anomaly-scan universe bounds")
     root = (project_root or settings.project_root).resolve()
-    scope = f"us-equity-reference:{universe_id}"
+    scope = f"{SEC_SCOPE_PREFIX}:{universe_id}"
 
     members = store.universe_identity_labels(universe_id, decision_date)
     if not minimum_members <= len(members) <= maximum_members:
@@ -650,7 +714,7 @@ def _sec_zero_row_outcome_proof(
             f"for run {_bounded_identifier(run_id)}: rejection_codes"
         ) from exc
     legacy_future_warning = (
-        replay_proof["parser_version"] == COMPANYFACTS_PARSER_VERSION
+        replay_proof["parser_version"] == COMPANYFACTS_LEGACY_PARSER_VERSION
         and expected_codes == ("future_period",)
         and recorded_codes is None
         and accepted_sec_fundamental_outcome(
@@ -727,8 +791,10 @@ def _sec_zero_row_replay_proof(
             "sec-companyfacts-v1",
         }:
             raise ValueError("SEC zero-row Company Facts parser is unsupported")
-        parser_version = COMPANYFACTS_PARSER_VERSION
+        parser_version = COMPANYFACTS_LEGACY_PARSER_VERSION
     if parser_version not in {
+        COMPANYFACTS_LEGACY_PARSER_VERSION,
+        COMPANYFACTS_STORAGE_SAFE_V1_PARSER_VERSION,
         COMPANYFACTS_PARSER_VERSION,
         COMPANYFACTS_NEXT_PARSER_VERSION,
     }:
@@ -1157,6 +1223,17 @@ def _bounded_identifier(value: str) -> str:
     return value if len(value) <= 96 else f"{value[:93]}..."
 
 
+def _exact_count(value: Any, *, field: str, label: str) -> int:
+    """Require a genuine non-negative integer count.
+
+    A silently coerced ``"502"`` or ``None`` would let a malformed baseline
+    manufacture or hide a deterioration finding, so the type is checked exactly.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{label} requires a non-negative integer {field}: {value!r}")
+    return value
+
+
 def _verified_sec_fundamental_coverage(
     *,
     store: Store,
@@ -1443,11 +1520,13 @@ def _verified_sec_fundamental_coverage(
             "sec-companyfacts-v1",
         }
         parser_version = (
-            COMPANYFACTS_PARSER_VERSION
+            COMPANYFACTS_LEGACY_PARSER_VERSION
             if legacy_capture
             else facts_reference["parser_version"]
         )
         if (parsed_count is None) != (parsed_hash is None) or parser_version not in {
+            COMPANYFACTS_LEGACY_PARSER_VERSION,
+            COMPANYFACTS_STORAGE_SAFE_V1_PARSER_VERSION,
             COMPANYFACTS_PARSER_VERSION,
             COMPANYFACTS_NEXT_PARSER_VERSION,
         } or (
@@ -1524,7 +1603,7 @@ def _verified_sec_fundamental_coverage(
         else:
             rejection_codes_invalid = False
         legacy_future_warning = (
-            parser_version == COMPANYFACTS_PARSER_VERSION
+            parser_version == COMPANYFACTS_LEGACY_PARSER_VERSION
             and expected_rejection_codes == ("future_period",)
             and evidence_rejection_codes is None
             and evidence_status == "warning"
@@ -2007,3 +2086,1710 @@ def _as_date(value: date | str) -> date:
         return date.fromisoformat(str(value))
     except ValueError as exc:
         raise ValueError(f"anomaly scan date must be YYYY-MM-DD: {value!r}") from exc
+
+
+# ----------------------------------------------------------------------
+# Rule: unexplained price move (price gaps and split/dividend mismatches)
+# ----------------------------------------------------------------------
+def scan_price_action_mismatch(
+    *,
+    store: Store,
+    as_of: date | str,
+    universe_id: str = "sp500",
+    minimum_members: int = 450,
+    maximum_members: int = 550,
+    lookback_sessions: int = PRICE_LOOKBACK_SESSIONS,
+    move_threshold: float = PRICE_MOVE_THRESHOLD,
+) -> AnomalyScan:
+    """Detect large close-to-close moves that no corporate action explains.
+
+    A split or large distribution moves the quoted close. When a reviewed,
+    action-complete row reports ``split_ratio = 1`` and ``dividends = 0`` yet the
+    close still jumps beyond the threshold, either the action evidence is missing
+    or the price is wrong. Both are review cases, never automatic repairs.
+
+    Detection is all-or-nothing, exactly like the SEC coverage rule: if any
+    examined row lacks the action fields required to make the judgement, the
+    whole scan is withheld rather than reported with weaker evidence.
+    """
+
+    decision_date = _as_date(as_of)
+    if minimum_members < 1 or maximum_members < minimum_members:
+        raise ValueError("invalid anomaly-scan universe bounds")
+    if lookback_sessions < 2:
+        raise ValueError("price anomaly lookback requires at least two sessions")
+    if not 0 < move_threshold < 1:
+        raise ValueError("price move threshold must be a fraction in (0, 1)")
+    scope = f"{PRICE_SCOPE_PREFIX}:{universe_id}"
+
+    members = store.universe_identity_labels(universe_id, decision_date)
+    if not minimum_members <= len(members) <= maximum_members:
+        raise ValueError(
+            f"{universe_id} has {len(members)} reviewed members on {decision_date}; "
+            f"expected {minimum_members}-{maximum_members}"
+        )
+
+    observations: list[AnomalyObservation] = []
+    examined_boundary: list[dict[str, Any]] = []
+    examined_rows = 0
+    examined_securities = 0
+    latest_observed: date | None = None
+
+    for member in sorted(members, key=lambda row: str(row.get("ticker") or "")):
+        security_id = _text(member, "security_id", "reviewed universe member")
+        ticker = _text(member, "ticker", "reviewed universe member").upper()
+        window = store.query(
+            """
+            SELECT date, close, dividends, split_ratio, actions_complete,
+                   close_split_adjusted, provider_symbol, source
+            FROM prices
+            WHERE security_id = ?
+              AND date <= CAST(? AS DATE)
+              AND close IS NOT NULL
+            ORDER BY date DESC
+            LIMIT ?
+            """,
+            (security_id, decision_date.isoformat(), lookback_sessions),
+        )
+        if len(window) < 2:
+            # No comparable pair: nothing is claimed for this security.
+            continue
+        rows = list(reversed(window))
+        examined_securities += 1
+        examined_rows += len(rows)
+
+        for row in rows:
+            if not bool(row.get("actions_complete")):
+                raise ValueError(
+                    "price anomaly scan requires action-complete rows: "
+                    f"{security_id}@{row.get('date')}"
+                )
+            if row.get("split_ratio") is None or row.get("dividends") is None:
+                raise ValueError(
+                    "price anomaly scan requires split and dividend evidence: "
+                    f"{security_id}@{row.get('date')}"
+                )
+
+        window_start = _as_date(rows[0]["date"])
+        window_end = _as_date(rows[-1]["date"])
+        if latest_observed is None or window_end > latest_observed:
+            latest_observed = window_end
+        examined_boundary.append(
+            {
+                "security_id": security_id,
+                "ticker": ticker,
+                "sessions": len(rows),
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
+            }
+        )
+
+        for previous, current in zip(rows, rows[1:], strict=False):
+            previous_close = _positive_close(previous, security_id)
+            current_close = _positive_close(current, security_id)
+            change = (current_close - previous_close) / previous_close
+            if abs(change) < move_threshold:
+                continue
+            split_ratio = float(current["split_ratio"])
+            dividends = float(current["dividends"])
+            if split_ratio != 1.0 or dividends != 0.0:
+                # The move has declared corporate-action evidence behind it.
+                continue
+
+            current_date = _as_date(current["date"])
+            previous_date = _as_date(previous["date"])
+            implied_ratio = previous_close / current_close
+            observations.append(
+                AnomalyObservation(
+                    fingerprint=anomaly_fingerprint(
+                        rule_id=PRICE_RULE_ID,
+                        rule_version=PRICE_RULE_VERSION,
+                        scope=scope,
+                        subject_type="security_session",
+                        subject_id=f"{security_id}@{current_date.isoformat()}",
+                    ),
+                    rule_id=PRICE_RULE_ID,
+                    rule_version=PRICE_RULE_VERSION,
+                    scope=scope,
+                    subject_type="security_session",
+                    subject_id=f"{security_id}@{current_date.isoformat()}",
+                    severity="high" if abs(change) >= 0.5 else "medium",
+                    confidence=CONFIDENCE_REPORTED_SOURCE,
+                    title=(
+                        f"{ticker} moved {change:.1%} on {current_date.isoformat()} "
+                        "with no corporate action"
+                    ),
+                    summary=(
+                        "This action-complete session reports no split and no "
+                        "dividend, yet the close moved beyond the review "
+                        "threshold. Confirm the corporate-action evidence before "
+                        "trusting the price; never adjust the stored row to make "
+                        "the move look explained."
+                    ),
+                    old_value={
+                        "date": previous_date.isoformat(),
+                        "close": previous_close,
+                    },
+                    new_value={
+                        "date": current_date.isoformat(),
+                        "close": current_close,
+                        "close_change_fraction": change,
+                        "declared_split_ratio": split_ratio,
+                        "declared_dividends": dividends,
+                        "implied_split_ratio_if_unrecorded": implied_ratio,
+                    },
+                    evidence={
+                        "security_id": security_id,
+                        "ticker": ticker,
+                        "provider_symbol": _optional(current.get("provider_symbol")),
+                        "price_source": _optional(current.get("source")),
+                        "actions_complete": True,
+                        "close_split_adjusted": bool(
+                            current.get("close_split_adjusted")
+                        ),
+                        "move_threshold": move_threshold,
+                        "rule_bundle_version": RULE_BUNDLE_VERSION,
+                        "decision_evidence_as_of": decision_date.isoformat(),
+                    },
+                    suggested_checks=(
+                        "Check the issuer's official split/dividend announcement "
+                        "for this exact session.",
+                        "Compare the stored close against the exact retained "
+                        "provider snapshot for both sessions.",
+                        "If a split is real but unrecorded, correct it through a "
+                        "reviewed corporate-action ingest, not a price edit.",
+                        "If the provider row is wrong, withhold it; never "
+                        "overwrite a valid stored close.",
+                    ),
+                )
+            )
+
+    if latest_observed is None:
+        raise ValueError(
+            "price anomaly scan found no comparable reviewed price sessions"
+        )
+
+    source_boundary_at = _price_source_boundary(store, decision_date)
+    return _build_scan(
+        scope=scope,
+        rule_id=PRICE_RULE_ID,
+        rule_version=PRICE_RULE_VERSION,
+        decision_date=decision_date,
+        source_boundary_at=source_boundary_at,
+        observations=observations,
+        boundary_extra={
+            "examined_set_sha256": _sha(examined_boundary),
+            "latest_examined_session": latest_observed.isoformat(),
+        },
+        evidence_extra={
+            "universe_id": universe_id,
+            "reviewed_members": len(members),
+            "examined_securities": examined_securities,
+            "examined_rows": examined_rows,
+            "latest_examined_session": latest_observed.isoformat(),
+            "lookback_sessions": lookback_sessions,
+            "move_threshold": move_threshold,
+            "unexplained_moves": len(observations),
+            "examined_set_sha256": _sha(examined_boundary),
+        },
+    )
+
+
+def _positive_close(row: dict[str, Any], security_id: str) -> float:
+    value = row.get("close")
+    if value is None:
+        raise ValueError(f"price row lacks a close: {security_id}@{row.get('date')}")
+    close = float(value)
+    if not close > 0:
+        raise ValueError(
+            f"price row has a non-positive close: {security_id}@{row.get('date')}"
+        )
+    return close
+
+
+def _price_source_boundary(store: Store, decision_date: date) -> datetime:
+    """Bind the boundary to the newest price evidence the scan could consume."""
+    return _dataset_source_boundary(
+        store,
+        decision_date,
+        # The retained archive labels every price response `daily-prices`,
+        # for yfinance and Tiingo alike. The storage table is `prices`; the
+        # fetch dataset is not, and using the table name here silently found
+        # no evidence and withheld every scan.
+        dataset="daily-prices",
+        label="price",
+        evidence_label="price-fetch evidence",
+    )
+
+
+def _dataset_source_boundary(
+    store: Store,
+    decision_date: date,
+    *,
+    dataset: str,
+    label: str,
+    evidence_label: str,
+) -> datetime:
+    """Return the newest retained fetch observation this scan could have used.
+
+    The SEC rule derives its boundary from the exact snapshots it consumed.
+    Rules that read the storage projection rather than replaying payloads use
+    the honest equivalent: the newest retained observation for their dataset at
+    or before the decision date.
+
+    Wall-clock time is deliberately NOT used. It would make an identical
+    comparison produce a new ``scan_id`` on every run, breaking ledger
+    idempotency, and it would claim evidence was observed later than it was.
+    """
+    row = store.query(
+        """
+        SELECT MAX(received_at) AS latest
+        FROM raw_snapshots
+        WHERE dataset = ?
+          AND CAST(received_at AS DATE) <= CAST(? AS DATE)
+        """,
+        (dataset, decision_date.isoformat()),
+    )[0]
+    latest = row["latest"]
+    if latest is None:
+        raise ValueError(
+            f"{label} anomaly scan has no retained {evidence_label} to bound it"
+        )
+    return _utc_raw_snapshot_time(latest)
+
+
+def _reference_source_boundary(store: Store, decision_date: date) -> datetime:
+    """Bound an identity/reference scan by the newest evidence it could consume.
+
+    Mapping, share-count and filing rules all read reviewed reference and
+    fundamental state, whose retained evidence is the SEC dataset.
+    """
+    return _dataset_source_boundary(
+        store,
+        decision_date,
+        dataset="companyfacts",
+        label="reference",
+        evidence_label="companyfacts evidence",
+    )
+
+
+# ----------------------------------------------------------------------
+# Rule: coverage deterioration versus the previous comparable run
+# ----------------------------------------------------------------------
+def measure_universe_coverage(
+    *,
+    store: Store,
+    as_of: date | str,
+    universe_id: str = "sp500",
+) -> dict[str, Any]:
+    """Return the exact current coverage counts for one decision date."""
+    decision_date = _as_date(as_of)
+    coverage = store.universe_data_coverage(universe_id, decision_date)
+    members = len(coverage)
+    if not members:
+        raise ValueError(
+            f"{universe_id} has no active members on {decision_date}"
+        )
+    priced = sum(bool(row.get("has_price_history")) for row in coverage)
+    filed = sum(bool(row.get("has_pit_fundamentals")) for row in coverage)
+    identified = sum(bool(row.get("security_id")) for row in coverage)
+    return {
+        "as_of": decision_date.isoformat(),
+        "universe_id": universe_id,
+        "members": members,
+        "identified_members": identified,
+        "priced_members": priced,
+        "filed_members": filed,
+        "price_coverage_rate": priced / members,
+        "filing_coverage_rate": filed / members,
+    }
+
+
+def scan_coverage_deterioration(
+    *,
+    store: Store,
+    as_of: date | str,
+    baseline: dict[str, Any] | None,
+    universe_id: str = "sp500",
+    minimum_drop: int = 1,
+) -> AnomalyScan:
+    """Compare current coverage against the previous comparable measurement.
+
+    ``baseline`` is the coverage payload recorded by the previous complete scan
+    for this scope. When it is ``None`` the scan reports "no comparable
+    baseline" and emits zero observations: a first run must never invent a
+    deterioration finding.
+    """
+
+    decision_date = _as_date(as_of)
+    if minimum_drop < 1:
+        raise ValueError("coverage deterioration requires a positive minimum drop")
+    scope = f"{COVERAGE_SCOPE_PREFIX}:{universe_id}"
+    current = measure_universe_coverage(
+        store=store,
+        as_of=decision_date,
+        universe_id=universe_id,
+    )
+
+    observations: list[AnomalyObservation] = []
+    comparable = False
+    if baseline is not None:
+        comparable = True
+        baseline_as_of = _as_date(_text(baseline, "as_of", "coverage baseline"))
+        if baseline_as_of > decision_date:
+            raise ValueError(
+                "coverage baseline is later than the scanned decision date"
+            )
+        if str(baseline.get("universe_id") or "") != universe_id:
+            raise ValueError("coverage baseline describes a different universe")
+
+        for metric, label in (
+            ("filed_members", "point-in-time filing"),
+            ("priced_members", "identity-safe price"),
+            ("identified_members", "stable identity"),
+        ):
+            previous_value = _exact_count(
+                baseline.get(metric),
+                field=metric,
+                label="coverage baseline",
+            )
+            current_value = _exact_count(
+                current.get(metric),
+                field=metric,
+                label="coverage observation",
+            )
+            drop = previous_value - current_value
+            if drop < minimum_drop:
+                continue
+            observations.append(
+                AnomalyObservation(
+                    fingerprint=anomaly_fingerprint(
+                        rule_id=COVERAGE_RULE_ID,
+                        rule_version=COVERAGE_RULE_VERSION,
+                        scope=scope,
+                        subject_type="coverage_metric",
+                        subject_id=f"{universe_id}:{metric}",
+                    ),
+                    rule_id=COVERAGE_RULE_ID,
+                    rule_version=COVERAGE_RULE_VERSION,
+                    scope=scope,
+                    subject_type="coverage_metric",
+                    subject_id=f"{universe_id}:{metric}",
+                    severity="high" if drop >= 5 else "medium",
+                    confidence=CONFIDENCE_EXACT_COMPARISON,
+                    title=(
+                        f"{label} coverage fell by {drop} member(s) since "
+                        f"{baseline_as_of.isoformat()}"
+                    ),
+                    summary=(
+                        "Coverage decreased versus the previous comparable run. "
+                        "Investigate the source or identity change; scores stay "
+                        "withheld for affected members until evidence returns."
+                    ),
+                    old_value={
+                        "as_of": baseline_as_of.isoformat(),
+                        metric: previous_value,
+                        "members": _exact_count(
+                            baseline.get("members"),
+                            field="members",
+                            label="coverage baseline",
+                        ),
+                    },
+                    new_value={
+                        "as_of": decision_date.isoformat(),
+                        metric: current_value,
+                        "members": _exact_count(
+                            current.get("members"),
+                            field="members",
+                            label="coverage observation",
+                        ),
+                        "dropped": drop,
+                    },
+                    evidence={
+                        "universe_id": universe_id,
+                        "metric": metric,
+                        "minimum_drop": minimum_drop,
+                        "baseline_as_of": baseline_as_of.isoformat(),
+                        "current_as_of": decision_date.isoformat(),
+                        "rule_bundle_version": RULE_BUNDLE_VERSION,
+                    },
+                    suggested_checks=(
+                        "Check whether a reviewed membership change explains the "
+                        "difference.",
+                        "Check the latest ingest and refresh outcomes for "
+                        "failures or withheld rows.",
+                        "Confirm no identity or provider mapping expired "
+                        "unexpectedly.",
+                        "Never backfill coverage to clear this case; restore the "
+                        "source evidence instead.",
+                    ),
+                )
+            )
+
+    source_boundary_at = _reference_source_boundary(store, decision_date)
+    return _build_scan(
+        scope=scope,
+        rule_id=COVERAGE_RULE_ID,
+        rule_version=COVERAGE_RULE_VERSION,
+        decision_date=decision_date,
+        source_boundary_at=source_boundary_at,
+        observations=observations,
+        boundary_extra={"coverage_set_sha256": _sha(current)},
+        evidence_extra={
+            "universe_id": universe_id,
+            "comparable_baseline": comparable,
+            "baseline_as_of": (
+                str(baseline.get("as_of")) if baseline is not None else None
+            ),
+            "current_coverage": current,
+            "baseline_coverage": baseline,
+            "deteriorated_metrics": len(observations),
+            "minimum_drop": minimum_drop,
+            "coverage_set_sha256": _sha(current),
+        },
+    )
+
+
+# ----------------------------------------------------------------------
+# Rule: changed ticker/provider mappings
+# ----------------------------------------------------------------------
+def scan_mapping_drift(
+    *,
+    store: Store,
+    as_of: date | str,
+    universe_id: str = "sp500",
+    minimum_members: int = 450,
+    maximum_members: int = 550,
+) -> AnomalyScan:
+    """Detect provider/ticker mappings that cannot all be true at once.
+
+    Prices route by immutable ``security_id`` plus a dated provider symbol, so
+    two contradictions matter and neither is self-correcting:
+
+    1. one security holding two overlapping verified windows at the same
+       provider — the router cannot know which symbol owns the date; and
+    2. one provider symbol claimed by two different securities on the same date
+       — the classic reused-ticker contamination this system exists to prevent.
+
+    Both are reported, never repaired. A member whose identity evidence is
+    missing withholds the whole scan rather than being skipped silently.
+    """
+
+    decision_date = _as_date(as_of)
+    if minimum_members < 1 or maximum_members < minimum_members:
+        raise ValueError("invalid anomaly-scan universe bounds")
+    scope = f"{MAPPING_SCOPE_PREFIX}:{universe_id}"
+
+    members = store.universe_identity_labels(universe_id, decision_date)
+    if not minimum_members <= len(members) <= maximum_members:
+        raise ValueError(
+            f"{universe_id} has {len(members)} reviewed members on {decision_date}; "
+            f"expected {minimum_members}-{maximum_members}"
+        )
+
+    observations: list[AnomalyObservation] = []
+    examined_boundary: list[dict[str, Any]] = []
+    # (provider, provider_symbol) -> the securities that claim it on this date.
+    symbol_claims: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+    for member in sorted(members, key=lambda row: str(row.get("ticker") or "")):
+        security_id = _text(member, "security_id", "reviewed universe member")
+        ticker = _text(member, "ticker", "reviewed universe member").upper()
+        mappings = store.provider_symbol_mappings(security_id)
+        active = [
+            row
+            for row in mappings
+            if _mapping_covers(row, decision_date)
+        ]
+        examined_boundary.append(
+            {
+                "security_id": security_id,
+                "ticker": ticker,
+                "active_mappings": len(active),
+            }
+        )
+
+        by_provider: dict[str, list[dict[str, Any]]] = {}
+        for row in active:
+            provider = _text(row, "provider", "provider mapping").lower()
+            symbol = _text(row, "provider_symbol", "provider mapping").upper()
+            by_provider.setdefault(provider, []).append(row)
+            symbol_claims.setdefault((provider, symbol), []).append(
+                {"security_id": security_id, "ticker": ticker}
+            )
+
+        for provider, rows in sorted(by_provider.items()):
+            if len(rows) < 2:
+                continue
+            symbols = sorted(
+                {
+                    _text(row, "provider_symbol", "provider mapping").upper()
+                    for row in rows
+                }
+            )
+            observations.append(
+                AnomalyObservation(
+                    fingerprint=anomaly_fingerprint(
+                        rule_id=MAPPING_RULE_ID,
+                        rule_version=MAPPING_RULE_VERSION,
+                        scope=scope,
+                        subject_type="security_provider",
+                        subject_id=f"{security_id}:{provider}",
+                    ),
+                    rule_id=MAPPING_RULE_ID,
+                    rule_version=MAPPING_RULE_VERSION,
+                    scope=scope,
+                    subject_type="security_provider",
+                    subject_id=f"{security_id}:{provider}",
+                    severity="high",
+                    confidence=CONFIDENCE_EXACT_COMPARISON,
+                    title=(
+                        f"{ticker} has {len(rows)} overlapping {provider} mappings "
+                        f"on {decision_date.isoformat()}"
+                    ),
+                    summary=(
+                        "More than one verified provider window covers this "
+                        "decision date, so price routing is ambiguous. Close or "
+                        "correct the wrong window; never guess which symbol wins."
+                    ),
+                    old_value={"expected_active_mappings": 1},
+                    new_value={
+                        "active_mappings": len(rows),
+                        "provider": provider,
+                        "provider_symbols": symbols,
+                    },
+                    evidence={
+                        "security_id": security_id,
+                        "ticker": ticker,
+                        "provider": provider,
+                        "as_of": decision_date.isoformat(),
+                        "windows": [_mapping_window(row) for row in rows],
+                        "rule_bundle_version": RULE_BUNDLE_VERSION,
+                    },
+                    suggested_checks=(
+                        "Confirm which provider symbol genuinely covers this date.",
+                        "Close the superseded window with an exact data_end.",
+                        "Re-verify any prices already routed through the wrong symbol.",
+                        "Never delete history to resolve this; correct the window.",
+                    ),
+                )
+            )
+
+    for (provider, symbol), claimants in sorted(symbol_claims.items()):
+        distinct = sorted({row["security_id"] for row in claimants})
+        if len(distinct) < 2:
+            continue
+        tickers = sorted({row["ticker"] for row in claimants})
+        observations.append(
+            AnomalyObservation(
+                fingerprint=anomaly_fingerprint(
+                    rule_id=MAPPING_RULE_ID,
+                    rule_version=MAPPING_RULE_VERSION,
+                    scope=scope,
+                    subject_type="provider_symbol",
+                    subject_id=f"{provider}:{symbol}",
+                ),
+                rule_id=MAPPING_RULE_ID,
+                rule_version=MAPPING_RULE_VERSION,
+                scope=scope,
+                subject_type="provider_symbol",
+                subject_id=f"{provider}:{symbol}",
+                severity="high",
+                confidence=CONFIDENCE_EXACT_COMPARISON,
+                title=(
+                    f"{provider} symbol {symbol} is claimed by "
+                    f"{len(distinct)} securities"
+                ),
+                summary=(
+                    "One provider symbol maps to more than one listed security "
+                    "on this date. This is how a reused ticker contaminates an "
+                    "unrelated company's price history."
+                ),
+                old_value={"expected_securities": 1},
+                new_value={
+                    "securities": len(distinct),
+                    "security_ids": distinct,
+                    "tickers": tickers,
+                },
+                evidence={
+                    "provider": provider,
+                    "provider_symbol": symbol,
+                    "as_of": decision_date.isoformat(),
+                    "claimants": sorted(
+                        claimants,
+                        key=lambda row: (row["security_id"], row["ticker"]),
+                    ),
+                    "rule_bundle_version": RULE_BUNDLE_VERSION,
+                },
+                suggested_checks=(
+                    "Determine which security genuinely owned this symbol on "
+                    "this date.",
+                    "Bound the losing mapping with an exact data_end.",
+                    "Check whether prices were stored against the wrong security.",
+                    "Never let a live provider result backfill a historical issuer.",
+                ),
+            )
+        )
+
+    source_boundary_at = _reference_source_boundary(store, decision_date)
+    return _build_scan(
+        scope=scope,
+        rule_id=MAPPING_RULE_ID,
+        rule_version=MAPPING_RULE_VERSION,
+        decision_date=decision_date,
+        source_boundary_at=source_boundary_at,
+        observations=observations,
+        boundary_extra={"examined_set_sha256": _sha(examined_boundary)},
+        evidence_extra={
+            "universe_id": universe_id,
+            "reviewed_members": len(members),
+            "examined_securities": len(examined_boundary),
+            "distinct_provider_symbols": len(symbol_claims),
+            "ambiguous_mappings": len(observations),
+            "examined_set_sha256": _sha(examined_boundary),
+        },
+    )
+
+
+def _mapping_covers(row: dict[str, Any], moment: date) -> bool:
+    """Return whether one half-open provider window covers the decision date."""
+    start = row.get("data_start")
+    if start is None:
+        raise ValueError("provider mapping lacks data_start")
+    if _as_date(start) > moment:
+        return False
+    end = row.get("data_end")
+    return end is None or _as_date(end) > moment
+
+
+def _mapping_window(row: dict[str, Any]) -> dict[str, Any]:
+    end = row.get("data_end")
+    return {
+        "provider_symbol": _text(row, "provider_symbol", "provider mapping").upper(),
+        "data_start": _as_date(row["data_start"]).isoformat(),
+        "data_end": _as_date(end).isoformat() if end is not None else None,
+        "verified_date": _optional(row.get("verified_date")),
+        "source": _optional(row.get("source")),
+    }
+
+
+def _issuer_members(members: list[dict[str, Any]]) -> list[tuple[str, tuple[str, ...]]]:
+    """Group reviewed members by issuer, in deterministic ticker order.
+
+    Fundamentals are issuer-level, but membership is security-level, and the
+    S&P 500 holds three dual-class issuers (Alphabet, Fox, News Corp) whose two
+    listed securities share one ``issuer_id``. Iterating members would query
+    each of those issuers twice and emit the same finding twice, and the ledger
+    rejects a scan containing duplicate fingerprints — so every issuer is
+    visited exactly once, carrying all of its member tickers as evidence.
+    """
+    grouped: dict[str, set[str]] = {}
+    for member in members:
+        issuer_id = _text(member, "issuer_id", "reviewed universe member")
+        ticker = _text(member, "ticker", "reviewed universe member").upper()
+        grouped.setdefault(issuer_id, set()).add(ticker)
+    return [
+        (issuer_id, tuple(sorted(tickers)))
+        for issuer_id, tickers in sorted(
+            grouped.items(), key=lambda row: (sorted(row[1])[0], row[0])
+        )
+    ]
+
+
+# ----------------------------------------------------------------------
+# Rule: sudden share-count changes
+# ----------------------------------------------------------------------
+def scan_share_count_jump(
+    *,
+    store: Store,
+    as_of: date | str,
+    universe_id: str = "sp500",
+    minimum_members: int = 450,
+    maximum_members: int = 550,
+    jump_threshold: float = SHARES_JUMP_THRESHOLD,
+    lookback_filings: int = SHARES_LOOKBACK_FILINGS,
+) -> AnomalyScan:
+    """Detect implausible share-count movement between consecutive filings.
+
+    Share count drives market cap, so a bad value silently corrupts every Value
+    factor built on it. Genuine causes exist — splits, large issuance, buybacks
+    — but a move past the threshold between two consecutive point-in-time
+    filings is worth a human look. The rule does NOT look up the corresponding
+    corporate action: confirming one is the operator's first suggested check,
+    and co-reporting reviewed splits belongs to a later rule version.
+
+    Two stored values need no threshold to be wrong. A non-positive share count
+    is impossible for a listed company and is reported directly, and it is kept
+    out of the ratio comparison so it cannot divide by zero or manufacture a
+    fake jump in the surrounding series.
+
+    The rule never repairs a value and never guesses a split from the ratio.
+    Expect a large historical backlog on first run: the comparison spans the
+    issuer's whole retained filing history, and a retroactive post-split
+    restatement of an old period is a genuine, reviewable difference.
+    """
+
+    decision_date = _as_date(as_of)
+    if minimum_members < 1 or maximum_members < minimum_members:
+        raise ValueError("invalid anomaly-scan universe bounds")
+    if not 0 < jump_threshold < 10:
+        raise ValueError("share-count jump threshold must be a positive fraction")
+    if lookback_filings < 2:
+        raise ValueError("share-count lookback requires at least two filings")
+    scope = f"{SHARES_SCOPE_PREFIX}:{universe_id}"
+
+    members = store.universe_identity_labels(universe_id, decision_date)
+    if not minimum_members <= len(members) <= maximum_members:
+        raise ValueError(
+            f"{universe_id} has {len(members)} reviewed members on {decision_date}; "
+            f"expected {minimum_members}-{maximum_members}"
+        )
+
+    observations: list[AnomalyObservation] = []
+    examined_boundary: list[dict[str, Any]] = []
+    examined_issuers = 0
+
+    for issuer_id, tickers in _issuer_members(members):
+        ticker = tickers[0]
+        window = store.query(
+            """
+            SELECT period_end, as_of_date, value
+            FROM fundamentals
+            WHERE issuer_id = ?
+              AND metric = ?
+              AND as_of_date <= CAST(? AS DATE)
+              AND period_end <= as_of_date
+              AND value IS NOT NULL
+            ORDER BY period_end DESC, as_of_date DESC
+            LIMIT ?
+            """,
+            (issuer_id, SHARES_METRIC, decision_date.isoformat(), lookback_filings),
+        )
+        history = list(reversed(window))
+        if len(history) < 2:
+            # Nothing comparable is claimed for this issuer.
+            continue
+        examined_issuers += 1
+        examined_boundary.append(
+            {
+                "issuer_id": issuer_id,
+                "ticker": ticker,
+                "tickers": list(tickers),
+                "observations": len(history),
+            }
+        )
+
+        # A stored non-positive count is itself the anomaly. Report it, and
+        # keep it out of the ratio comparison so one bad row cannot divide by
+        # zero or manufacture a fake jump in the surrounding series.
+        usable: list[dict[str, Any]] = []
+        for row in history:
+            if _share_value(row, issuer_id) > 0:
+                usable.append(row)
+                continue
+            observations.append(
+                _invalid_share_count_observation(
+                    scope=scope,
+                    issuer_id=issuer_id,
+                    ticker=ticker,
+                    tickers=tickers,
+                    row=row,
+                    decision_date=decision_date,
+                )
+            )
+
+        for previous, current in zip(usable, usable[1:], strict=False):
+            previous_shares = _share_value(previous, issuer_id)
+            current_shares = _share_value(current, issuer_id)
+            change = (current_shares - previous_shares) / previous_shares
+            if abs(change) < jump_threshold:
+                continue
+
+            current_period = _as_date(current["period_end"])
+            previous_period = _as_date(previous["period_end"])
+            # One fiscal period is restated across several knowable dates, so
+            # the period alone is not a unique case identity: two jumps inside
+            # the same period would collide into one fingerprint and the ledger
+            # would reject the whole scan.
+            subject_id = (
+                f"{issuer_id}@{current_period.isoformat()}"
+                f"#{_as_date(current['as_of_date']).isoformat()}"
+            )
+            observations.append(
+                AnomalyObservation(
+                    fingerprint=anomaly_fingerprint(
+                        rule_id=SHARES_RULE_ID,
+                        rule_version=SHARES_RULE_VERSION,
+                        scope=scope,
+                        subject_type="issuer_period",
+                        subject_id=subject_id,
+                    ),
+                    rule_id=SHARES_RULE_ID,
+                    rule_version=SHARES_RULE_VERSION,
+                    scope=scope,
+                    subject_type="issuer_period",
+                    subject_id=subject_id,
+                    severity="high" if abs(change) >= 0.5 else "medium",
+                    confidence=CONFIDENCE_REPORTED_SOURCE,
+                    title=(
+                        f"{ticker} share count moved {change:.1%} into "
+                        f"{current_period.isoformat()}"
+                    ),
+                    summary=(
+                        "Reported shares outstanding changed sharply between two "
+                        "consecutive point-in-time filings. Confirm a split, "
+                        "issuance or buyback explains it before trusting any "
+                        "market-cap or per-share factor built on this value."
+                    ),
+                    old_value={
+                        "period_end": previous_period.isoformat(),
+                        "as_of_date": _as_date(previous["as_of_date"]).isoformat(),
+                        "shares_out": previous_shares,
+                    },
+                    new_value={
+                        "period_end": current_period.isoformat(),
+                        "as_of_date": _as_date(current["as_of_date"]).isoformat(),
+                        "shares_out": current_shares,
+                        "change_fraction": change,
+                        "implied_ratio": current_shares / previous_shares,
+                    },
+                    evidence={
+                        "issuer_id": issuer_id,
+                        "ticker": ticker,
+                        "tickers": list(tickers),
+                        "metric": SHARES_METRIC,
+                        "jump_threshold": jump_threshold,
+                        "decision_evidence_as_of": decision_date.isoformat(),
+                        "rule_bundle_version": RULE_BUNDLE_VERSION,
+                    },
+                    suggested_checks=(
+                        "Check the issuer's filing for a split, offering or "
+                        "buyback covering this period.",
+                        "Confirm the SEC cover-page share count was parsed with "
+                        "the right unit and scale.",
+                        "Re-check any market-cap or per-share factor computed "
+                        "from the newer value.",
+                        "Never rescale a stored share count to make the series "
+                        "look smooth.",
+                    ),
+                )
+            )
+
+    source_boundary_at = _reference_source_boundary(store, decision_date)
+    return _build_scan(
+        scope=scope,
+        rule_id=SHARES_RULE_ID,
+        rule_version=SHARES_RULE_VERSION,
+        decision_date=decision_date,
+        source_boundary_at=source_boundary_at,
+        observations=observations,
+        boundary_extra={"examined_set_sha256": _sha(examined_boundary)},
+        evidence_extra={
+            "universe_id": universe_id,
+            "reviewed_members": len(members),
+            "examined_issuers": examined_issuers,
+            "metric": SHARES_METRIC,
+            "jump_threshold": jump_threshold,
+            "lookback_filings": lookback_filings,
+            "share_count_jumps": len(observations),
+            "examined_set_sha256": _sha(examined_boundary),
+        },
+    )
+
+
+def _invalid_share_count_observation(
+    *,
+    scope: str,
+    issuer_id: str,
+    ticker: str,
+    tickers: tuple[str, ...],
+    row: dict[str, Any],
+    decision_date: date,
+) -> AnomalyObservation:
+    """Report one stored share count that cannot be true."""
+    period_end = _as_date(row["period_end"])
+    known_on = _as_date(row["as_of_date"])
+    shares = float(row["value"])
+    subject_id = f"{issuer_id}@{period_end.isoformat()}#{known_on.isoformat()}"
+    return AnomalyObservation(
+        fingerprint=anomaly_fingerprint(
+            rule_id=SHARES_RULE_ID,
+            rule_version=SHARES_RULE_VERSION,
+            scope=scope,
+            subject_type="issuer_share_count",
+            subject_id=subject_id,
+        ),
+        rule_id=SHARES_RULE_ID,
+        rule_version=SHARES_RULE_VERSION,
+        scope=scope,
+        subject_type="issuer_share_count",
+        subject_id=subject_id,
+        severity="high",
+        confidence=CONFIDENCE_EXACT_COMPARISON,
+        title=(
+            f"{ticker} reports a non-positive share count "
+            f"({shares:g}) for {period_end.isoformat()}"
+        ),
+        summary=(
+            "A listed company cannot have zero or negative shares "
+            "outstanding, so this stored value is wrong. Any market-cap or "
+            "per-share factor built on it is meaningless. Correct the parse "
+            "or withhold the row; never substitute a neighbouring period."
+        ),
+        old_value={"expected": "a positive share count"},
+        new_value={
+            "period_end": period_end.isoformat(),
+            "as_of_date": known_on.isoformat(),
+            "shares_out": shares,
+        },
+        evidence={
+            "issuer_id": issuer_id,
+            "ticker": ticker,
+            "tickers": list(tickers),
+            "metric": SHARES_METRIC,
+            "decision_evidence_as_of": decision_date.isoformat(),
+            "rule_bundle_version": RULE_BUNDLE_VERSION,
+        },
+        suggested_checks=(
+            "Read the exact retained filing payload for this period and "
+            "confirm the cover-page share count.",
+            "Check whether the parser mapped an empty or placeholder tag to "
+            "zero instead of withholding the row.",
+            "Confirm no factor score for this issuer consumed this value.",
+            "Withhold the row rather than guessing a replacement count.",
+        ),
+    )
+
+
+def _share_value(row: dict[str, Any], issuer_id: str) -> float:
+    """Return one stored share count without judging whether it is plausible.
+
+    A missing value is a contract violation and still fails closed. A stored
+    zero or negative count is NOT: it is precisely the implausible share count
+    this rule exists to surface, and the live archive holds 80 such historical
+    rows. Raising on them withheld every scan for the whole universe and hid
+    the finding, so they are reported as observations instead.
+    """
+    value = row.get("value")
+    if value is None:
+        raise ValueError(f"share-count row lacks a value: {issuer_id}")
+    return float(value)
+
+
+# ----------------------------------------------------------------------
+# Rule: duplicate or conflicting filings
+# ----------------------------------------------------------------------
+def scan_conflicting_filings(
+    *,
+    store: Store,
+    as_of: date | str,
+    universe_id: str = "sp500",
+    minimum_members: int = 450,
+    maximum_members: int = 550,
+) -> AnomalyScan:
+    """Detect one economic key carrying two different values.
+
+    ``fundamentals`` is keyed by ``(ticker, period_end, as_of_date, metric)``, so
+    the same issuer reporting one metric for one period, knowable on one date,
+    must resolve to exactly one value. Two distinct values mean a restatement was
+    stored as a duplicate, or two source rows disagree. Either way a factor read
+    could silently pick the wrong one.
+
+    The rule reports the conflict and never chooses a winner.
+    """
+
+    decision_date = _as_date(as_of)
+    if minimum_members < 1 or maximum_members < minimum_members:
+        raise ValueError("invalid anomaly-scan universe bounds")
+    scope = f"{FILINGS_SCOPE_PREFIX}:{universe_id}"
+
+    members = store.universe_identity_labels(universe_id, decision_date)
+    if not minimum_members <= len(members) <= maximum_members:
+        raise ValueError(
+            f"{universe_id} has {len(members)} reviewed members on {decision_date}; "
+            f"expected {minimum_members}-{maximum_members}"
+        )
+
+    observations: list[AnomalyObservation] = []
+    examined_boundary: list[dict[str, Any]] = []
+
+    for issuer_id, tickers in _issuer_members(members):
+        ticker = tickers[0]
+        conflicts = store.query(
+            """
+            SELECT period_end, as_of_date, metric,
+                   COUNT(DISTINCT value) AS distinct_values,
+                   MIN(value) AS minimum_value,
+                   MAX(value) AS maximum_value
+            FROM fundamentals
+            WHERE issuer_id = ?
+              AND as_of_date <= CAST(? AS DATE)
+              AND period_end <= as_of_date
+              AND value IS NOT NULL
+            GROUP BY period_end, as_of_date, metric
+            HAVING COUNT(DISTINCT value) > 1
+            ORDER BY period_end, metric
+            """,
+            (issuer_id, decision_date.isoformat()),
+        )
+        examined_boundary.append(
+            {
+                "issuer_id": issuer_id,
+                "ticker": ticker,
+                "tickers": list(tickers),
+                "conflicts": len(conflicts),
+            }
+        )
+        for row in conflicts:
+            metric = _text(row, "metric", "conflicting filing")
+            period_end = _as_date(row["period_end"])
+            known_on = _as_date(row["as_of_date"])
+            distinct_values = _exact_count(
+                row.get("distinct_values"),
+                field="distinct_values",
+                label="conflicting filing",
+            )
+            # The query groups by as_of_date, so one metric/period restated on
+            # two knowable dates yields two rows. Omitting as_of_date here
+            # collapsed them into one fingerprint and the ledger rejects a scan
+            # that repeats a fingerprint.
+            subject_id = (
+                f"{issuer_id}:{metric}@{period_end.isoformat()}"
+                f"#{known_on.isoformat()}"
+            )
+            observations.append(
+                AnomalyObservation(
+                    fingerprint=anomaly_fingerprint(
+                        rule_id=FILINGS_RULE_ID,
+                        rule_version=FILINGS_RULE_VERSION,
+                        scope=scope,
+                        subject_type="issuer_metric_period",
+                        subject_id=subject_id,
+                    ),
+                    rule_id=FILINGS_RULE_ID,
+                    rule_version=FILINGS_RULE_VERSION,
+                    scope=scope,
+                    subject_type="issuer_metric_period",
+                    subject_id=subject_id,
+                    severity="high",
+                    confidence=CONFIDENCE_EXACT_COMPARISON,
+                    title=(
+                        f"{ticker} reports {distinct_values} values for {metric} "
+                        f"in {period_end.isoformat()}"
+                    ),
+                    summary=(
+                        "One issuer, metric and fiscal period knowable on one "
+                        "date resolves to more than one stored value. A factor "
+                        "read could pick either. Identify the correct source row "
+                        "instead of averaging or deleting."
+                    ),
+                    old_value={"expected_distinct_values": 1},
+                    new_value={
+                        "distinct_values": distinct_values,
+                        "minimum_value": row.get("minimum_value"),
+                        "maximum_value": row.get("maximum_value"),
+                        "period_end": period_end.isoformat(),
+                        "as_of_date": known_on.isoformat(),
+                        "metric": metric,
+                    },
+                    evidence={
+                        "issuer_id": issuer_id,
+                        "ticker": ticker,
+                        "tickers": list(tickers),
+                        "metric": metric,
+                        "period_end": period_end.isoformat(),
+                        "as_of_date": known_on.isoformat(),
+                        "decision_evidence_as_of": decision_date.isoformat(),
+                        "rule_bundle_version": RULE_BUNDLE_VERSION,
+                    },
+                    suggested_checks=(
+                        "Compare both values against the exact retained filing "
+                        "payload.",
+                        "Check whether a restatement was stored as a duplicate "
+                        "rather than a new version.",
+                        "Confirm unit and scale parsing for this metric.",
+                        "Never average conflicting values or delete one without "
+                        "source evidence.",
+                    ),
+                )
+            )
+
+    source_boundary_at = _reference_source_boundary(store, decision_date)
+    return _build_scan(
+        scope=scope,
+        rule_id=FILINGS_RULE_ID,
+        rule_version=FILINGS_RULE_VERSION,
+        decision_date=decision_date,
+        source_boundary_at=source_boundary_at,
+        observations=observations,
+        boundary_extra={"examined_set_sha256": _sha(examined_boundary)},
+        evidence_extra={
+            "universe_id": universe_id,
+            "reviewed_members": len(members),
+            "examined_issuers": len(examined_boundary),
+            "conflicting_keys": len(observations),
+            "examined_set_sha256": _sha(examined_boundary),
+        },
+    )
+
+
+# ----------------------------------------------------------------------
+# Rule: factor percentile jumps
+# ----------------------------------------------------------------------
+def measure_universe_factor_percentiles(
+    *,
+    store: Store,
+    as_of: date | str,
+    universe_id: str = "sp500",
+    factor_model: str = "qv",
+) -> dict[str, Any]:
+    """Return the exact composite percentile for every scored member.
+
+    There is no stored factor-score history: scores are computed on demand from
+    point-in-time evidence. So the caller keeps this snapshot and feeds it back
+    as the next scan's baseline, exactly as the coverage rule works. The payload
+    is deliberately separate from the scan evidence, which carries only a hash
+    and counts — 503 embedded scores on both sides would not fit the ledger's
+    64 KiB evidence limit.
+    """
+    from aios.factors.composite import compute_composite
+
+    decision_date = _as_date(as_of)
+    if factor_model not in FACTOR_SUPPORTED_MODELS:
+        raise ValueError(
+            f"unsupported factor model: {factor_model!r}; "
+            f"expected one of {list(FACTOR_SUPPORTED_MODELS)}"
+        )
+    members = store.universe_identity_labels(universe_id, decision_date)
+    if not members:
+        raise ValueError(f"{universe_id} has no active members on {decision_date}")
+
+    tickers = sorted(
+        _text(member, "ticker", "reviewed universe member").upper()
+        for member in members
+    )
+    rows = compute_composite(tickers, decision_date.isoformat(), store)
+
+    attribute = "qv_score" if factor_model == "qv" else "qvml_score"
+    scores: dict[str, float] = {}
+    withheld: list[str] = []
+    for row in rows:
+        value = getattr(row, attribute)
+        ticker = str(row.ticker).upper()
+        if value is None:
+            # A withheld score is a coverage question, not a factor jump. It is
+            # counted, never treated as a zero.
+            withheld.append(ticker)
+            continue
+        scores[ticker] = float(value)
+    return {
+        "as_of": decision_date.isoformat(),
+        "universe_id": universe_id,
+        "factor_model": factor_model,
+        "members": len(members),
+        "scored_members": len(scores),
+        "withheld_members": sorted(withheld),
+        "scores": scores,
+    }
+
+
+FACTOR_BASELINE_ARTIFACT_DIR = Path("data/anomaly_baselines/factor_percentiles")
+
+
+def _factor_baseline_scope_slug(universe_id: str, factor_model: str) -> str:
+    return f"{universe_id}-{factor_model}"
+
+
+def record_factor_percentile_baseline(
+    snapshot: dict[str, Any],
+    *,
+    baseline_dir: Path = FACTOR_BASELINE_ARTIFACT_DIR,
+) -> Path:
+    """Durably record one factor-percentile snapshot as the next scan's baseline.
+
+    The scan ledger deliberately excludes the full score map from its own
+    evidence — a 503-name mapping does not fit the 64 KiB evidence limit — so
+    `scan_factor_percentile_jump`'s baseline cannot come from
+    `latest_anomaly_scan_evidence` the way `coverage_deterioration`'s does.
+    This is the separate, small write-once store that fills that gap: one
+    immutable file per snapshot, content-addressed by decision date, entirely
+    outside the operations ledger.
+    """
+    scope_slug = _factor_baseline_scope_slug(
+        str(snapshot["universe_id"]), str(snapshot["factor_model"])
+    )
+    destination = baseline_dir / scope_slug / f"{snapshot['as_of']}.json"
+    publish_text_write_once(destination, canonical_json(snapshot))
+    return destination
+
+
+def latest_factor_percentile_baseline(
+    *,
+    universe_id: str = "sp500",
+    factor_model: str = "qv",
+    before: date | str | None = None,
+    baseline_dir: Path = FACTOR_BASELINE_ARTIFACT_DIR,
+) -> dict[str, Any] | None:
+    """Return the most recent recorded snapshot for one scope, if any.
+
+    ``before`` restricts the search to snapshots dated strictly earlier than
+    the given date — the caller comparing a new decision date against history
+    should never pick a "baseline" that is actually later than the scan it is
+    meant to explain. Returns ``None`` when nothing has been recorded yet: a
+    legitimate first-run state, not an error.
+    """
+    scope_slug = _factor_baseline_scope_slug(universe_id, factor_model)
+    directory = baseline_dir / scope_slug
+    if not directory.is_dir():
+        return None
+    cutoff = _as_date(before) if before is not None else None
+    candidates: list[tuple[date, Path]] = []
+    for candidate in directory.glob("*.json"):
+        try:
+            snapshot_date = date.fromisoformat(candidate.stem)
+        except ValueError:
+            continue
+        if cutoff is not None and snapshot_date >= cutoff:
+            continue
+        candidates.append((snapshot_date, candidate))
+    if not candidates:
+        return None
+    _, latest_path = max(candidates, key=lambda row: row[0])
+    return json.loads(latest_path.read_text(encoding="utf-8"))
+
+
+def scan_factor_percentile_jump(
+    *,
+    store: Store,
+    as_of: date | str,
+    baseline: dict[str, Any] | None,
+    universe_id: str = "sp500",
+    factor_model: str = "qv",
+    jump_threshold: float = FACTOR_JUMP_THRESHOLD,
+    current: dict[str, Any] | None = None,
+) -> AnomalyScan:
+    """Detect research scores that moved further than evidence should allow.
+
+    A composite percentile is a cross-sectional research score. It moves when
+    peers move, so ordinary drift is expected and uninteresting. A jump of tens
+    of percentile points between two comparable decision dates usually means the
+    inputs changed underneath the score — a restated fundamental, a bad price, a
+    lost mapping — not that the company transformed.
+
+    The rule reports the jump and never adjusts a score or withholds a member.
+    ``baseline`` is the snapshot from the previous comparable measurement; when
+    it is ``None`` the scan emits zero observations rather than inventing a
+    first-run finding, exactly like the coverage rule.
+
+    ``current`` lets a caller pass a snapshot it already computed. Recomputing
+    the full 503-member composite is the expensive part of this scan, so a
+    caller that just measured it should not pay twice.
+    """
+
+    decision_date = _as_date(as_of)
+    if not 0 < jump_threshold <= 100:
+        raise ValueError("factor jump threshold must be in (0, 100] percentile points")
+    scope = f"{FACTOR_SCOPE_PREFIX}:{universe_id}"
+
+    if current is not None:
+        measured = current
+    else:
+        measured = measure_universe_factor_percentiles(
+            store=store,
+            as_of=decision_date,
+            universe_id=universe_id,
+            factor_model=factor_model,
+        )
+    if str(measured.get("as_of") or "") != decision_date.isoformat():
+        raise ValueError("factor snapshot describes a different decision date")
+    if str(measured.get("factor_model") or "") != factor_model:
+        raise ValueError("factor snapshot describes a different factor model")
+
+    observations: list[AnomalyObservation] = []
+    comparable = False
+    compared_members = 0
+    if baseline is not None:
+        comparable = True
+        baseline_as_of = _as_date(_text(baseline, "as_of", "factor baseline"))
+        if baseline_as_of > decision_date:
+            raise ValueError("factor baseline is later than the scanned decision date")
+        if str(baseline.get("universe_id") or "") != universe_id:
+            raise ValueError("factor baseline describes a different universe")
+        if str(baseline.get("factor_model") or "") != factor_model:
+            # Comparing a QV percentile against a QVML percentile would
+            # manufacture jumps out of a definition change.
+            raise ValueError("factor baseline describes a different factor model")
+
+        previous_scores = baseline.get("scores")
+        if not isinstance(previous_scores, dict):
+            raise ValueError("factor baseline lacks a scores mapping")
+        current_scores = measured["scores"]
+
+        for ticker in sorted(set(previous_scores) & set(current_scores)):
+            previous_value = _exact_percentile(previous_scores[ticker], ticker=ticker)
+            current_value = _exact_percentile(current_scores[ticker], ticker=ticker)
+            compared_members += 1
+            move = current_value - previous_value
+            if abs(move) < jump_threshold:
+                continue
+            subject_id = f"{universe_id}:{factor_model}:{ticker}"
+            observations.append(
+                AnomalyObservation(
+                    fingerprint=anomaly_fingerprint(
+                        rule_id=FACTOR_RULE_ID,
+                        rule_version=FACTOR_RULE_VERSION,
+                        scope=scope,
+                        subject_type="member_factor_score",
+                        subject_id=subject_id,
+                    ),
+                    rule_id=FACTOR_RULE_ID,
+                    rule_version=FACTOR_RULE_VERSION,
+                    scope=scope,
+                    subject_type="member_factor_score",
+                    subject_id=subject_id,
+                    severity="high" if abs(move) >= 60 else "medium",
+                    confidence=CONFIDENCE_EXACT_COMPARISON,
+                    title=(
+                        f"{ticker} {factor_model.upper()} percentile moved "
+                        f"{move:+.1f} points since {baseline_as_of.isoformat()}"
+                    ),
+                    summary=(
+                        "A cross-sectional research score moved further than "
+                        "ordinary peer drift explains. Check whether an input "
+                        "changed underneath it — a restated fundamental, a bad "
+                        "price, or a lost mapping — before trusting the new "
+                        "ranking. Never adjust a score to smooth this."
+                    ),
+                    old_value={
+                        "as_of": baseline_as_of.isoformat(),
+                        "percentile": previous_value,
+                    },
+                    new_value={
+                        "as_of": decision_date.isoformat(),
+                        "percentile": current_value,
+                        "move_points": move,
+                    },
+                    evidence={
+                        "universe_id": universe_id,
+                        "ticker": ticker,
+                        "factor_model": factor_model,
+                        "jump_threshold": jump_threshold,
+                        "baseline_as_of": baseline_as_of.isoformat(),
+                        "decision_evidence_as_of": decision_date.isoformat(),
+                        "rule_bundle_version": RULE_BUNDLE_VERSION,
+                    },
+                    suggested_checks=(
+                        "Compare the point-in-time fundamentals behind both "
+                        "scores for a restatement.",
+                        "Check the price and share count this score consumed.",
+                        "Confirm the provider mapping did not change between "
+                        "the two decision dates.",
+                        "Rankings are research scores, not expected returns; "
+                        "never trade this signal to resolve the case.",
+                    ),
+                )
+            )
+
+    source_boundary_at = _reference_source_boundary(store, decision_date)
+    return _build_scan(
+        scope=scope,
+        rule_id=FACTOR_RULE_ID,
+        rule_version=FACTOR_RULE_VERSION,
+        decision_date=decision_date,
+        source_boundary_at=source_boundary_at,
+        observations=observations,
+        boundary_extra={"factor_set_sha256": _sha(measured)},
+        evidence_extra={
+            "universe_id": universe_id,
+            "factor_model": factor_model,
+            "comparable_baseline": comparable,
+            "baseline_as_of": (
+                str(baseline.get("as_of")) if baseline is not None else None
+            ),
+            "members": measured["members"],
+            "scored_members": measured["scored_members"],
+            "withheld_members": len(measured["withheld_members"]),
+            "compared_members": compared_members,
+            "jump_threshold": jump_threshold,
+            "percentile_jumps": len(observations),
+            # The full score maps stay out of the evidence deliberately: two
+            # 503-entry mappings would not fit the ledger's 64 KiB limit.
+            "factor_set_sha256": _sha(measured),
+        },
+    )
+
+
+def _exact_percentile(value: Any, *, ticker: str) -> float:
+    """Require a genuine 0-100 percentile.
+
+    A silently coerced string or an out-of-range value would manufacture or hide
+    a jump, so the range is checked exactly.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"factor percentile must be numeric for {ticker}: {value!r}")
+    percentile = float(value)
+    if not 0.0 <= percentile <= 100.0:
+        raise ValueError(
+            f"factor percentile out of range for {ticker}: {percentile}"
+        )
+    return percentile
+
+
+# ----------------------------------------------------------------------
+# Shared scan assembly and detector registry
+# ----------------------------------------------------------------------
+def _build_scan(
+    *,
+    scope: str,
+    rule_id: str,
+    rule_version: str,
+    decision_date: date,
+    source_boundary_at: datetime,
+    observations: list[AnomalyObservation],
+    boundary_extra: dict[str, Any],
+    evidence_extra: dict[str, Any],
+) -> AnomalyScan:
+    """Assemble one complete scan with the shared safety and boundary contract.
+
+    ``scan_id`` is derived from the boundary hash so an identical comparison is
+    idempotent in the ledger, matching the SEC rule's behaviour.
+    """
+    executed = f"{rule_id}@{rule_version}"
+    # The ledger refuses a scan that repeats a fingerprint, which would surface
+    # far downstream as an opaque record-time failure. Catch it here, where the
+    # rule and the colliding subject are still known.
+    seen: set[str] = set()
+    for row in observations:
+        if row.fingerprint in seen:
+            raise ValueError(
+                f"{executed} produced a duplicate fingerprint for "
+                f"{row.subject_type} {row.subject_id!r}; its subject identity "
+                "is not unique within one scan"
+            )
+        seen.add(row.fingerprint)
+    observation_boundary = [
+        {
+            "fingerprint": row.fingerprint,
+            "evidence_sha256": _sha(
+                {
+                    "old_value": row.old_value,
+                    "new_value": row.new_value,
+                    "evidence": row.evidence,
+                }
+            ),
+        }
+        for row in observations
+    ]
+    boundary = {
+        "rule_bundle_version": RULE_BUNDLE_VERSION,
+        "scope": scope,
+        "decision_evidence_as_of": decision_date.isoformat(),
+        "evidence_observed_through": source_boundary_at.isoformat(),
+        "temporal_mode": "retrospective_review_no_backfill",
+        "executed_rules": [executed],
+        "observations": observation_boundary,
+        **boundary_extra,
+    }
+    boundary_hash = _sha(boundary)
+    return AnomalyScan(
+        scan_id=f"dqs-{boundary_hash[:32]}",
+        rule_bundle_version=RULE_BUNDLE_VERSION,
+        scope=scope,
+        source_boundary_sha256=boundary_hash,
+        source_boundary_at=source_boundary_at,
+        executed_rules=(executed,),
+        observations=tuple(observations),
+        evidence={
+            "as_of": decision_date.isoformat(),
+            "decision_evidence_as_of": decision_date.isoformat(),
+            "evidence_observed_through": source_boundary_at.isoformat(),
+            "temporal_mode": "retrospective_review_no_backfill",
+            "executed_rules": [executed],
+            "safety": {
+                "data_repairs": 0,
+                "readiness_overrides": 0,
+                "paper_actions": 0,
+                "broker_actions": 0,
+            },
+            **evidence_extra,
+        },
+    )
+
+
+@dataclass(frozen=True)
+class DetectorSpec:
+    """One registered detector and the ledger scope it owns.
+
+    Each rule family writes into its own scope namespace. The ledger enforces a
+    monotonic source boundary per case, so separate scopes let a price scan and
+    a coverage scan advance independently without either blocking the other, and
+    without changing the frozen ``rule_bundle_version`` contract.
+    """
+
+    rule_id: str
+    rule_version: str
+    scope_prefix: str
+    subject_type: str
+    requires_baseline: bool = False
+
+
+SEC_DETECTOR = DetectorSpec(
+    rule_id=SEC_RULE_ID,
+    rule_version=SEC_RULE_VERSION,
+    scope_prefix=SEC_SCOPE_PREFIX,
+    subject_type="issuer",
+)
+PRICE_DETECTOR = DetectorSpec(
+    rule_id=PRICE_RULE_ID,
+    rule_version=PRICE_RULE_VERSION,
+    scope_prefix=PRICE_SCOPE_PREFIX,
+    subject_type="security_session",
+)
+COVERAGE_DETECTOR = DetectorSpec(
+    rule_id=COVERAGE_RULE_ID,
+    rule_version=COVERAGE_RULE_VERSION,
+    scope_prefix=COVERAGE_SCOPE_PREFIX,
+    subject_type="coverage_metric",
+    requires_baseline=True,
+)
+MAPPING_DETECTOR = DetectorSpec(
+    rule_id=MAPPING_RULE_ID,
+    rule_version=MAPPING_RULE_VERSION,
+    scope_prefix=MAPPING_SCOPE_PREFIX,
+    subject_type="security_provider",
+)
+SHARES_DETECTOR = DetectorSpec(
+    rule_id=SHARES_RULE_ID,
+    rule_version=SHARES_RULE_VERSION,
+    scope_prefix=SHARES_SCOPE_PREFIX,
+    subject_type="issuer_period",
+)
+FILINGS_DETECTOR = DetectorSpec(
+    rule_id=FILINGS_RULE_ID,
+    rule_version=FILINGS_RULE_VERSION,
+    scope_prefix=FILINGS_SCOPE_PREFIX,
+    subject_type="issuer_metric_period",
+)
+FACTOR_DETECTOR = DetectorSpec(
+    rule_id=FACTOR_RULE_ID,
+    rule_version=FACTOR_RULE_VERSION,
+    scope_prefix=FACTOR_SCOPE_PREFIX,
+    subject_type="member_factor_score",
+    requires_baseline=True,
+)
+RULE_REGISTRY: tuple[DetectorSpec, ...] = (
+    SEC_DETECTOR,
+    PRICE_DETECTOR,
+    COVERAGE_DETECTOR,
+    MAPPING_DETECTOR,
+    SHARES_DETECTOR,
+    FILINGS_DETECTOR,
+    FACTOR_DETECTOR,
+)
+
+
+def registered_rule_ids() -> tuple[str, ...]:
+    """Return every rule identifier this build can execute."""
+    return tuple(spec.rule_id for spec in RULE_REGISTRY)
+
+
+def rule_scope(rule_id: str, universe_id: str = "sp500") -> str:
+    """Return the ledger scope one rule writes into."""
+    for spec in RULE_REGISTRY:
+        if spec.rule_id == rule_id:
+            return f"{spec.scope_prefix}:{universe_id}"
+    raise ValueError(f"unknown anomaly rule: {rule_id}")
+
+
+def run_detectors(
+    *,
+    store: Store,
+    as_of: date | str,
+    rules: tuple[str, ...] | None = None,
+    universe_id: str = "sp500",
+    project_root: Path | None = None,
+    coverage_baseline: dict[str, Any] | None = None,
+    factor_baseline: dict[str, Any] | None = None,
+    factor_model: str = "qv",
+) -> tuple[AnomalyScan, ...]:
+    """Run the selected detectors and return one independent scan per rule.
+
+    Each scan owns its scope, so the caller may record them separately and one
+    family's source boundary never constrains another's. A rule that cannot run
+    honestly raises rather than returning a partial scan, and the exception
+    names the rule so the operator can see exactly which evidence is missing.
+
+    ``coverage_baseline`` is the coverage payload from the previous complete
+    coverage scan. Passing ``None`` is valid and yields a baseline-free scan
+    with zero observations.
+    """
+    selected = rules if rules is not None else registered_rule_ids()
+    unknown = [rule_id for rule_id in selected if rule_id not in registered_rule_ids()]
+    if unknown:
+        raise ValueError(f"unknown anomaly rule(s): {sorted(unknown)}")
+
+    scans: list[AnomalyScan] = []
+    for rule_id in selected:
+        if rule_id == SEC_RULE_ID:
+            scans.append(
+                scan_sec_fundamental_coverage(
+                    store=store,
+                    as_of=as_of,
+                    project_root=project_root,
+                    universe_id=universe_id,
+                )
+            )
+        elif rule_id == PRICE_RULE_ID:
+            scans.append(
+                scan_price_action_mismatch(
+                    store=store,
+                    as_of=as_of,
+                    universe_id=universe_id,
+                )
+            )
+        elif rule_id == COVERAGE_RULE_ID:
+            scans.append(
+                scan_coverage_deterioration(
+                    store=store,
+                    as_of=as_of,
+                    baseline=coverage_baseline,
+                    universe_id=universe_id,
+                )
+            )
+        elif rule_id == MAPPING_RULE_ID:
+            scans.append(
+                scan_mapping_drift(
+                    store=store,
+                    as_of=as_of,
+                    universe_id=universe_id,
+                )
+            )
+        elif rule_id == SHARES_RULE_ID:
+            scans.append(
+                scan_share_count_jump(
+                    store=store,
+                    as_of=as_of,
+                    universe_id=universe_id,
+                )
+            )
+        elif rule_id == FILINGS_RULE_ID:
+            scans.append(
+                scan_conflicting_filings(
+                    store=store,
+                    as_of=as_of,
+                    universe_id=universe_id,
+                )
+            )
+        elif rule_id == FACTOR_RULE_ID:
+            scans.append(
+                scan_factor_percentile_jump(
+                    store=store,
+                    as_of=as_of,
+                    baseline=factor_baseline,
+                    universe_id=universe_id,
+                    factor_model=factor_model,
+                )
+            )
+        else:  # pragma: no cover - registry and dispatch are kept in step
+            raise ValueError(f"registered rule has no dispatch entry: {rule_id}")
+    return tuple(scans)

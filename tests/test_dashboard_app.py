@@ -183,16 +183,23 @@ def _dashboard_source_with_paper_fakes(
     *,
     stress_report: dict | None,
     stress_error: str | None = None,
+    monitor: dict | None = None,
+    review_result: dict | None = None,
+    execute_result: dict | None = None,
+    execute_raises: str | None = None,
 ) -> str:
     """Inject deterministic read-only loaders before dashboard routing.
 
     AppTest executes the dashboard as a standalone script, so replacing the
     loaders after their definitions is the narrowest way to characterize the
     real Paper Trial composition without reading mutable local paper files.
+    ``review_result``/``execute_result``/``execute_raises`` fake the one write
+    path the dashboard has, so a test can drive it without ever touching the
+    real paper account or the real project maintenance lease.
     """
     source = _DASHBOARD_PATH.read_text(encoding="utf-8")
     assert source.count(_SIDEBAR_MARKER) == 1
-    monitor = _paper_monitor()
+    monitor = monitor if monitor is not None else _paper_monitor()
     readiness = {
         "ready": True,
         "certified_research_from": "2023-08-01",
@@ -237,6 +244,21 @@ def _dashboard_source_with_paper_fakes(
         f"    return {{'source_bundle_sha256': {_SHA256_E!r}}}\n\n"
         f"{stress_loader}\n"
     )
+    if review_result is not None:
+        overrides += (
+            "def review_paper_proposal_execution(account_path, proposal_path, store):\n"
+            f"    return {review_result!r}\n\n"
+        )
+    if execute_raises is not None:
+        overrides += (
+            "def _execute_paper_proposal_from_dashboard(account_path, proposal_path):\n"
+            f"    raise ValueError({execute_raises!r})\n\n"
+        )
+    elif execute_result is not None:
+        overrides += (
+            "def _execute_paper_proposal_from_dashboard(account_path, proposal_path):\n"
+            f"    return {execute_result!r}\n\n"
+        )
     return source.replace(_SIDEBAR_MARKER, overrides + _SIDEBAR_MARKER, 1)
 
 
@@ -244,16 +266,35 @@ def _paper_app(
     *,
     stress_report: dict | None,
     stress_error: str | None = None,
+    monitor: dict | None = None,
+    review_result: dict | None = None,
+    execute_result: dict | None = None,
+    execute_raises: str | None = None,
 ) -> AppTest:
     app = AppTest.from_string(
         _dashboard_source_with_paper_fakes(
             stress_report=stress_report,
             stress_error=stress_error,
+            monitor=monitor,
+            review_result=review_result,
+            execute_result=execute_result,
+            execute_raises=execute_raises,
         ),
         default_timeout=120,
     )
     app.query_params["view"] = ["paper"]
     return app
+
+
+def _execution_ready_monitor(*, already_simulated: bool = False) -> dict:
+    monitor = _paper_monitor()
+    monitor["proposal"] = dict(monitor["proposal"])
+    monitor["proposal"]["already_simulated"] = already_simulated
+    monitor["proposal"]["timing"] = {
+        "status": "execution_window_open",
+        "detail": "The prospective window is open.",
+    }
+    return monitor
 
 
 def _rendered_values(app: AppTest) -> str:
@@ -335,6 +376,144 @@ def test_paper_stress_failure_is_scoped_and_rest_of_page_still_renders() -> None
     assert "Simulation assumptions" in rendered
     assert "Commission assumption" in rendered
     assert len(app.button) == 0
+
+
+def test_paper_record_action_is_absent_outside_the_execution_window() -> None:
+    """The default fixture is 'waiting_for_scheduled_close'; no write UI appears."""
+    app = _paper_app(stress_report=None, stress_error="unused").run()
+    assert not app.exception
+    assert len(app.button) == 0
+    assert "Record simulated fill" not in _rendered_values(app)
+
+
+def test_paper_record_action_is_absent_once_already_simulated() -> None:
+    monitor = _execution_ready_monitor(already_simulated=True)
+    app = _paper_app(
+        stress_report=None, stress_error="unused", monitor=monitor
+    ).run()
+    assert not app.exception
+    assert "Record simulated fill" not in _rendered_values(app)
+
+
+def test_paper_record_action_blocks_on_missing_execution_evidence() -> None:
+    monitor = _execution_ready_monitor()
+    review = {
+        "ready": False,
+        "detail": "Reviewed closing-price evidence is not yet available.",
+        "missing_count": 2,
+        "missing": ["AAA close", "BBB close"],
+    }
+    app = _paper_app(
+        stress_report=None,
+        stress_error="unused",
+        monitor=monitor,
+        review_result=review,
+    ).run()
+    assert not app.exception
+    rendered = _rendered_values(app)
+    assert "Record this simulated fill" in rendered
+    assert "2 required item(s)" in rendered
+    assert "AAA close" in rendered
+    # No button is offered while evidence is missing.
+    assert len(app.button) == 0
+    assert len(app.checkbox) == 0
+
+
+def test_paper_record_action_offers_a_disabled_button_until_acknowledged() -> None:
+    monitor = _execution_ready_monitor()
+    review = {
+        "ready": True,
+        "detail": "Ready for explicit local simulation.",
+        "missing_count": 0,
+        "missing": [],
+        "projected_trade_count": 2,
+        "projected_transaction_costs": 12.5,
+    }
+    app = _paper_app(
+        stress_report=None,
+        stress_error="unused",
+        monitor=monitor,
+        review_result=review,
+    ).run()
+    assert not app.exception
+    rendered = _rendered_values(app)
+    assert "Record this simulated fill" in rendered
+    assert "2 simulated trade(s)" in rendered
+    assert "$12.50 modeled costs" in rendered
+
+    buttons = [b for b in app.button if b.label == "Record simulated fill"]
+    assert len(buttons) == 1
+    assert buttons[0].disabled is True
+
+    checkboxes = list(app.checkbox)
+    assert len(checkboxes) == 1
+    assert checkboxes[0].value is False
+
+
+def test_paper_record_action_records_after_explicit_acknowledgement() -> None:
+    """Checking the box and clicking runs the write path, then shows success."""
+    monitor = _execution_ready_monitor()
+    review = {
+        "ready": True,
+        "detail": "Ready for explicit local simulation.",
+        "missing_count": 0,
+        "missing": [],
+        "projected_trade_count": 1,
+        "projected_transaction_costs": 5.0,
+    }
+    execution = {
+        "execution": {
+            "execution_date": "2026-08-10",
+            "trades": [{"ticker": "AAA", "shares": 10}],
+            "transaction_costs": 5.0,
+        }
+    }
+    app = _paper_app(
+        stress_report=None,
+        stress_error="unused",
+        monitor=monitor,
+        review_result=review,
+        execute_result=execution,
+    ).run()
+
+    app.checkbox[0].check().run()
+    buttons = [b for b in app.button if b.label == "Record simulated fill"]
+    assert buttons[0].disabled is False
+    buttons[0].click().run()
+
+    assert not app.exception
+    rendered = _rendered_values(app)
+    assert "Simulation recorded for 2026-08-10" in rendered
+    assert "1 simulated trade(s)" in rendered
+    assert "No order was sent to a broker" in rendered
+
+
+def test_paper_record_action_surfaces_a_refused_write_without_crashing() -> None:
+    monitor = _execution_ready_monitor()
+    review = {
+        "ready": True,
+        "detail": "Ready for explicit local simulation.",
+        "missing_count": 0,
+        "missing": [],
+        "projected_trade_count": 1,
+        "projected_transaction_costs": 5.0,
+    }
+    app = _paper_app(
+        stress_report=None,
+        stress_error="unused",
+        monitor=monitor,
+        review_result=review,
+        execute_raises="synthetic refusal: proposal changed on disk",
+    ).run()
+
+    app.checkbox[0].check().run()
+    buttons = [b for b in app.button if b.label == "Record simulated fill"]
+    buttons[0].click().run()
+
+    assert not app.exception
+    rendered = _rendered_values(app)
+    assert "Simulated execution refused" in rendered
+    assert "synthetic refusal: proposal changed on disk" in rendered
 
 
 def test_dashboard_blocks_invalid_readiness_evidence_without_an_unhandled_exception() -> None:
@@ -428,3 +607,6 @@ def test_dashboard_workspaces_and_research_surfaces_render_without_exceptions() 
         expected_nav = "research" if slug == "company" else slug
         assert app.sidebar.radio("workspace").value == expected_nav
         assert any(title in str(item.value) for item in app.markdown), slug
+        if slug == "system":
+            system_html = "\n".join(str(item.value) for item in app.markdown)
+            assert "Research experiments" in system_html

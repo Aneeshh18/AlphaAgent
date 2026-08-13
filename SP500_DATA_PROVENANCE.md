@@ -24,6 +24,114 @@ This current path does **not** turn the repository into a complete
 1996-present S&P announcement archive. Pre-August-2023 provenance and broader
 delisted histories remain separate long-history work.
 
+### Candidate 2023-01 → 2023-07 event manifest (2026-08-12) — REVIEWED, NOT IMPORTED
+
+`examples/sp500_events_candidate_2023-01_to_2023-07.csv` and
+`examples/sp500_security_transitions_candidate_2023-01_to_2023-07.csv` are
+**candidates pending operator review. Neither has been imported and neither
+extends the certified window.** They exist because extending membership
+backward is the binding constraint on ever lengthening a backtest.
+
+Six genuine index changes were verified, each against its own S&P Dow Jones
+Indices press release [VERIFIED — two fetched directly, four confirmed
+through search result text quoting the release]:
+
+| Effective | Announced | Out | In | Reason |
+|---|---|---|---|---|
+| 2023-01-04 | 2022-12-28 | VNO | GEHC | GE spinoff; VNO moved to MidCap 400 on 2023-01-05 |
+| 2023-03-15 | 2023-03-10 | SIVB | PODD | FDIC receivership |
+| 2023-03-15 | 2023-03-13 | SBNY | BG | FDIC receivership |
+| 2023-03-20 | 2023-03-03 | LUMN | FICO | quarterly rebalance |
+| 2023-05-04 | 2023-05-01 | FRC | AXON | FDIC receivership |
+| 2023-06-20 | 2023-06-02 | DISH | PANW | quarterly rebalance |
+
+**Three candidate rows from the secondary baseline were refuted**, and this
+is why the verification step exists. `data/sp500_ticker_start_end.csv`
+records PKI→RVTY, FISV→FI and RE→EG as start/end boundaries, which a naive
+import would have turned into six phantom index events — three deletions and
+three additions that never happened. All three are same-security ticker
+changes, confirmed by unchanged SEC CIK: Revvity still files under CIK
+31791, Fiserv under 798354, Everest under 1095073. They belong in the
+transitions manifest, never the event manifest.
+
+**Completeness cross-check [VERIFIED]:** the 2023-06-02 release states Palo
+Alto Networks was "the sixth addition to the index in 2023." The six
+additions verified above through that date — GEHC, PODD, BG, FICO, AXON,
+PANW — match exactly, which independently confirms no addition was missed
+between 2023-01-01 and 2023-06-20. Coverage between 2023-06-20 and
+2023-08-01 rests on the secondary baseline alone, which lists no further
+index change in that gap [UNVERIFIED].
+
+**What these files do not do.** An event manifest is necessary but not
+sufficient to backtest the window. Running 2023 H1 additionally requires
+reference identities, SEC CIKs, provider symbol intervals, prices and
+point-in-time fundamentals for every name that left the index — SIVB, SBNY,
+FRC, LUMN, DISH, VNO and PKI — none of which are in the database, several of
+which are delisted, and two of which (SIVB, SBNY) entered FDIC receivership
+and will have irregular terminal price and filing histories. Treat this as
+the first of several steps, not as a window that is ready to test.
+
+### Pre-August-2023 source research (2026-08-12) — no ingest-ready path found
+
+Researched, not fabricated: what primary sources actually exist for
+extending verified coverage backward, evidence-tagged the same way
+`INDIA_SOURCE_MATRIX.md` tags India findings
+([VERIFIED]/[REPORTED]/[UNVERIFIED]). **Conclusion: no source found meets
+this project's own evidence bar (an official S&P DJI press release with an
+exact effective date, cross-checked against an independent source) for a
+full 1996-present extension. Do not attempt one without paying for
+institutional data, and do not lower the evidence bar to get there.**
+
+- **S&P DJI's own official archive** [VERIFIED, fetched directly]:
+  `press.spglobal.com`'s year filter only goes back to **2012**. A
+  consolidated historical archive like the one that exists for India's
+  Nifty 50 does not exist here. Pre-2012 releases likely survive on legacy
+  domains (`standardandpoors.com`, `spindices.com`, `djindexes.com`) only
+  via one-at-a-time Wayback Machine excavation, not a searchable archive
+  [UNVERIFIED, not tested].
+- **Wikipedia's "Selected changes" table** — too large to audit directly
+  this session [could not personally fetch and read citation rows]. An
+  independent author who checked it against a paid dataset is quoted
+  [REPORTED]: "relatively accurate and complete up to about the year 2000
+  ... gets less complete and accurate before then." The article's own Talk
+  page [VERIFIED] shows a 2021 proposal to make the table machine-usable
+  closed with no consensus, editors stating "we are an encyclopedia, not a
+  market data service." Not primary, not reliable pre-2001.
+- **Commercial providers**: CRSP (`dsp500list`, via WRDS) has full daily
+  membership history but is institution-gated, no public researcher tier
+  found; a bundled CRSP+Compustat+Thomson subscription was quoted around
+  $100k/yr [REPORTED]. Compustat/Capital IQ similarly $10k–50k+/user/yr,
+  academic-library-seat only [REPORTED]. Sharadar and Norgate Data are
+  cheap ($270–360/yr range) but **disclose no source for their historical
+  membership claims** [VERIFIED — pricing/product pages checked, silent on
+  sourcing] — the same unverifiable-provenance problem already rejected for
+  free datasets, just paid for.
+- **Free/community datasets** — same laundering pattern already rejected
+  elsewhere in this project. `fja05680/sp500` — the dataset this repo
+  *already uses* as the 2023-08-01 baseline snapshot above — is itself
+  sourced from a book covering 1996–2019 plus Wikipedia thereafter; its own
+  maintainer writes "you can't reconstruct the past with only the Wikipedia
+  changes mentioned" and suggests skipping 1996–2001 entirely [VERIFIED via
+  its README]. `hanshof/sp500_constituents` claims 1996-to-present coverage
+  but discloses no source at all [VERIFIED via its README]. Neither
+  qualifies as primary evidence, especially pre-2019.
+- **SEC EDGAR full-text search** [VERIFIED]: indexes filings only since
+  **2001**; pre-2001 is browsable by company but not keyword-searchable. An
+  inclusion-announcement phrase search is only viable 2001-forward, and even
+  then an 8-K filing date proves disclosure of that filing, not the index's
+  own effective date — usable only to generate review candidates for manual
+  cross-check against a real S&P DJI release, never as a substitute for one,
+  consistent with how issuer filings are already used for ticker-only
+  transitions in the approved 2023–2024 window above.
+
+**What is realistically achievable, if this is picked up again**: a smaller
+extension using S&P DJI's own archive from **2012 onward** (a real primary
+source, just not consolidated — one press release at a time), optionally
+cross-checked against EDGAR 8-Ks from **2001 onward** for candidate
+verification. Full 1996-present coverage is not achievable today without an
+institutional CRSP/Compustat-class subscription this project does not have
+budget authorization for.
+
 ### Mid-period held-security evidence
 
 The stateful portfolio exposed two cases that a membership table alone cannot
@@ -957,6 +1065,26 @@ zero; wash sales, cross-bucket offsets, carryforwards, and filing calendars are
 not modeled. The earlier batch checkpoints also used older factor logic,
 changing eligible samples, and interval accounting, so they are preserved as
 engineering history rather than like-for-like strategy comparisons.
+
+**The size and cause of that supersession, diagnosed 2026-08-12.** The v3
+audit reports +74.2% and the schema-v4 replacement +51.1% for a
+byte-identical configuration — same window, `top_n`, costs, taxes, universe,
+and five completed periods — and the eligible universe matches period for
+period (291/291, 293/293, 350/350, 308/308). The difference is entirely in
+*which names were selected*: quality percentiles are identical for every
+shared holding, while value percentiles moved, and the four names that
+dropped out were AVGO, NVDA, ORLY and LRCX. The v3 value factor scored AVGO
+at the 85.6th and ORLY at the 98.2nd percentile for cheapness in April 2024,
+when both traded at premium multiples. It was systematically overrating
+expensive semiconductor and specialty-retail names as cheap, which placed
+the 2023-24 AI trade inside a Quality+Value portfolio and accounts for
+roughly 23 points of the older result. **Do not cite the v3 number as a
+strategy result under any framing.** The schema-v4 figure is the defensible
+one: +51.1% against SPY's +39.5% for the same window. That remaining gap is
+still not evidence of an edge — the paired daily excess return carries
+t=0.62 over five rebalances, which the artifact's own
+`strategy_vs_benchmark_significance` verdict now reports as not
+interpretable.
 
 The superseded local gitignored schema-v3 audit is
 `data/backtests/qv_sp500_pit_2023-08_2024-12.json`. The preserved v1 baseline is

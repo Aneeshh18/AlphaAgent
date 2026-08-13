@@ -187,13 +187,33 @@ def refresh_us_current(
                 failures.append(RefreshFailure("issuer_identity", security_id, str(exc)))
                 continue
             if not issuer_id:
-                failures.append(
-                    RefreshFailure(
-                        "issuer_identity",
+                try:
+                    reviewed_later = db.has_later_verified_issuer_assignment(
                         security_id,
-                        f"no reviewed issuer on {membership_date}",
+                        membership_date,
                     )
-                )
+                except Exception as exc:
+                    failures.append(
+                        RefreshFailure("issuer_identity", security_id, str(exc))
+                    )
+                    continue
+                if reviewed_later:
+                    warnings.append(
+                        RefreshFailure(
+                            "fundamentals_pending",
+                            security_id,
+                            "effective issuer evidence was reviewed after the "
+                            f"{membership_date} decision snapshot",
+                        )
+                    )
+                else:
+                    failures.append(
+                        RefreshFailure(
+                            "issuer_identity",
+                            security_id,
+                            f"no reviewed issuer on {membership_date}",
+                        )
+                    )
                 continue
             issuer_ids.append(issuer_id)
         issuer_ids = sorted(set(issuer_ids))
