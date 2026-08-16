@@ -103,7 +103,15 @@ class Settings(BaseSettings):
     # --- Ingest tuning ---
     edgar_max_rps: int = Field(default=8, description="SEC fair-access limit is 10; we stay under.")
     yfinance_sleep_sec: float = Field(default=0.5)
-    yfinance_max_attempts: int = Field(default=3, ge=1, le=5)
+    # Raised from 3 to 5 on 2026-08-13. A full daily cycle issues ~503
+    # sequential requests, and Yahoo throttles under that sustained load by
+    # returning a non-empty frame whose newest close is absent rather than an
+    # error. Those responses are retried (see `_has_usable_latest_close`), but
+    # three attempts left a handful of securities failing per run — a rotating
+    # set that each returned a valid close when requested individually
+    # moments later. The extra attempts cost nothing on a healthy fetch,
+    # which still breaks on the first response.
+    yfinance_max_attempts: int = Field(default=5, ge=1, le=5)
     yfinance_retry_base_sec: float = Field(default=1.0, ge=0.0, le=30.0)
     duckdb_lock_wait_seconds: float = Field(
         default=10.0,

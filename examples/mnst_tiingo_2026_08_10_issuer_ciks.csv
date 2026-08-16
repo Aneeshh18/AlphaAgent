@@ -1,0 +1,2 @@
+issuer_id,canonical_name,canonical_ticker,cik,effective_start,effective_end,verified_date,source
+aios:issuer:sec:0000865752,Monster Beverage Corp,MNST,0000865752,2025-01-01,2026-08-13,2026-07-21,https://data.sec.gov/submissions/CIK0000865752.json

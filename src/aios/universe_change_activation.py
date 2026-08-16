@@ -49,16 +49,16 @@ from aios.universe_change import (
     capture_paper_tree_state,
     capture_universe_change_state,
 )
-from aios.universe_rollforward import COMPONENT_SNAPSHOT_URL, sp500_archive_page_url
+from aios.universe_rollforward import (
+    COMPONENT_SNAPSHOT_URL,
+    IVV_HOLDINGS_URL,
+    sp500_archive_page_url,
+)
 
 ACTIVATION_PLAN_KIND = "aios.universe-change-activation-plan"
 ACTIVATION_PLAN_SCHEMA_VERSION = 1
 ACTIVATION_RECEIPT_SCHEMA_VERSION = "universe-change-activation-receipt.v1"
 ACTIVATION_POLICY_VERSION = "governed-sp500-constituent-activation.v1"
-IVV_HOLDINGS_URL = (
-    "https://www.ishares.com/us/products/239726/"
-    "ishares-core-s-p-500-etf/latest-holdings.csv"
-)
 IVV_CAPTURE_PARSER_VERSION = "ishares-ivv-holdings-csv-capture-v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_PLAN_BYTES = 8 * 1024 * 1024

@@ -266,10 +266,13 @@ def create_local_backup(
         raise ValueError(f"database does not exist: {database}")
     database_compatibility = _database_compatibility_version(database)
     timestamp = (now or datetime.now(UTC)).astimezone(UTC)
+    generated_suffix = "" if now is not None else f"-{uuid4().hex[:8]}"
     destination = (
         Path(output).resolve()
         if output is not None
-        else root / "backups" / f"aios-{timestamp.strftime('%Y%m%dT%H%M%SZ')}"
+        else root
+        / "backups"
+        / f"aios-{timestamp.strftime('%Y%m%dT%H%M%SZ')}{generated_suffix}"
     )
     if destination.exists():
         raise ValueError(f"backup destination already exists: {destination}")

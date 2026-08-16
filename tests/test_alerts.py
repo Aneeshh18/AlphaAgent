@@ -370,22 +370,32 @@ def test_writable_store_migrates_v4_to_v6_without_changing_existing_incidents(
         verification.close()
 
 
-def test_incident_references_require_a_unique_prefix_and_same_second_order_is_stable(
+def test_incident_reads_allow_unique_prefix_but_mutations_require_exact_id(
     tmp_path,
 ) -> None:
     store = AlertStore(tmp_path / "alerts.sqlite3")
     moment = datetime(2026, 7, 22, 1, 0, tzinfo=UTC)
     first = store.emit(_alert(), now=moment)
     store.emit(_alert(dedup_key="refresh:other", code="other"), now=moment)
+    with pytest.raises(ValueError, match="exact full incident_id"):
+        store.resolve(
+            first.incident_id[:12],
+            actor="ops@example.test",
+            note="A prefix must never select state-changing work.",
+            outcome="false_positive",
+            expected_evidence_sha256=first.evidence_sha256,
+            now=moment,
+        )
+
+    assert store.get(first.incident_id[:12]).state == "open"
     store.resolve(
-        first.incident_id[:12],
+        first.incident_id,
         actor="ops@example.test",
-        note="Bounded reference-resolution test.",
+        note="Exact incident identity reviewed.",
         outcome="false_positive",
         expected_evidence_sha256=first.evidence_sha256,
         now=moment,
     )
-
     assert store.get(first.incident_id[:12]).state == "resolved"
     assert [event["event_type"] for event in store.events(first.incident_id[:12])] == [
         "resolved",
@@ -414,7 +424,7 @@ def test_alert_cli_tests_lists_and_inspects_local_history(monkeypatch, tmp_path)
         cli.app,
         [
             "alert-ack",
-            incident_ref,
+            unresolved.incident_id,
             "--actor",
             "ops@example.test",
             "--note",

@@ -97,14 +97,46 @@ dist/
 venv/
 .python-version
 
+# Test, type-checker, lint, and coverage output.
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.ipynb_checkpoints/
+
 # --- Editors / OS ---
 .vscode/
 .idea/
 .DS_Store
 *.swp
 
-# --- Local AI tooling (may contain provider credentials/cache) ---
+# --- Local AI/design tooling (not runtime source) ---
 .zcode/
+.agents/
+.claude/
+.codex/
+.impeccable/
+.impeccable-live/
+.impeccable-live.json
+.code-review-graph/
+skills-lock.json
+agent.md
+
+# Generated local briefs. Durable architecture, provenance, and release
+# documents remain tracked because they are part of the governed system.
+DESIGN.md
+PRODUCT.md
+
+# Keep GitHub CI/workflows eligible while excluding local agent mirrors.
+.github/agents/
+.github/hooks/
+.github/skills/
 
 # --- Project runtime artifacts ---
 logs/

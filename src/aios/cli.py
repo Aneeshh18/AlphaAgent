@@ -388,9 +388,7 @@ def _incident_action_cli_arguments(
 def _incident_resolution_outcome_cli(outcome: str) -> str:
     normalized = str(outcome).strip()
     if normalized not in {"verified_recovery", "false_positive"}:
-        raise ValueError(
-            "incident outcome must be verified_recovery or false_positive"
-        )
+        raise ValueError("incident outcome must be verified_recovery or false_positive")
     return normalized
 
 
@@ -456,10 +454,7 @@ def _record_scheduler_runtime_recovery(
             recovery=recovery,
         )
     except Exception as exc:
-        console.print(
-            "[yellow]Scheduler recovery attestation was not recorded:[/yellow] "
-            f"{exc}"
-        )
+        console.print(f"[yellow]Scheduler recovery attestation was not recorded:[/yellow] {exc}")
 
 
 def _record_daily_cycle_recovery(run_id: str) -> None:
@@ -502,10 +497,7 @@ def _record_daily_cycle_recovery(run_id: str) -> None:
             recovery=recovery,
         )
     except Exception as exc:
-        console.print(
-            "[yellow]Daily-cycle recovery attestation was not recorded:[/yellow] "
-            f"{exc}"
-        )
+        console.print(f"[yellow]Daily-cycle recovery attestation was not recorded:[/yellow] {exc}")
 
 
 def _resolve_operational_alert(fingerprint: str) -> None:
@@ -883,6 +875,21 @@ def preflight(
         console.print(f"Checked at: {snapshot.checked_at}")
         console.print(f"Certified decision date: {snapshot.decision_date or 'unavailable'}")
         console.print(f"Registered proposal: {snapshot.proposal_path or 'none'}")
+        universe_evidence = snapshot.universe_evidence or {}
+        if universe_evidence.get("component_source_mode") == "reconciled_divergence":
+            reconciliation = universe_evidence.get("accepted_activation_component_lag")
+            activation_id = (
+                reconciliation.get("activation_id")
+                if isinstance(reconciliation, dict)
+                else "unknown"
+            )
+            age_days = (
+                reconciliation.get("lag_days") if isinstance(reconciliation, dict) else "unknown"
+            )
+            console.print(
+                "[yellow]Universe component source: reconciled divergence[/yellow] "
+                f"(activation {activation_id}, {age_days} day(s) since effective date)."
+            )
         table = Table()
         table.add_column("Capability")
         table.add_column("State")
@@ -1002,10 +1009,7 @@ def upgrade_local_state_command(
         Path | None,
         typer.Option(
             "--backup-output",
-            help=(
-                "Explicit pre-upgrade directory under project backups/; must not "
-                "already exist."
-            ),
+            help=("Explicit pre-upgrade directory under project backups/; must not already exist."),
         ),
     ] = None,
 ) -> None:
@@ -1030,9 +1034,7 @@ def upgrade_local_state_command(
             confirm=True,
         )
     except MaintenanceLockBusyError as exc:
-        console.print(
-            f"[yellow]Another AIOS mutation workflow is already running.[/yellow] {exc}"
-        )
+        console.print(f"[yellow]Another AIOS mutation workflow is already running.[/yellow] {exc}")
         raise typer.Exit(code=75) from exc
     except (OSError, RuntimeError, TypeError, ValueError, duckdb.Error) as exc:
         console.print(f"[red]Local state upgrade failed:[/red] {exc}")
@@ -1090,9 +1092,7 @@ def recover_local_state_upgrade_command(
             confirm=True,
         )
     except MaintenanceLockBusyError as exc:
-        console.print(
-            f"[yellow]Another AIOS mutation workflow is already running.[/yellow] {exc}"
-        )
+        console.print(f"[yellow]Another AIOS mutation workflow is already running.[/yellow] {exc}")
         raise typer.Exit(code=75) from exc
     except (OSError, RuntimeError, TypeError, ValueError, duckdb.Error) as exc:
         console.print(f"[red]Local state upgrade recovery failed:[/red] {exc}")
@@ -1224,6 +1224,18 @@ def review_universe_current() -> None:
     table.add_row("Official release records checked", str(result.official_release_count))
     table.add_row("Unreviewed change announcements", str(result.relevant_release_count))
     table.add_row("Identity/component mismatches", str(result.identity_mismatch_count))
+    reconciliation = result.accepted_activation_component_lag
+    if reconciliation is not None:
+        table.add_row("Component source mode", "RECONCILED DIVERGENCE")
+        table.add_row(
+            "Component reconciliation",
+            f"{reconciliation.get('activation_id', 'unknown')}; "
+            f"{reconciliation.get('lag_days', 'unknown')} day(s) since effective date",
+        )
+    elif result.identity_mismatch_count == 0:
+        table.add_row("Component source mode", "exact ticker-set match")
+    else:
+        table.add_row("Component source mode", "unreconciled; review required")
     console.print(table)
     if result.review_required:
         _emit_operational_alert(
@@ -1277,9 +1289,7 @@ def prepare_universe_change(
     ] = Path("examples/sp500_events_verified_2026-07-22_to_2026-08-06.csv"),
     reference_stem: Annotated[
         Path,
-        typer.Option(
-            help="Path prefix shared by the reviewed FERG reference batch files."
-        ),
+        typer.Option(help="Path prefix shared by the reviewed FERG reference batch files."),
     ] = Path("examples/sp500_reference_ferg_2026_08"),
     effective_date: Annotated[
         str,
@@ -1321,8 +1331,7 @@ def prepare_universe_change(
         f"{result.restore_raw_payloads} raw payload(s)."
     )
     console.print(
-        f"FERG prices staged: {result.price_rows}; fundamentals: "
-        f"{result.fundamental_status}."
+        f"FERG prices staged: {result.price_rows}; fundamentals: {result.fundamental_status}."
     )
     console.print(
         "Review the plan, then run activate-universe-change with its exact path, "
@@ -1371,10 +1380,7 @@ def activate_universe_change(
     console.print("[bold green]Constituent change activated atomically.[/bold green]")
     console.print(f"Activation receipt: {result.activation_id}")
     console.print(f"Event: {result.event_id}")
-    console.print(
-        f"Coverage: {result.prior_coverage_through} → "
-        f"{result.target_coverage_through}"
-    )
+    console.print(f"Coverage: {result.prior_coverage_through} → {result.target_coverage_through}")
     console.print(f"After-state SHA-256: {result.after_state_sha256}")
     console.print(
         "Disposable activation and rollback proof passed. FERG fundamentals remain "
@@ -1740,10 +1746,7 @@ def alert_show(
     console.print(f"Code: {incident.code}")
     console.print(f"Severity/state: {incident.severity} / {incident.state}")
     console.print(f"Resolution proof: {incident.resolution_proof_status}")
-    console.print(
-        "Operational blocker: "
-        + ("yes" if incident.operationally_blocking else "no")
-    )
+    console.print("Operational blocker: " + ("yes" if incident.operationally_blocking else "no"))
     console.print(f"Source: {incident.source_job}")
     console.print(f"First/last seen: {incident.first_seen_at} / {incident.last_seen_at}")
     console.print(f"Occurrences: {incident.occurrence_count}")
@@ -1762,11 +1765,7 @@ def alert_show(
             event["created_at"],
             event["event_type"],
             str(event.get("actor") or event.get("producer") or ""),
-            str(
-                event.get("resolution_outcome")
-                or event.get("proof_kind")
-                or ""
-            ),
+            str(event.get("resolution_outcome") or event.get("proof_kind") or ""),
             str(event.get("note") or event.get("proof_error") or ""),
         )
     console.print(event_table)
@@ -1952,10 +1951,7 @@ def alert_attest_resolution(
     except (OSError, RuntimeError, ValueError) as exc:
         console.print(f"[red]Incident resolution attestation refused:[/red] {exc}")
         raise typer.Exit(code=1) from exc
-    console.print(
-        f"[green]Legacy incident resolution attested:[/green] "
-        f"{incident.incident_id}"
-    )
+    console.print(f"[green]Legacy incident resolution attested:[/green] {incident.incident_id}")
 
 
 @app.command("alert-reconcile-fundamentals")
@@ -2029,14 +2025,10 @@ def alert_reconcile_fundamentals(
         console.print_json(json.dumps(payload, sort_keys=True))
         return
     if record:
-        console.print(
-            f"[green]Fundamentals incident reconciled:[/green] "
-            f"{recovery.incident_id}"
-        )
+        console.print(f"[green]Fundamentals incident reconciled:[/green] {recovery.incident_id}")
     else:
         console.print(
-            f"[green]Fundamentals reconciliation is eligible:[/green] "
-            f"{recovery.incident_id}"
+            f"[green]Fundamentals reconciliation is eligible:[/green] {recovery.incident_id}"
         )
         console.print("No incident, research, readiness, paper, or broker state changed.")
 
@@ -2336,6 +2328,18 @@ def _anomaly_scan_multi_rule(
                     kwargs["coverage_baseline"] = (
                         evidence.get("current_coverage") if evidence else None
                     )
+                if rule_id == anomalies.PRICE_RULE_ID and alert_store is not None:
+                    open_price_cases = alert_store.anomaly_cases(
+                        unresolved_only=True,
+                        scope=scope,
+                        limit=1000,
+                    )
+                    kwargs["price_clearance_subject_ids"] = tuple(
+                        case.subject_id
+                        for case in open_price_cases
+                        if case.rule_id == anomalies.PRICE_RULE_ID
+                        and case.rule_version == anomalies.PRICE_RULE_VERSION
+                    )
                 if rule_id == anomalies.FACTOR_RULE_ID:
                     kwargs["factor_model"] = factor_model
                     factor_snapshot = anomalies.measure_universe_factor_percentiles(
@@ -2492,9 +2496,7 @@ def companyfacts_v3_plan(
                 issuer_ids=issuer_ids,
             )
         published = (
-            persist_companyfacts_v3_plan(settings.project_root, preview)
-            if write_plan
-            else None
+            persist_companyfacts_v3_plan(settings.project_root, preview) if write_plan else None
         )
     except (OSError, RuntimeError, TypeError, ValueError, duckdb.Error) as exc:
         if json_output:
@@ -2552,14 +2554,10 @@ def companyfacts_v3_plan(
         "Eligible / ineligible issuers: "
         f"{summary['eligible_issuers']} / {summary['ineligible_issuers']}"
     )
-    console.print(
-        "Excluded source observations: "
-        f"{summary['excluded_source_observations']}"
-    )
+    console.print(f"Excluded source observations: {summary['excluded_source_observations']}")
     if published is not None:
         console.print(
-            "[green]Review plan published:[/green] "
-            f"{published.relative_to(settings.project_root)}"
+            f"[green]Review plan published:[/green] {published.relative_to(settings.project_root)}"
         )
     else:
         console.print("Preview only. Use --write-plan to publish the exact plan.")
@@ -2675,9 +2673,182 @@ def companyfacts_v3_activate(
         f"(version boundary {result.version_sequence_boundary})"
     )
     console.print(
-        "Disposable activation and rollback proof passed. No paper fill or "
-        "broker action occurred."
+        "Disposable activation and rollback proof passed. No paper fill or broker action occurred."
     )
+
+
+@app.command("companyfacts-v4-plan")
+def companyfacts_v4_plan(
+    as_of: Annotated[
+        datetime,
+        typer.Option(
+            "--as-of",
+            formats=["%Y-%m-%d"],
+            help="Decision date bounding identities and immutable SEC evidence.",
+        ),
+    ],
+    issuer_ids: Annotated[
+        list[str],
+        typer.Option(
+            "--issuer-id",
+            help="Reviewed issuer_id; repeat to define the explicit release scope.",
+        ),
+    ],
+    write_plan: Annotated[
+        bool,
+        typer.Option("--write-plan", help="Publish the content-addressed review plan."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit one machine-readable result."),
+    ] = False,
+) -> None:
+    """Review the immutable v3-to-v4 revenue-policy delta without mutation."""
+    from aios.companyfacts_v4_activation import (
+        persist_companyfacts_v4_plan,
+        preview_companyfacts_v4_replay,
+    )
+
+    try:
+        with store_scope(read_only=True) as store:
+            review = preview_companyfacts_v4_replay(
+                settings.project_root,
+                store=store,
+                as_of=as_of.date(),
+                issuer_ids=issuer_ids,
+            )
+        published = (
+            persist_companyfacts_v4_plan(settings.project_root, review) if write_plan else None
+        )
+    except (OSError, RuntimeError, TypeError, ValueError, duckdb.Error) as exc:
+        if json_output:
+            console.print_json(
+                json.dumps(
+                    {
+                        "schema_version": "companyfacts-v4-plan-cli.v1",
+                        "status": "withheld",
+                        "error": str(exc),
+                        "database_mutation": False,
+                    },
+                    sort_keys=True,
+                )
+            )
+        else:
+            console.print(f"[red]Company Facts v4 review withheld:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    result = {
+        "schema_version": "companyfacts-v4-plan-cli.v1",
+        "status": "published" if published is not None else "preview",
+        "plan_sha256": review.plan_sha256,
+        "plan": review.plan,
+        "path": (
+            published.relative_to(settings.project_root).as_posix()
+            if published is not None
+            else None
+        ),
+        "safety": {
+            "database_mutation": False,
+            "provider_fetch": False,
+            "paper_state_mutation": False,
+            "broker_action": False,
+        },
+    }
+    if json_output:
+        console.print_json(json.dumps(result, sort_keys=True))
+        return
+    console.rule("[bold]Company Facts v4 revenue-policy review[/bold]")
+    console.print(f"Plan SHA-256: {review.plan_sha256}")
+    console.print(
+        "Eligible / ineligible issuers: "
+        f"{review.plan['summary']['eligible_issuers']} / "
+        f"{review.plan['summary']['ineligible_issuers']}"
+    )
+    console.print(f"Published plan: {published}" if published else "Preview only.")
+    console.print("No database, provider, paper, or broker state changed.")
+
+
+@app.command("companyfacts-v4-prepare")
+@_exclusive_project_operation("companyfacts-v4-prepare")
+def companyfacts_v4_prepare(
+    review_plan: Annotated[Path, typer.Argument(help="Published v4 review-plan JSON.")],
+    review_plan_sha256: Annotated[
+        str,
+        typer.Option("--review-plan-sha256", help="Exact reviewed plan SHA-256."),
+    ],
+    actor: Annotated[
+        str,
+        typer.Option(help="Stable operator identity recorded in the activation plan."),
+    ],
+) -> None:
+    """Bind an eligible v4 review to a fresh verified backup."""
+    from aios.companyfacts_v4_activation import prepare_companyfacts_v4_activation
+
+    try:
+        result = prepare_companyfacts_v4_activation(
+            project_root=settings.project_root,
+            database_path=_project_path(settings.duckdb_path),
+            application_version=__version__,
+            review_plan_path=_project_path(review_plan),
+            review_plan_sha256=review_plan_sha256,
+            actor=actor,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError, duckdb.Error) as exc:
+        console.print(f"[red]Company Facts v4 preparation refused:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print("[bold green]Company Facts v4 activation plan prepared.[/bold green]")
+    console.print(f"Plan: {result.plan_path}")
+    console.print(f"Plan SHA-256: {result.plan_sha256}")
+    console.print(f"Issuers: {', '.join(result.issuer_ids)}")
+    console.print(f"Backup: {result.backup.path} ({result.backup.manifest_sha256})")
+
+
+@app.command("companyfacts-v4-activate")
+@_exclusive_project_operation("companyfacts-v4-activate")
+def companyfacts_v4_activate(
+    plan: Annotated[Path, typer.Argument(help="Published v4 activation-plan JSON.")],
+    plan_sha256: Annotated[
+        str,
+        typer.Option("--plan-sha256", help="Exact reviewed activation-plan SHA-256."),
+    ],
+    actor: Annotated[
+        str,
+        typer.Option(help="Operator identity; must equal the plan actor."),
+    ],
+    confirm_activation: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-activation/--no-confirm-activation",
+            help="Required acknowledgement of the bounded fundamentals mutation.",
+        ),
+    ] = False,
+) -> None:
+    """Recheck CAS, prove a restore, then atomically activate Company Facts v4."""
+    from aios.companyfacts_v4_activation import activate_companyfacts_v4
+
+    try:
+        result = activate_companyfacts_v4(
+            project_root=settings.project_root,
+            database_path=_project_path(settings.duckdb_path),
+            plan_path=_project_path(plan),
+            expected_plan_sha256=plan_sha256,
+            actor=actor,
+            confirm=confirm_activation,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError, duckdb.Error) as exc:
+        console.print(f"[red]Company Facts v4 activation refused safely:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print("[bold green]Company Facts v4 activated atomically.[/bold green]")
+    console.print(f"Activation receipt: {result.activation_id}")
+    console.print(
+        f"Rows added: {result.counts['added']}, changed: {result.counts['changed']}, "
+        f"removed: {result.counts['removed']}"
+    )
+    console.print(
+        f"Evidence generation: {result.generation_id} "
+        f"(version boundary {result.version_sequence_boundary})"
+    )
+    console.print("No paper fill or broker action occurred.")
 
 
 @app.command("anomalies")
@@ -2858,12 +3029,9 @@ def anomaly_acceptance_check(
         console.print_json(json.dumps(contract, sort_keys=True))
         return
     console.print(
-        "[green]Accepted-missingness contract verified:[/green] "
-        f"{contract['contract_id']}"
+        f"[green]Accepted-missingness contract verified:[/green] {contract['contract_id']}"
     )
-    console.print(
-        "Coverage, readiness, score state, and predecessor facts remain unchanged."
-    )
+    console.print("Coverage, readiness, score state, and predecessor facts remain unchanged.")
 
 
 @app.command("anomaly-ack")
@@ -3904,9 +4072,7 @@ def _run_forward_rollover_preview(
             preflight = assess_operator_preflight(now=checked)
             with store_scope(read_only=True) as store:
                 decision_date = (
-                    date.fromisoformat(as_of)
-                    if as_of
-                    else latest_paper_decision_date(store)
+                    date.fromisoformat(as_of) if as_of else latest_paper_decision_date(store)
                 )
                 readiness = assess_us_readiness(
                     decision_date,
@@ -4090,9 +4256,7 @@ def forward_rollover(
         Path | None,
         typer.Option(
             "--plan",
-            help=(
-                "Activation contract: canonical content-addressed plan artifact."
-            ),
+            help=("Activation contract: canonical content-addressed plan artifact."),
         ),
     ] = None,
     plan_sha256: Annotated[
@@ -4205,27 +4369,17 @@ def forward_rollover(
                     "predecessor_trial_id": result.predecessor_trial_id,
                     "successor_trial_id": result.successor_trial_id,
                     "active_trial": _forward_rollover_display_path(result.active_trial),
-                    "archived_trial": _forward_rollover_display_path(
-                        result.archived_trial
-                    ),
-                    "archived_proposal": _forward_rollover_display_path(
-                        result.archived_proposal
-                    ),
-                    "successor_proposal": _forward_rollover_display_path(
-                        result.successor_proposal
-                    ),
+                    "archived_trial": _forward_rollover_display_path(result.archived_trial),
+                    "archived_proposal": _forward_rollover_display_path(result.archived_proposal),
+                    "successor_proposal": _forward_rollover_display_path(result.successor_proposal),
                     "backup": {
                         "path": _forward_rollover_display_path(result.backup.path),
                         "files": result.backup.files,
                         "bytes": result.backup.bytes,
                         "manifest_sha256": result.backup.manifest_sha256,
                     },
-                    "journal_directory": _forward_rollover_display_path(
-                        result.journal_directory
-                    ),
-                    "verified_receipt": _forward_rollover_display_path(
-                        result.verified_receipt
-                    ),
+                    "journal_directory": _forward_rollover_display_path(result.journal_directory),
+                    "verified_receipt": _forward_rollover_display_path(result.verified_receipt),
                     "account_mutated": False,
                     "fill_recorded": False,
                     "broker_order_sent": False,
@@ -4240,9 +4394,7 @@ def forward_rollover(
         console.rule("[bold green]Verified prospective forward rollover[/bold green]")
         console.print(f"Plan SHA-256: {result.plan_sha256}")
         console.print(f"Attempt: {result.attempt_id}")
-        console.print(
-            f"Trial: {result.predecessor_trial_id} → {result.successor_trial_id}"
-        )
+        console.print(f"Trial: {result.predecessor_trial_id} → {result.successor_trial_id}")
         console.print(f"Active trial: {_forward_rollover_display_path(result.active_trial)}")
         console.print(f"Verified receipt: {result.verified_receipt}")
         console.print(
@@ -4331,12 +4483,8 @@ def forward_rollover_recover(
             "attempt_id": item.attempt_id,
             "terminal_phase": item.terminal_phase,
             "active_trial": _forward_rollover_display_path(item.active_trial),
-            "journal_directory": _forward_rollover_display_path(
-                item.journal_directory
-            ),
-            "terminal_receipt": _forward_rollover_display_path(
-                item.terminal_receipt
-            ),
+            "journal_directory": _forward_rollover_display_path(item.journal_directory),
+            "terminal_receipt": _forward_rollover_display_path(item.terminal_receipt),
         }
         for item in recovered
     ]
@@ -4365,9 +4513,7 @@ def forward_rollover_recover(
     console.print(f"Plan SHA-256: {plan_sha256}")
     for item in output:
         console.print(f"{item['attempt_id']}: {item['terminal_phase']}")
-    console.print(
-        "[dim]Recovery constructed no new successor, fill, or broker order.[/dim]"
-    )
+    console.print("[dim]Recovery constructed no new successor, fill, or broker order.[/dim]")
 
 
 @app.command("forward-rollover-preview", hidden=True)
@@ -5170,6 +5316,76 @@ def paper_execute(
     console.print("No order was sent to a broker.")
 
 
+@app.command("autopilot")
+@_exclusive_project_operation("autopilot")
+def autopilot(
+    account: Annotated[
+        Path,
+        typer.Option("--account", help="Local paper-account JSON path."),
+    ] = Path("data/paper/us_qv_sandbox.json"),
+    trial: Annotated[
+        Path,
+        typer.Option("--trial", help="Active checksum-protected forward-trial path."),
+    ] = Path("data/paper/us_qv_forward_trial.json"),
+    top_n: Annotated[
+        int,
+        typer.Option("--top-n", min=10, max=20, help="Number of simulated holdings."),
+    ] = 10,
+    confirm_simulated: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-simulated/--no-confirm-simulated",
+            help="Required acknowledgement that a due simulated fill may be recorded.",
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit one machine-readable result."),
+    ] = False,
+) -> None:
+    """Run one paper cycle: report a due fill and stage the next proposal.
+
+    Intended for the scheduled timer, which fires between a U.S. close and the
+    following open — inside both the execution window of the proposal that just
+    matured and the creation window of the next one. The timer does not pass
+    ``--confirm-simulated``, so recording remains manual. Every governed gate
+    still runs inside the frozen paper/forward libraries; this only sequences
+    them and skips whatever is not permitted.
+    """
+    from aios.autopilot import run_autopilot_cycle
+
+    try:
+        with store_scope(read_only=False) as store:
+            result = run_autopilot_cycle(
+                account_path=_project_path(account),
+                trial_path=_project_path(trial),
+                store=store,
+                top_n=top_n,
+                confirm_simulated=confirm_simulated,
+            )
+    except (OSError, RuntimeError, ValueError, duckdb.Error) as exc:
+        if json_output:
+            console.print_json(json.dumps({"status": "refused", "error": str(exc)}, sort_keys=True))
+        else:
+            console.print(f"[red]Autopilot refused safely:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if json_output:
+        console.print_json(json.dumps({"status": "complete", **result.to_dict()}, sort_keys=True))
+        return
+
+    console.rule("[bold]Unattended paper cycle[/bold]")
+    if result.executed_proposal_id:
+        console.print(f"[green]Simulated fill recorded:[/green] {result.execution_detail}")
+    else:
+        console.print("No simulated fill was due.")
+    if result.creation_detail:
+        console.print(f"Next proposal: {result.creation_detail}")
+    for skipped in result.skipped:
+        console.print(f"  [yellow]skipped:[/yellow] {skipped}")
+    console.print("Simulation only. No broker order was placed and no governed gate was bypassed.")
+
+
 @app.command("paper-mark")
 @_exclusive_project_operation("paper-mark")
 def paper_mark(
@@ -5468,9 +5684,7 @@ def refresh_us_current_command(
             )
         raise typer.Exit(code=1)
     actionable_warnings = tuple(
-        warning
-        for warning in result.warnings
-        if warning.kind != "fundamentals_pending"
+        warning for warning in result.warnings if warning.kind != "fundamentals_pending"
     )
     if actionable_warnings:
         from aios.alerts import Alert, AlertSeverity
@@ -5486,9 +5700,7 @@ def refresh_us_current_command(
                 payload={
                     "areas": enabled_areas,
                     "warning_count": len(actionable_warnings),
-                    "identities": [
-                        warning.identity for warning in actionable_warnings[:25]
-                    ],
+                    "identities": [warning.identity for warning in actionable_warnings[:25]],
                 },
             )
         )
@@ -6589,9 +6801,7 @@ def backtest_qv(
     from aios.backtest import TaxPolicy, TransactionCostPolicy, run_qv_policy_backtest
 
     if register_experiment and output is None:
-        console.print(
-            "[red]Backtest refused:[/red] --register-experiment requires --output"
-        )
+        console.print("[red]Backtest refused:[/red] --register-experiment requires --output")
         raise typer.Exit(code=1)
 
     try:
@@ -6929,6 +7139,7 @@ def compare_experiments_command(
     table.add_column("regime max drawdown", justify="right")
     table.add_column("baseline cum. return", justify="right")
     for row in comparison["rows"]:
+
         def _pct(value: Any) -> str:
             return "N/A" if value is None else f"{float(value) * 100:.2f}%"
 
@@ -7199,7 +7410,10 @@ def refresh_price_actions(
     """Correct rows fetched before explicit dividend/split actions were enabled."""
     import time
 
-    from aios.ingest.prices import fetch_provider_prices
+    from aios.ingest.prices import (
+        YFINANCE_CORPORATE_ACTION_PARSER_VERSION,
+        fetch_provider_prices,
+    )
     from aios.ingest.prices import (
         ingest_security_prices as _ingest_security_prices,
     )
@@ -7245,6 +7459,7 @@ def refresh_price_actions(
                 start=start,
                 end=end,
                 store=store,
+                yfinance_parser_version=YFINANCE_CORPORATE_ACTION_PARSER_VERSION,
             )
             remaining = store.unverified_price_action_count(
                 security_id,
@@ -7263,7 +7478,13 @@ def refresh_price_actions(
     for ticker in explicit_tickers:
         console.rule(f"benchmark/calendar {ticker}")
         try:
-            rows = fetch_provider_prices(provider, ticker, start, end)
+            rows = fetch_provider_prices(
+                provider,
+                ticker,
+                start,
+                end,
+                yfinance_parser_version=YFINANCE_CORPORATE_ACTION_PARSER_VERSION,
+            )
             if not rows:
                 raise ValueError("provider returned no rows")
             refreshed_rows += store.upsert_prices(rows)

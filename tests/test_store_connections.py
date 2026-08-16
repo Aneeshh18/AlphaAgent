@@ -26,6 +26,10 @@ def test_store_retries_only_a_duckdb_lock_conflict(monkeypatch, tmp_path: Path) 
     attempts = 0
 
     class FakeConnection:
+        def execute(self, statement: str) -> FakeConnection:
+            assert statement == "SET TimeZone = 'UTC'"
+            return self
+
         def close(self) -> None:
             return None
 

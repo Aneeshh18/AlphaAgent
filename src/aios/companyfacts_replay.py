@@ -331,7 +331,30 @@ def scoped_source_evidence(
     re-verify and re-parse the exact payload at activation time rather than
     trusting anything cached in a plan file.
     """
+    return scoped_source_evidence_many(
+        store,
+        issuer_ids=(issuer_id,),
+        as_of=as_of,
+    ).get(issuer_id)
+
+
+def scoped_source_evidence_many(
+    store: Store,
+    *,
+    issuer_ids: Sequence[str],
+    as_of: date | str,
+) -> dict[str, dict[str, Any]]:
+    """Return newest accepted Company Facts evidence for an explicit scope.
+
+    The underlying evidence relation covers every issuer. Querying it once is
+    materially important for governed full-universe reviews; the single-issuer
+    wrapper above preserves the original API and exact selection semantics.
+    """
+
     decision_as_of = _normalize_as_of(as_of)
+    requested = {str(value).strip() for value in issuer_ids if str(value).strip()}
+    if not requested:
+        return {}
     ingest_columns = _table_columns(store, "ingest_log")
     subject_columns = {"subject_type", "subject_id"} & ingest_columns
     if subject_columns and subject_columns != {"subject_type", "subject_id"}:
@@ -347,10 +370,11 @@ def scoped_source_evidence(
             ),
         )
     )
-    observations = []
+    newest: dict[str, dict[str, Any]] = {}
     for row in evidence_rows:
         normalized = _normalize_evidence_row(row)
-        if _scoped_issuer_id(normalized) != issuer_id:
+        issuer_id = _scoped_issuer_id(normalized)
+        if issuer_id not in requested:
             continue
         try:
             received_on = _observation_date(normalized.get("received_at"))
@@ -358,10 +382,12 @@ def scoped_source_evidence(
             continue
         if received_on > decision_as_of:
             continue
-        observations.append(normalized)
-    if not observations:
-        return None
-    return max(observations, key=_evidence_order_key)
+        current = newest.get(issuer_id)
+        if current is None or _evidence_order_key(normalized) > _evidence_order_key(
+            current
+        ):
+            newest[issuer_id] = normalized
+    return newest
 
 
 def verified_companyfacts_payload_bytes(root: Path, evidence: dict[str, Any]) -> bytes:

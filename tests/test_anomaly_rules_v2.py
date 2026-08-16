@@ -792,15 +792,22 @@ class _FundamentalStore:
         if "COUNT(DISTINCT value)" in sql:
             return list(self._conflicts.get(issuer_id, []))
         assert "FROM fundamentals" in sql
-        # Mirror the real query: newest filings first, bounded by the lookback,
-        # so the rule's own reversal is exercised rather than bypassed.
-        assert "ORDER BY period_end DESC, as_of_date DESC" in sql
-        rows = sorted(
-            self._shares.get(issuer_id, []),
-            key=lambda row: (row["period_end"], row["as_of_date"]),
+        # Mirror the real query: retain every row from the latest filing dates,
+        # then return them in deterministic vintage/period/value order.
+        assert "recent_vintages" in sql
+        rows = self._shares.get(issuer_id, [])
+        filing_dates = sorted(
+            {row["as_of_date"] for row in rows},
             reverse=True,
+        )[: params[3]]
+        return sorted(
+            (row for row in rows if row["as_of_date"] in filing_dates),
+            key=lambda row: (
+                row["as_of_date"],
+                row["period_end"],
+                row.get("value", float("-inf")),
+            ),
         )
-        return rows[: params[3]]
 
 
 def _shares_row(period_end: date, value: float, known: date | None = None) -> dict:
@@ -837,9 +844,7 @@ def test_share_rule_flags_a_large_jump() -> None:
     scan = scan_share_count_jump(store=store, as_of=DECISION)
     assert len(scan.observations) == 1
     finding = scan.observations[0]
-    # The subject carries the knowable date as well as the fiscal period: one
-    # period restated on several dates must not collapse into one fingerprint.
-    assert finding.subject_id == "iss-aaa@2026-03-31#2026-03-31"
+    assert finding.subject_id == "iss-aaa@2026-03-31"
     assert finding.new_value["implied_ratio"] == 4.0
     assert finding.severity == "high"
 
@@ -864,9 +869,66 @@ def test_share_rule_separates_restatements_of_one_period() -> None:
     assert len(scan.observations) == 2
     assert len({row.fingerprint for row in scan.observations}) == 2
     assert [row.subject_id for row in scan.observations] == [
-        "iss-aaa@2026-03-31#2026-05-30",
-        "iss-aaa@2026-03-31#2026-06-30",
+        "iss-aaa@2026-05-30",
+        "iss-aaa@2026-06-30",
     ]
+
+
+def test_share_rule_orders_hon_by_filing_vintage() -> None:
+    store = _FundamentalStore(
+        shares={
+            "iss-hon": [
+                _shares_row(
+                    date(2025, 3, 31), 642_700_000.0, date(2026, 4, 23)
+                ),
+                _shares_row(
+                    date(2025, 6, 30), 317_500_000.0, date(2026, 7, 23)
+                ),
+                _shares_row(
+                    date(2025, 12, 31), 635_300_000.0, date(2026, 2, 17)
+                ),
+                _shares_row(
+                    date(2026, 1, 23), 635_675_701.0, date(2026, 2, 17)
+                ),
+                _shares_row(
+                    date(2026, 6, 30), 316_940_010.0, date(2026, 7, 24)
+                ),
+            ]
+        }
+    )
+
+    scan = scan_share_count_jump(store=store, as_of=DECISION)
+
+    assert len(scan.observations) == 1
+    finding = scan.observations[0]
+    assert finding.subject_id == "iss-hon@2026-07-23"
+    assert finding.evidence["comparison_mode"] == "inter_vintage"
+    assert finding.new_value["change_fraction"] == pytest.approx(-0.506, abs=1e-5)
+    assert all(
+        row.new_value.get("change_fraction") != pytest.approx(1.001)
+        for row in scan.observations
+    )
+
+
+def test_share_rule_catches_an_intra_vintage_scale_error() -> None:
+    store = _FundamentalStore(
+        shares={
+            "iss-aaa": [
+                _shares_row(
+                    date(2025, 12, 31), 1_000_000.0, date(2026, 5, 1)
+                ),
+                _shares_row(
+                    date(2026, 3, 31), 10_000_000.0, date(2026, 5, 1)
+                ),
+            ]
+        }
+    )
+
+    scan = scan_share_count_jump(store=store, as_of=DECISION)
+
+    assert len(scan.observations) == 1
+    assert scan.observations[0].evidence["comparison_mode"] == "intra_vintage"
+    assert scan.observations[0].new_value["implied_ratio"] == 10.0
 
 
 def test_share_rule_needs_two_observations() -> None:

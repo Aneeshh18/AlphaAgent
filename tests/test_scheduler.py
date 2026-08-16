@@ -64,6 +64,8 @@ def test_rendered_scheduler_uses_supported_commands_and_no_dashboard_service(tmp
     assert "OnStartupSec=3min" in units["aios-us-daily.timer"]
     assert "refresh-us-current --no-prices --no-macro" in units["aios-us-filings.service"]
     assert "ExecStartPost=" in units["aios-us-daily.service"]
+    assert " autopilot\n" in units["aios-us-daily.service"]
+    assert "--confirm-simulated" not in units["aios-us-daily.service"]
     assert " health\n" in units["aios-us-daily.service"]
     assert "OnFailure=aios-alert@%n.service" in units["aios-us-daily.service"]
     assert "alert-service-recovered --unit %n" in units["aios-us-daily.service"]

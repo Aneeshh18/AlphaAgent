@@ -1,6 +1,12 @@
 # AIOS UI Design System
 
-Status: normative product and implementation guidance
+> **Superseded (2026-08-13).** The dashboard was redesigned onto a new
+> visual world ("Herbarium Specimen Sheet"). This document describes the
+> retired warm-institutional-workbench identity and is kept as historical
+> record only. Current, binding design authority is `DESIGN.md` at the
+> project root plus its `.impeccable/design.json` sidecar.
+
+Status: historical — retired 2026-08-13
 Last reviewed: 2026-07-28
 
 This document defines the shared visual language and interaction contract for

@@ -185,7 +185,7 @@ def test_home_model_surfaces_critical_operations_over_green_research() -> None:
     assert model.next_action.title == "Review the operating issue first"
     assert "guarded daily workflow failed" in model.next_action.detail
     assert model.next_action.command == "aios alert-show incident-critical-1"
-    assert model.next_action.cta_label == "Open System Health"
+    assert model.next_action.cta_label == "Open Operations"
     assert model.next_action.destination == "system"
 
 

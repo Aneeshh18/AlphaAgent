@@ -24,7 +24,107 @@ This current path does **not** turn the repository into a complete
 1996-present S&P announcement archive. Pre-August-2023 provenance and broader
 delisted histories remain separate long-history work.
 
-### Candidate 2023-01 → 2023-07 event manifest (2026-08-12) — REVIEWED, NOT IMPORTED
+### Anomaly backlog worked down 45 → 16 (2026-08-13), all with primary evidence
+
+The unresolved data-review backlog was not noise, and it was not closed to
+unblock anything. Each disposition below cites evidence read directly, and
+**no stored row was altered** — point-in-time correctness requires retaining
+what an issuer published on the date it published it, including when that
+value is wrong.
+
+**4 price moves → `false_positive`.** PLTR +29.5%, ZBRA +26.5%, SNDK +26.0%
+and IBM -25.2% were re-fetched from the provider on 2026-08-13. Stored
+closes match the provider exactly, with `Stock Splits = 0.0` on each move
+date. These are ordinary earnings-reaction moves past the rule's 25%
+threshold, not data defects.
+
+**10 zero share counts → `accepted`.** Verified against the retained SEC
+Company Facts payload itself: SEC publishes `val = 0` for
+`CommonStockSharesOutstanding` at these period ends. For CRWD 2019-07-31,
+accession 0001558370-19-008521 reports 47,421,000 shares for 2019-01-31 and
+0 for 2019-07-31 *in the same filing* — so the parser read the response
+faithfully and the zero originates upstream, in an early post-IPO
+cover-page tag. The factor layer already withholds a non-positive share
+count rather than computing on it.
+
+**6 thousand-scale contradictions → `accepted`.** The issuers' own filings
+disagree by exactly 1000x for one period end. DLR 2024-12-31 is reported as
+336,637,000 by accessions 0001558370-25-001424, 0001558370-25-006125,
+0001558370-25-009991 and 0001104659-25-104945, but as 336,637 by
+0001104659-26-015365. REGN 2011-12-31 is reported as 90,692,071 by
+0001206774-12-000709 and 0001532176-12-000004, but as 90,692,071,000 by
+0001206774-12-001689 and 0001206774-12-003062. Identical digit sequences,
+different scale — one filing tagged the value in thousands. Accepted as a
+real upstream inconsistency; correcting it would destroy the record of what
+was actually published.
+
+**9 split-related findings were dispositioned `false_positive`.** The filings
+show later restatements on post-split share bases. The old review also cited
+stored `split_ratio` values as confirmation; that part is superseded. Those
+values came from Yahoo price-continuity evidence and are not, by themselves,
+legal share multipliers. Detector v2 now avoids that source entirely and
+compares filing vintages directly.
+
+**16 remain open and are deliberately not closed.** HON's three cases are not
+detector-only findings: the stored 2026-06-29 price-adjustment ratio of 0.9535
+does not encode the 1-for-2 reverse split. That is a separate
+corporate-action/price-normalization defect from the filing-vintage problem in
+`share_count_jump`. CSX 2020-12-31 has no split in that window. C, EXE, JCI,
+COF, NEM, FITB, OMC, WAT and XYL need corporate-action research (mergers and
+share issuance) that could not be completed offline. MNST is the split-basis
+corruption described below. None of these should be closed without the same
+standard of evidence applied above.
+
+### MNST price-basis incident (2026-08-13) — close repaired, old factor diagnosis superseded
+
+The `price_action_mismatch` case `case-b70cc7b` ("MNST moved -51.5% on
+2026-08-03 with no corporate action") was **not** a false positive. It was a
+genuine mixed-split-basis corruption, and the rule caught it correctly.
+
+Monster Beverage split 2:1 effective **2026-08-11**. The incident review
+correctly established that 2026-08-10's stored 45.72 was half the quoted
+91.43 close and that a narrow reviewed Tiingo mapping repaired it. The later
+claim that every pre-split raw close should carry normalization factor 2.0 was
+wrong: with `auto_adjust=False`, provider OHLC is contemporaneous. A factor of
+1.0 is therefore correct for a raw 91.43 close; multiplying it by 2.0 would
+manufacture 182.86.
+
+Three sessions were affected — 2026-08-03, 08-04 and 08-10 — each storing
+almost exactly half the quoted close while neighbouring rows stayed
+unadjusted, which is what produced the phantom -51.5% move.
+
+The existing yfinance v3 rows that combine raw closes with cumulative factors
+remain governed historical state and were not rewritten in this release.
+Immutable parser v4 keeps raw close, sets normalization factor 1.0, and
+separates provider price-continuity evidence from reviewed legal-share actions.
+
+**Resolved 2026-08-14, and the fix required a reference decision.** The
+2026-08-10 close was corrected from 45.72 to **91.43** via
+`refresh-price-actions --provider tiingo`, the value Tiingo independently
+confirms and exactly twice the stored figure. That correction initially
+*broke* `tagged_prices_outside_provider_window`: the row was tagged to the
+security but sourced from a provider with no reviewed mapping for it, which
+is precisely the governance boundary flagged below before the fix. The
+`--ticker` path bypasses the reviewed-provider check, so the violation was
+introduced silently and only surfaced in validation.
+
+Completed rather than reverted, because reverting would restore a
+known-wrong price to satisfy a check. `examples/mnst_tiingo_2026_08_10_*.csv`
+registers Tiingo as a reviewed provider for this security across the single
+half-open session `2026-08-10` to `2026-08-11` — deliberately the narrowest
+window that covers the one session the primary provider cannot serve, not a
+blanket second mapping. Integrity returned to zero hard failures.
+
+The corrected Tiingo row's `split_normalization_factor = 1.0` is not a
+residual defect. The neighbouring yfinance factor-2 rows are evidence of the
+old parser contract now under governed migration review.
+
+The retained repair evidence is the narrow reviewed Tiingo mapping in
+`examples/mnst_tiingo_2026_08_10_*.csv`, bounded to the single half-open
+session `2026-08-10` to `2026-08-11`. It confirms 91.43 without turning Tiingo
+into an unbounded alternate identity source. The old pre-decision note that
+Tiingo had no reviewed mapping is retained in audit history, but is no longer
+the current state.
 
 `examples/sp500_events_candidate_2023-01_to_2023-07.csv` and
 `examples/sp500_security_transitions_candidate_2023-01_to_2023-07.csv` are
@@ -1266,3 +1366,49 @@ daily cycle then certified the August 3 close with 503/503 reviewed prices,
 500/503 point-in-time filing coverage, zero hard data-quality failures, and
 three warnings. FERG/EA remains a future-effective boundary: August 5 and later
 cannot be certified until that event is formally imported and validated.
+
+## August 14, 2026 receipt-bound component divergence policy
+
+The fja05680 current-component CSV did not publish the already-effective
+EA-to-FERG change before the former seven-calendar-day allowance expired.
+The governed AIOS membership was already bound to the official S&P DJI event
+and a dated official IVV holdings export showing FERG present and EA absent.
+Changing the reviewed membership back to the stale community set would have
+made the primary record wrong; making IVV the sole membership authority would
+have replaced one proxy with an ETF that has its own holdings, share-class,
+sampling and timing differences.
+
+The owner therefore approved a narrower rule. The community CSV may differ
+only when it is the accepted activation receipt's exact pre-event member set,
+AIOS is the same receipt's exact post-event set, the receipt's dated event rows
+explain every difference, and its archived IVV export contains every addition
+and no deletion. The current official release scan must still be fresh and
+clean, overlapping community CIKs must still match reviewed security lineage,
+and any unrelated ticker, identity, CIK, effective-date or release difference
+still blocks.
+
+There is no clock-based expiry on that exact state. It is nevertheless bounded
+to one outstanding event: after a second activation, a CSV still at the first
+pre-event set cannot equal the second receipt's pre-event set, so no activation
+receipt can reconcile both complete hashes. The validator then fails closed.
+IVV remains corroboration for an official event, never the sole definition of
+S&P 500 membership.
+
+New attestations retain the historical `accepted_activation_component_lag`
+JSON key for compatibility but add mode
+`receipt_bound_component_divergence` and basis
+`accepted_activation_receipt+dated_ivv_holdings`. Both
+`review-universe-current` and operator `preflight` display the reconciled
+component-source mode so a long-lived stale cross-check cannot pass silently.
+
+The first live attestation under this rule was
+`uca-3f76113fb0c24cdbad159df96f40c355`. It archived 100 current official
+release records, found no unreviewed change effective through 2026-08-13, and
+reconciled exactly the FERG addition and EA deletion to accepted activation
+`uca-event-87d33f15572441efbedd7b47a1226b64`. All 503 membership, security,
+issuer/CIK and provider windows moved together through August 13. The
+persistent validator independently reconstructed the live post-event set and
+inverse-applied the receipt event to reconstruct the pre-event component set;
+both the attestation's newline hashes and activation's canonical-list hashes
+matched. Exact-date research readiness passed afterward. Separate failed-job
+incidents remain operational blockers and were not waived by this attestation.

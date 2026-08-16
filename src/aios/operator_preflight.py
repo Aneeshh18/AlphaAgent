@@ -7,7 +7,7 @@ import json
 import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -123,6 +123,7 @@ class OperatorPreflight:
     operations: CapabilityState
     real_capital: CapabilityState
     next_action: OperatorAction
+    universe_evidence: dict[str, Any] | None = None
     raw_prices_through: str | None = None
     fundamentals_through: str | None = None
     macro_releases_through: str | None = None
@@ -188,6 +189,7 @@ class OperatorPreflight:
                 "fundamentals_through": self.fundamentals_through,
                 "macro_releases_through": self.macro_releases_through,
             },
+            "universe_evidence": self.universe_evidence,
             "evidence_identity": {
                 "account_id": self.account_id,
                 "proposal_id": self.proposal_id,
@@ -252,6 +254,55 @@ def _research_state(readiness: Mapping[str, Any]) -> CapabilityState:
         ),
         blockers=blockers,
     )
+
+
+def _load_universe_evidence(store: Any, decision_date: date) -> dict[str, Any]:
+    """Expose whether the certified universe uses exact or reconciled components."""
+
+    rows = store.query(
+        """
+        SELECT attestation_id, requested_coverage_through, component_source_url,
+               mismatch_detail_json
+        FROM universe_coverage_attestations
+        WHERE universe_id = 'sp500'
+          AND status = 'accepted_no_change'
+          AND requested_coverage_through >= ?
+        ORDER BY requested_coverage_through DESC, checked_at DESC, created_at DESC
+        LIMIT 1
+        """,
+        (decision_date,),
+    )
+    if not rows:
+        return {
+            "attestation_id": None,
+            "coverage_through": None,
+            "component_source_url": None,
+            "component_source_mode": "unavailable",
+            "accepted_activation_component_lag": None,
+        }
+    row = rows[0]
+    try:
+        mismatch = json.loads(str(row["mismatch_detail_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("universe attestation mismatch detail is invalid") from exc
+    if not isinstance(mismatch, dict):
+        raise ValueError("universe attestation mismatch detail is invalid")
+    reconciliation = mismatch.get("accepted_activation_component_lag")
+    if reconciliation is not None and not isinstance(reconciliation, dict):
+        raise ValueError("universe component reconciliation is invalid")
+    return {
+        "attestation_id": str(row["attestation_id"]),
+        "coverage_through": str(row["requested_coverage_through"]),
+        "component_source_url": str(row["component_source_url"]),
+        "component_source_mode": (
+            "reconciled_divergence" if reconciliation is not None else "exact_match"
+        ),
+        # Preserve the attestation key verbatim so operators can trace the
+        # activation receipt without translating between schemas.
+        "accepted_activation_component_lag": (
+            dict(reconciliation) if reconciliation is not None else None
+        ),
+    }
 
 
 def _proposal_mapping(
@@ -738,7 +789,7 @@ def _incident_action(
         destination="system",
         tone="danger" if incident.get("severity") == "critical" else "warning",
         command=command,
-        cta_label="Open System Health",
+        cta_label="Open Operations",
     )
 
 
@@ -857,7 +908,7 @@ def _next_action(
             destination="system",
             tone="danger",
             command="aios alerts --blocking --limit 1000",
-            cta_label="Open System Health",
+            cta_label="Open Operations",
         )
     daily = (
         operations_evidence.get("daily_cycle") if isinstance(operations_evidence, Mapping) else None
@@ -870,7 +921,7 @@ def _next_action(
             destination="system",
             tone="danger",
             command="aios health --report-only",
-            cta_label="Open System Health",
+            cta_label="Open Operations",
         )
     if not research.available:
         failed = [
@@ -892,7 +943,7 @@ def _next_action(
             destination="system",
             tone="danger",
             command=command,
-            cta_label="Open System Health",
+            cta_label="Open Operations",
         )
     if operations.state == "unavailable":
         return OperatorAction(
@@ -902,7 +953,7 @@ def _next_action(
             destination="system",
             tone="warning",
             command="aios health --report-only",
-            cta_label="Open System Health",
+            cta_label="Open Operations",
         )
     if not registered_proposal_ready:
         forward = _forward_mapping(monitor)
@@ -1018,7 +1069,7 @@ def _next_action(
             destination="system",
             tone="warning",
             command="aios alerts --blocking --limit 1000",
-            cta_label="Open System Health",
+            cta_label="Open Operations",
         )
     route = (
         operations_evidence.get("notification_route")
@@ -1048,7 +1099,7 @@ def _next_action(
             destination="system",
             tone="warning",
             command="aios notifications --needs-review --limit 1000",
-            cta_label="Open System Health",
+            cta_label="Open Operations",
         )
     if not operations.available:
         return OperatorAction(
@@ -1058,7 +1109,7 @@ def _next_action(
             destination="system",
             tone="warning",
             command="aios health --report-only",
-            cta_label="Open System Health",
+            cta_label="Open Operations",
         )
     if paper_recording.state == "waiting_for_close":
         proposal = _proposal_mapping(monitor)
@@ -1095,6 +1146,7 @@ def build_operator_preflight(
     operations_evidence: Mapping[str, Any] | None,
     *,
     paper_review: Mapping[str, Any] | None = None,
+    universe_evidence: Mapping[str, Any] | None = None,
     checked_at: str | None = None,
 ) -> OperatorPreflight:
     """Compose one deterministic snapshot from already-loaded governed evidence."""
@@ -1133,6 +1185,7 @@ def build_operator_preflight(
         paper_recording=paper_recording,
         operations=operations,
         real_capital=real_capital,
+        universe_evidence=dict(universe_evidence) if universe_evidence is not None else None,
         next_action=_next_action(
             readiness,
             monitor,
@@ -1204,6 +1257,7 @@ def assess_operator_preflight(
     paper_review: Mapping[str, Any] | None = None
     with store_scope(read_only=True) as store:
         decision_date = latest_paper_decision_date(store)
+        universe_evidence = _load_universe_evidence(store, decision_date)
         readiness = assess_us_readiness(
             decision_date,
             purpose="paper",
@@ -1259,5 +1313,6 @@ def assess_operator_preflight(
         monitor,
         operations,
         paper_review=paper_review,
+        universe_evidence=universe_evidence,
         checked_at=_timestamp(now),
     )

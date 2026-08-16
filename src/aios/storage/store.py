@@ -48,9 +48,7 @@ log = get_logger(__name__)
 MACRO_LEGACY_PURGED_MIGRATION = "macro_legacy_active_copies_purged"
 RAW_SNAPSHOT_REJECTION_EVIDENCE_MIGRATION = "raw_snapshot_rejection_evidence_v1"
 FUNDAMENTAL_EVIDENCE_VERSIONS_MIGRATION = "fundamental_evidence_versions_v1"
-UNIVERSE_CONSTITUENT_CHANGE_ACTIVATIONS_MIGRATION = (
-    "universe_constituent_change_activations_v1"
-)
+UNIVERSE_CONSTITUENT_CHANGE_ACTIVATIONS_MIGRATION = "universe_constituent_change_activations_v1"
 _RAW_SNAPSHOT_MAX_ORIGINAL_BYTES = 256 * 1024 * 1024
 _RAW_SNAPSHOT_MAX_STORED_BYTES = 64 * 1024 * 1024
 
@@ -110,9 +108,7 @@ def checkpoint_database_for_backup(database_path: Path) -> None:
     database = Path(os.path.abspath(requested))
     for candidate in (database, *database.parents):
         if candidate.is_symlink():
-            raise ValueError(
-                f"database path cannot contain symbolic links: {database}"
-            )
+            raise ValueError(f"database path cannot contain symbolic links: {database}")
     if not database.is_file():
         raise ValueError(f"database does not exist or is unsafe: {database}")
     before = database.stat()
@@ -167,13 +163,15 @@ class Store:
             read_only=read_only,
             wait_seconds=wait_seconds,
         )
+        # Every persisted TIMESTAMP is interpreted as a UTC wall time. Pin the
+        # session so SQL defaults and timezone-aware Python parameters cannot
+        # drift with the host's local timezone.
+        self._con.execute("SET TimeZone = 'UTC'")
         if read_only:
             try:
                 opened_identity = stable_database_file_identity(self.db_path)
                 if opened_identity != connection_identity:
-                    raise RuntimeError(
-                        "DuckDB database identity changed while it was opened"
-                    )
+                    raise RuntimeError("DuckDB database identity changed while it was opened")
                 self.database_file_identity = opened_identity
             except Exception:
                 self._con.close()
@@ -200,8 +198,7 @@ class Store:
         self._migrate_price_action_schema()
         self._migrate_universe_constituent_change_activation_schema(
             allow_marker_insert=(
-                self.allow_schema_upgrade
-                or self._universe_change_bootstrap_allowed
+                self.allow_schema_upgrade or self._universe_change_bootstrap_allowed
             )
         )
         log.info("schema.initialized", db=str(self.db_path))
@@ -234,26 +231,20 @@ class Store:
                 "Universe constituent-change activation receipt table is missing "
                 "after its migration marker was recorded."
             )
-        if (
-            tables
-            and not table_exists
-            and not marker_exists
-            and not self.allow_schema_upgrade
-        ):
+        if tables and not table_exists and not marker_exists and not self.allow_schema_upgrade:
             raise RuntimeError(
                 "Universe constituent-change activation capability requires the "
                 "backup-first upgrade-local-state workflow."
             )
         if table_exists and not marker_exists:
             row_count = int(
-                self.query(
-                    "SELECT COUNT(*) AS n FROM universe_constituent_change_activations"
-                )[0]["n"]
+                self.query("SELECT COUNT(*) AS n FROM universe_constituent_change_activations")[0][
+                    "n"
+                ]
             )
             if row_count:
                 raise RuntimeError(
-                    "Universe constituent-change activation rows exist without a "
-                    "migration marker."
+                    "Universe constituent-change activation rows exist without a migration marker."
                 )
 
     def require_universe_change_activation_schema(self) -> None:
@@ -282,9 +273,7 @@ class Store:
                 "run the backup-first upgrade-local-state workflow."
             )
         self._preflight_universe_constituent_change_activation_schema()
-        self._migrate_universe_constituent_change_activation_schema(
-            allow_marker_insert=False
-        )
+        self._migrate_universe_constituent_change_activation_schema(allow_marker_insert=False)
 
     def _migrate_universe_constituent_change_activation_schema(
         self,
@@ -333,9 +322,7 @@ class Store:
         )
         described = tuple(
             (str(row["column_name"]), str(row["column_type"]), str(row["null"]))
-            for row in self.query(
-                "DESCRIBE universe_constituent_change_activations"
-            )
+            for row in self.query("DESCRIBE universe_constituent_change_activations")
         )
         if described != expected_columns:
             raise RuntimeError(
@@ -390,9 +377,7 @@ class Store:
             '(length(main."trim"(policy_version))>0)',
         }
         if key_constraints != required_keys or check_expressions != required_checks:
-            raise RuntimeError(
-                "Universe constituent-change activation constraints are incomplete."
-            )
+            raise RuntimeError("Universe constituent-change activation constraints are incomplete.")
 
         marker = self.query(
             """
@@ -402,9 +387,7 @@ class Store:
             (UNIVERSE_CONSTITUENT_CHANGE_ACTIVATIONS_MIGRATION,),
         )
         row_count = int(
-            self.query(
-                "SELECT COUNT(*) AS n FROM universe_constituent_change_activations"
-            )[0]["n"]
+            self.query("SELECT COUNT(*) AS n FROM universe_constituent_change_activations")[0]["n"]
         )
         if marker:
             if (
@@ -526,7 +509,8 @@ class Store:
                   'sec-companyfacts-v2',
                   'sec-companyfacts-v2-storage-safe-v1',
                   'sec-companyfacts-v2-storage-safe-v2',
-                  'sec-companyfacts-v3'
+                  'sec-companyfacts-v3',
+                  'sec-companyfacts-v4'
               )
               AND snapshot.parsed_row_count IS NOT NULL
             ORDER BY snapshot.snapshot_id
@@ -661,14 +645,11 @@ class Store:
             "recorded_at",
             "is_deleted",
         }
-        columns = {
-            row["column_name"] for row in self.query("DESCRIBE fundamental_versions")
-        }
+        columns = {row["column_name"] for row in self.query("DESCRIBE fundamental_versions")}
         if not expected <= columns:
             missing = sorted(expected - columns)
             raise RuntimeError(
-                "Fundamental evidence version schema is incomplete: "
-                + ", ".join(missing)
+                "Fundamental evidence version schema is incomplete: " + ", ".join(missing)
             )
         marked = bool(
             self.query(
@@ -676,9 +657,7 @@ class Store:
                 (FUNDAMENTAL_EVIDENCE_VERSIONS_MIGRATION,),
             )[0]["n"]
         )
-        version_count = int(
-            self.query("SELECT COUNT(*) AS n FROM fundamental_versions")[0]["n"]
-        )
+        version_count = int(self.query("SELECT COUNT(*) AS n FROM fundamental_versions")[0]["n"])
         if not marked:
             if version_count:
                 raise RuntimeError(
@@ -718,8 +697,7 @@ class Store:
         unmatched = self._fundamental_projection_version_mismatch_count()
         if unmatched:
             raise RuntimeError(
-                "Latest fundamental evidence versions do not reconstruct the "
-                "current projection"
+                "Latest fundamental evidence versions do not reconstruct the current projection"
             )
 
     def _fundamental_projection_version_mismatch_count(self) -> int:
@@ -2800,7 +2778,8 @@ class Store:
             or source.get("artifact_kind") != "exact_response"
             or not isinstance(source.get("http_status"), int)
             or not 200 <= int(source["http_status"]) <= 299
-            or source.get("parser_version") not in {
+            or source.get("parser_version")
+            not in {
                 "sec-companyfacts-v2",
                 "sec-companyfacts-v2-storage-safe-v1",
                 "sec-companyfacts-v2-storage-safe-v2",
@@ -3080,8 +3059,14 @@ class Store:
         one table, and the caller knows the operation's true boundary.
         """
         run_id = run_id or str(uuid4())
-        started_at = started_at or datetime.now()
-        finished_at = finished_at or datetime.now()
+        started_at = _utc_naive_database_timestamp(
+            started_at or datetime.now(UTC),
+            label="ingest started_at",
+        )
+        finished_at = _utc_naive_database_timestamp(
+            finished_at or datetime.now(UTC),
+            label="ingest finished_at",
+        )
         normalized_subject_type, normalized_subject_id = _ingest_subject(
             subject_type,
             subject_id,
@@ -3168,8 +3153,14 @@ class Store:
                     snapshot["provider"],
                     snapshot["dataset"],
                     snapshot["artifact_kind"],
-                    snapshot["requested_at"],
-                    snapshot["received_at"],
+                    _utc_naive_database_timestamp(
+                        snapshot["requested_at"],
+                        label="raw snapshot requested_at",
+                    ),
+                    _utc_naive_database_timestamp(
+                        snapshot["received_at"],
+                        label="raw snapshot received_at",
+                    ),
                     snapshot.get("http_status"),
                     snapshot.get("content_type"),
                     snapshot["request_fingerprint"],
@@ -3735,7 +3726,15 @@ class Store:
             INSERT INTO universe_coverage_attestations ({", ".join(columns)})
             VALUES ({placeholders})
             """,
-            tuple(row[column] for column in columns),
+            tuple(
+                _utc_naive_database_timestamp(
+                    row[column],
+                    label="universe attestation checked_at",
+                )
+                if column == "checked_at"
+                else row[column]
+                for column in columns
+            ),
         )
 
     def universe_coverage_attestations(self, limit: int = 20) -> list[dict]:
@@ -4384,7 +4383,7 @@ class Store:
             self.query(
                 """
                 SELECT COUNT(*) AS n
-                FROM universe_coverage_attestations
+                FROM universe_coverage_attestations AS attestation
                 WHERE requested_coverage_through <= prior_coverage_through
                    OR requested_coverage_through > completed_new_york_date
                    OR official_release_count < 1
@@ -4407,8 +4406,332 @@ class Store:
                                        '$.accepted_activation_component_lag.activation_id'
                                    )
                                      AND activation.status = 'accepted'
-                                     AND requested_coverage_through -
-                                         activation.effective_date BETWEEN 0 AND 7
+                                     AND (
+                                         (
+                                             requested_coverage_through -
+                                                 activation.effective_date BETWEEN 0 AND 7
+                                             AND json_extract_string(
+                                                 mismatch_detail_json,
+                                                 '$.accepted_activation_component_lag.mode'
+                                             ) IS NULL
+                                         )
+                                         OR (
+                                             requested_coverage_through >=
+                                                 activation.effective_date
+                                             AND json_extract_string(
+                                                 mismatch_detail_json,
+                                                 '$.accepted_activation_component_lag.mode'
+                                             ) = 'receipt_bound_component_divergence'
+                                             AND json_extract_string(
+                                                 mismatch_detail_json,
+                                                 '$.accepted_activation_component_lag.reconciliation_basis'
+                                             ) = 'accepted_activation_receipt+dated_ivv_holdings'
+                                             AND activation.universe_id = attestation.universe_id
+                                             AND activation.policy_version LIKE
+                                                 'governed-sp500-constituent-activation.%'
+                                             AND attestation.reviewed_member_count = (
+                                                 SELECT COUNT(*)
+                                                 FROM universe_membership AS member
+                                                 WHERE member.universe_id =
+                                                     attestation.universe_id
+                                                   AND member.effective_start <=
+                                                     attestation.requested_coverage_through
+                                                   AND (
+                                                       member.effective_end IS NULL
+                                                       OR member.effective_end >
+                                                           attestation.requested_coverage_through
+                                                   )
+                                             )
+                                             AND attestation.reviewed_member_set_sha256 = (
+                                                 SELECT sha256(string_agg(
+                                                     member.ticker,
+                                                     chr(10) ORDER BY member.ticker
+                                                 ))
+                                                 FROM universe_membership AS member
+                                                 WHERE member.universe_id =
+                                                     attestation.universe_id
+                                                   AND member.effective_start <=
+                                                     attestation.requested_coverage_through
+                                                   AND (
+                                                       member.effective_end IS NULL
+                                                       OR member.effective_end >
+                                                           attestation.requested_coverage_through
+                                                   )
+                                             )
+                                             AND activation.after_member_set_sha256 = (
+                                                 SELECT sha256(CAST(to_json(list_sort(
+                                                     list(member.ticker)
+                                                 )) AS VARCHAR))
+                                                 FROM universe_membership AS member
+                                                 WHERE member.universe_id =
+                                                     attestation.universe_id
+                                                   AND member.effective_start <=
+                                                     attestation.requested_coverage_through
+                                                   AND (
+                                                       member.effective_end IS NULL
+                                                       OR member.effective_end >
+                                                           attestation.requested_coverage_through
+                                                   )
+                                             )
+                                             AND attestation.component_count = (
+                                                 SELECT COUNT(*)
+                                                 FROM (
+                                                     SELECT member.ticker
+                                                     FROM universe_membership AS member
+                                                     WHERE member.universe_id =
+                                                         attestation.universe_id
+                                                       AND member.effective_start <=
+                                                         attestation.requested_coverage_through
+                                                       AND (
+                                                           member.effective_end IS NULL
+                                                           OR member.effective_end >
+                                                               attestation.requested_coverage_through
+                                                       )
+                                                       AND member.ticker NOT IN (
+                                                           SELECT json_extract_string(
+                                                               value, '$.ticker'
+                                                           )
+                                                           FROM json_each(
+                                                               activation.activation_payload_json,
+                                                               '$.change_rows'
+                                                           )
+                                                           WHERE json_extract_string(
+                                                               value, '$.action'
+                                                           ) = 'addition'
+                                                       )
+                                                     UNION ALL
+                                                     SELECT json_extract_string(
+                                                         value, '$.ticker'
+                                                     )
+                                                     FROM json_each(
+                                                         activation.activation_payload_json,
+                                                         '$.change_rows'
+                                                     )
+                                                     WHERE json_extract_string(
+                                                         value, '$.action'
+                                                     ) = 'deletion'
+                                                 ) AS receipt_before
+                                             )
+                                             AND attestation.component_set_sha256 = (
+                                                 SELECT sha256(string_agg(
+                                                     receipt_before.ticker,
+                                                     chr(10) ORDER BY receipt_before.ticker
+                                                 ))
+                                                 FROM (
+                                                     SELECT member.ticker
+                                                     FROM universe_membership AS member
+                                                     WHERE member.universe_id =
+                                                         attestation.universe_id
+                                                       AND member.effective_start <=
+                                                         attestation.requested_coverage_through
+                                                       AND (
+                                                           member.effective_end IS NULL
+                                                           OR member.effective_end >
+                                                               attestation.requested_coverage_through
+                                                       )
+                                                       AND member.ticker NOT IN (
+                                                           SELECT json_extract_string(
+                                                               value, '$.ticker'
+                                                           )
+                                                           FROM json_each(
+                                                               activation.activation_payload_json,
+                                                               '$.change_rows'
+                                                           )
+                                                           WHERE json_extract_string(
+                                                               value, '$.action'
+                                                           ) = 'addition'
+                                                       )
+                                                     UNION ALL
+                                                     SELECT json_extract_string(
+                                                         value, '$.ticker'
+                                                     )
+                                                     FROM json_each(
+                                                         activation.activation_payload_json,
+                                                         '$.change_rows'
+                                                     )
+                                                     WHERE json_extract_string(
+                                                         value, '$.action'
+                                                     ) = 'deletion'
+                                                 ) AS receipt_before
+                                             )
+                                             AND activation.before_member_set_sha256 = (
+                                                 SELECT sha256(CAST(to_json(list_sort(
+                                                     list(receipt_before.ticker)
+                                                 )) AS VARCHAR))
+                                                 FROM (
+                                                     SELECT member.ticker
+                                                     FROM universe_membership AS member
+                                                     WHERE member.universe_id =
+                                                         attestation.universe_id
+                                                       AND member.effective_start <=
+                                                         attestation.requested_coverage_through
+                                                       AND (
+                                                           member.effective_end IS NULL
+                                                           OR member.effective_end >
+                                                               attestation.requested_coverage_through
+                                                       )
+                                                       AND member.ticker NOT IN (
+                                                           SELECT json_extract_string(
+                                                               value, '$.ticker'
+                                                           )
+                                                           FROM json_each(
+                                                               activation.activation_payload_json,
+                                                               '$.change_rows'
+                                                           )
+                                                           WHERE json_extract_string(
+                                                               value, '$.action'
+                                                           ) = 'addition'
+                                                       )
+                                                     UNION ALL
+                                                     SELECT json_extract_string(
+                                                         value, '$.ticker'
+                                                     )
+                                                     FROM json_each(
+                                                         activation.activation_payload_json,
+                                                         '$.change_rows'
+                                                     )
+                                                     WHERE json_extract_string(
+                                                         value, '$.action'
+                                                     ) = 'deletion'
+                                                 ) AS receipt_before
+                                             )
+                                             AND json_extract_string(
+                                                 activation.activation_payload_json,
+                                                 '$.receipt.activation_id'
+                                             ) = activation.activation_id
+                                             AND json_extract_string(
+                                                 activation.activation_payload_json,
+                                                 '$.receipt.universe_id'
+                                             ) = activation.universe_id
+                                             AND json_extract_string(
+                                                 activation.activation_payload_json,
+                                                 '$.receipt.status'
+                                             ) = 'accepted'
+                                             AND json_extract_string(
+                                                 activation.activation_payload_json,
+                                                 '$.receipt.policy_version'
+                                             ) = activation.policy_version
+                                             AND json_extract_string(
+                                                 activation.activation_payload_json,
+                                                 '$.receipt.before_member_set_sha256'
+                                             ) = activation.before_member_set_sha256
+                                             AND json_extract_string(
+                                                 activation.activation_payload_json,
+                                                 '$.receipt.after_member_set_sha256'
+                                             ) = activation.after_member_set_sha256
+                                             AND json_extract_string(
+                                                 activation.activation_payload_json,
+                                                 '$.post_event_reconciliation.source_url'
+                                             ) = 'https://www.ishares.com/us/products/239726/ishares-core-s-p-500-etf/latest-holdings.csv'
+                                             AND json_extract_string(
+                                                 activation.activation_payload_json,
+                                                 '$.post_event_reconciliation.review.fund'
+                                             ) = 'IVV'
+                                             AND json_extract_string(
+                                                 mismatch_detail_json,
+                                                 '$.accepted_activation_component_lag.holdings_as_of'
+                                             ) = json_extract_string(
+                                                 activation.activation_payload_json,
+                                                 '$.post_event_reconciliation.review.as_of'
+                                             )
+                                             AND CAST(json_extract_string(
+                                                 activation.activation_payload_json,
+                                                 '$.post_event_reconciliation.review.as_of'
+                                             ) AS DATE) BETWEEN activation.effective_date
+                                                 AND requested_coverage_through
+                                             AND (
+                                                 SELECT COUNT(*)
+                                                 FROM json_each(
+                                                     activation.activation_payload_json,
+                                                     '$.change_rows'
+                                                 )
+                                                 WHERE json_extract_string(
+                                                     value, '$.action'
+                                                 ) = 'addition'
+                                             ) > 0
+                                             AND (
+                                                 SELECT COUNT(*)
+                                                 FROM json_each(
+                                                     activation.activation_payload_json,
+                                                     '$.change_rows'
+                                                 )
+                                                 WHERE json_extract_string(
+                                                     value, '$.action'
+                                                 ) = 'addition'
+                                             ) = (
+                                                 SELECT COUNT(*)
+                                                 FROM json_each(
+                                                     activation.activation_payload_json,
+                                                     '$.change_rows'
+                                                 )
+                                                 WHERE json_extract_string(
+                                                     value, '$.action'
+                                                 ) = 'deletion'
+                                             )
+                                             AND NOT EXISTS (
+                                                 SELECT 1
+                                                 FROM json_each(
+                                                     activation.activation_payload_json,
+                                                     '$.change_rows'
+                                                 ) AS change
+                                                 WHERE json_extract_string(
+                                                     change.value, '$.action'
+                                                 ) NOT IN ('addition', 'deletion')
+                                                    OR COALESCE(json_extract_string(
+                                                        change.value, '$.ticker'
+                                                    ), '') = ''
+                                                    OR json_extract_string(
+                                                        change.value, '$.effective_date'
+                                                    ) IS DISTINCT FROM CAST(
+                                                        activation.effective_date AS VARCHAR
+                                                    )
+                                             )
+                                             AND NOT EXISTS (
+                                                 SELECT 1
+                                                 FROM json_each(
+                                                     activation.activation_payload_json,
+                                                     '$.change_rows'
+                                                 ) AS addition
+                                                 WHERE json_extract_string(
+                                                     addition.value, '$.action'
+                                                 ) = 'addition'
+                                                   AND NOT EXISTS (
+                                                       SELECT 1
+                                                       FROM json_each(
+                                                           activation.activation_payload_json,
+                                                           '$.post_event_reconciliation.review.tickers'
+                                                       ) AS holding
+                                                       WHERE UPPER(json_extract_string(
+                                                           holding.value, '$'
+                                                       )) = UPPER(json_extract_string(
+                                                           addition.value, '$.ticker'
+                                                       ))
+                                                   )
+                                             )
+                                             AND NOT EXISTS (
+                                                 SELECT 1
+                                                 FROM json_each(
+                                                     activation.activation_payload_json,
+                                                     '$.change_rows'
+                                                 ) AS deletion
+                                                 WHERE json_extract_string(
+                                                     deletion.value, '$.action'
+                                                 ) = 'deletion'
+                                                   AND EXISTS (
+                                                       SELECT 1
+                                                       FROM json_each(
+                                                           activation.activation_payload_json,
+                                                           '$.post_event_reconciliation.review.tickers'
+                                                       ) AS holding
+                                                       WHERE UPPER(json_extract_string(
+                                                           holding.value, '$'
+                                                       )) = UPPER(json_extract_string(
+                                                           deletion.value, '$.ticker'
+                                                       ))
+                                                   )
+                                             )
+                                         )
+                                     )
                                      AND json_extract_string(
                                          mismatch_detail_json,
                                          '$.accepted_activation_component_lag.effective_date'
@@ -5219,12 +5542,10 @@ class Store:
         if not normalized_purpose or len(normalized_purpose) > 80:
             raise ValueError("fundamental evidence purpose must contain 1-80 characters")
         if any(
-            not (character.isalnum() or character in "-_.:")
-            for character in normalized_purpose
+            not (character.isalnum() or character in "-_.:") for character in normalized_purpose
         ):
             raise ValueError(
-                "fundamental evidence purpose may contain only letters, numbers, "
-                "-, _, ., and :"
+                "fundamental evidence purpose may contain only letters, numbers, -, _, ., and :"
             )
         normalized_date = _as_date(decision_date) if decision_date is not None else None
         moment = now or datetime.now(UTC)
@@ -5278,9 +5599,7 @@ class Store:
             generation_id=str(row["generation_id"]),
             version_sequence=int(row["version_sequence"]),
             purpose=str(row["purpose"]),
-            decision_date=(
-                str(row["decision_date"]) if row["decision_date"] is not None else None
-            ),
+            decision_date=(str(row["decision_date"]) if row["decision_date"] is not None else None),
             captured_at=_utc_database_timestamp(row["captured_at"]),
         )
 
@@ -5388,9 +5707,7 @@ class Store:
             (security_id, str(as_of), str(as_of), str(as_of)),
         )
         if len(rows) > 1:
-            raise ValueError(
-                f"ambiguous later-verified issuer identity for {security_id}@{as_of}"
-            )
+            raise ValueError(f"ambiguous later-verified issuer identity for {security_id}@{as_of}")
         return bool(rows)
 
     def issuer_id_for_ticker(self, ticker: str, as_of: date | str) -> str | None:
@@ -5769,8 +6086,8 @@ class Store:
         if identity is None:
             return []
         identity_filter, identity_value = identity
-        generation_prefix, relation, generation_params = (
-            self._fundamental_evidence_relation(evidence_generation_id)
+        generation_prefix, relation, generation_params = self._fundamental_evidence_relation(
+            evidence_generation_id
         )
         sql = f"""
             {generation_prefix} ranked AS (
@@ -5809,8 +6126,8 @@ class Store:
         if identity is None:
             return []
         identity_filter, identity_value = identity
-        generation_prefix, relation, generation_params = (
-            self._fundamental_evidence_relation(evidence_generation_id)
+        generation_prefix, relation, generation_params = self._fundamental_evidence_relation(
+            evidence_generation_id
         )
         return self.query(
             f"""
@@ -5859,8 +6176,8 @@ class Store:
         if identity is None:
             return []
         identity_filter, identity_value = identity
-        generation_prefix, relation, generation_params = (
-            self._fundamental_evidence_relation(evidence_generation_id)
+        generation_prefix, relation, generation_params = self._fundamental_evidence_relation(
+            evidence_generation_id
         )
         placeholders = ",".join("?" for _ in normalized_metrics)
         return self.query(
@@ -6945,6 +7262,27 @@ def _utc_database_timestamp(value: Any) -> str:
     return moment.isoformat().replace("+00:00", "Z")
 
 
+def _utc_naive_database_timestamp(value: Any, *, label: str) -> datetime:
+    """Normalize aware instants before writing a zone-less DuckDB timestamp.
+
+    Existing naive values retain their legacy wall-time basis. New aware values
+    use UTC wall time instead of being cast through the host timezone.
+    """
+
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"{label} is not an ISO timestamp") from exc
+    else:
+        raise ValueError(f"{label} is not a timestamp")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return parsed
+    return parsed.astimezone(UTC).replace(tzinfo=None)
+
+
 def _as_date(value: date | str) -> date:
     if isinstance(value, date):
         return value
@@ -7169,11 +7507,13 @@ def _validate_raw_snapshot_registration(
     parsed_companyfacts = (
         snapshot.get("provider") == "sec-edgar"
         and snapshot.get("dataset") == "companyfacts"
-        and snapshot.get("parser_version") in {
+        and snapshot.get("parser_version")
+        in {
             "sec-companyfacts-v2",
             "sec-companyfacts-v2-storage-safe-v1",
             "sec-companyfacts-v2-storage-safe-v2",
             "sec-companyfacts-v3",
+            "sec-companyfacts-v4",
         }
         and parsed_count is not None
     )

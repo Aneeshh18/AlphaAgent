@@ -175,7 +175,7 @@ def initialize_paper_account(
     )
     payload: dict[str, Any] = {
         "account_schema_version": ACCOUNT_SCHEMA_VERSION,
-        "account_id": "us-qv-supervised-sandbox",
+        "account_id": f"paper-account-{uuid4().hex}",
         "market": "US",
         "universe_id": "sp500",
         "strategy": "qv",
@@ -290,9 +290,7 @@ def latest_paper_decision_date(
     )
     latest = rows[0]["date"] if rows else None
     if not isinstance(latest, date):
-        raise ValueError(
-            "no reviewed market close overlaps a certified investable-universe date"
-        )
+        raise ValueError("no reviewed market close overlaps a certified investable-universe date")
     return latest
 
 
@@ -593,9 +591,7 @@ def paper_proposal_timing_status(
     current = _as_utc_datetime(now)
     if current < executable_after:
         status = "waiting_for_scheduled_close"
-        detail = (
-            "Waiting for the scheduled U.S. close. The proposal cannot be simulated yet."
-        )
+        detail = "Waiting for the scheduled U.S. close. The proposal cannot be simulated yet."
     elif current >= expires_at:
         status = "expired"
         detail = (

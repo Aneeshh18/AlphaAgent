@@ -160,6 +160,22 @@ def test_paper_document_checksum_detects_manual_payload_edit(tmp_path) -> None:
         store.close()
 
 
+def test_new_paper_accounts_have_unique_stable_identities(tmp_path) -> None:
+    store = Store(tmp_path / "paper-identities.duckdb")
+    try:
+        first = initialize_paper_account(tmp_path / "first.json", store)
+        second = initialize_paper_account(tmp_path / "second.json", store)
+
+        assert first.payload["account_id"].startswith("paper-account-")
+        assert second.payload["account_id"].startswith("paper-account-")
+        assert first.payload["account_id"] != second.payload["account_id"]
+        assert read_paper_document(first.path).payload["account_id"] == (
+            first.payload["account_id"]
+        )
+    finally:
+        store.close()
+
+
 def test_decision_date_stops_at_universe_boundary_but_valuation_can_advance(tmp_path) -> None:
     store = Store(tmp_path / "paper-clocks.duckdb")
     try:

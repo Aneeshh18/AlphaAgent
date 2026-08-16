@@ -1,0 +1,2 @@
+provider,provider_symbol,security_id,data_start,data_end,mapping_status,verified_date,source
+tiingo,MNST,aios:bounded:sp500:mnst,2026-08-10,2026-08-11,verified,2026-08-14,https://api.tiingo.com/tiingo/daily/MNST/prices

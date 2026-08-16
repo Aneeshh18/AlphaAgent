@@ -109,6 +109,26 @@ TimeoutStartSec={DAILY_SERVICE_TIMEOUT}
             + "Restart=on-failure\n"
             + "RestartSec=5min\n"
             + f"ExecStart={serialized_launcher} refresh-us-daily\n"
+            # The unattended paper cycle runs here rather than on its own
+            # timer because it must follow the refresh (it needs the newly
+            # certified close) and because 02:00 America/New_York sits inside
+            # both the execution window of the proposal whose entry session
+            # just closed and the creation window of the next one.
+            #
+            # Leading '-' on purpose: a refused or skipped simulated fill must
+            # not fail the data-refresh unit. Paper progress and data freshness
+            # are separate concerns, and coupling them is what previously
+            # turned an ordinary governed refusal into a critical
+            # scheduler-failure incident.
+            #
+            # Deliberately WITHOUT --confirm-simulated. The unattended cycle
+            # stages the next proposal and reports what is due, but recording
+            # a fill stays a manual act: "Recording a simulated fill is the one
+            # deliberate, always-manual confirmation point ... nothing records
+            # automatically" (PRODUCT.md). Passing the confirmation flag from a
+            # timer would make the scheduler the approver, which is exactly the
+            # principle this system exists to hold.
+            + f"ExecStartPost=-{serialized_launcher} autopilot\n"
             + f"ExecStartPost={serialized_launcher} health\n"
             + f"ExecStartPost=-{launcher_value} alert-service-recovered --unit %n\n"
         ),

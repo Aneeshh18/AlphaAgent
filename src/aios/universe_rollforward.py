@@ -6,8 +6,9 @@ changes. It can extend an unchanged reviewed reference window only when:
 1. exact S&P Global press-archive responses are saved locally;
 2. no unreviewed S&P 500 constituent-change headline exists through the target;
 3. an independently maintained current-component file exactly matches the
-   reviewed ticker set; and
-4. its CIK values match the reviewed security-to-issuer references.
+   reviewed ticker set, or its exact pre-activation set is reconciled by one
+   accepted activation receipt plus dated IVV holdings evidence; and
+4. its overlapping CIK values match the reviewed security-to-issuer references.
 
 Any disagreement produces a review-required result and leaves every dated
 reference table unchanged.
@@ -45,9 +46,14 @@ NEW_YORK = ZoneInfo("America/New_York")
 MAX_ARCHIVE_PAGES = 10
 ARCHIVE_PAGE_SIZE = 100
 MAX_ARCHIVE_STALENESS_DAYS = 14
-MAX_ACTIVATED_COMPONENT_LAG_DAYS = 7
 MINIMUM_MEMBERS = 450
 MAXIMUM_MEMBERS = 550
+IVV_HOLDINGS_URL = (
+    "https://www.ishares.com/us/products/239726/"
+    "ishares-core-s-p-500-etf/latest-holdings.csv"
+)
+COMPONENT_DIVERGENCE_MODE = "receipt_bound_component_divergence"
+COMPONENT_RECONCILIATION_BASIS = "accepted_activation_receipt+dated_ivv_holdings"
 PRESS_ARCHIVE_PARSER_VERSION = "spglobal-press-archive-html-v1"
 CHANGE_ANNOUNCEMENT_PARSER_VERSION = "spglobal-constituent-change-html-v1"
 COMPONENT_SNAPSHOT_PARSER_VERSION = "sp500-components-csv-v1"
@@ -111,6 +117,7 @@ class UniverseRollForwardResult:
     official_release_count: int
     relevant_release_count: int
     identity_mismatch_count: int
+    accepted_activation_component_lag: dict[str, object] | None
     rows_extended: dict[str, int]
     detail: str
 
@@ -138,6 +145,11 @@ def roll_forward_sp500_coverage(
     prior, members = _bounded_coverage_boundary(db, universe_id)
     target = latest_reviewed_market_close(db, today=completed_new_york_date)
     if target <= prior:
+        accepted_component_divergence = _latest_accepted_component_divergence(
+            db,
+            universe_id=universe_id,
+            through=prior,
+        )
         return UniverseRollForwardResult(
             status="up_to_date",
             universe_id=universe_id,
@@ -150,6 +162,7 @@ def roll_forward_sp500_coverage(
             official_release_count=0,
             relevant_release_count=0,
             identity_mismatch_count=0,
+            accepted_activation_component_lag=accepted_component_divergence,
             rows_extended={},
             detail="Certified universe coverage already reaches the newest eligible market close.",
         )
@@ -181,7 +194,7 @@ def roll_forward_sp500_coverage(
         component_tickers = set(component_by_ticker)
         missing_components = sorted(reviewed_tickers - component_tickers)
         unexpected_components = sorted(component_tickers - reviewed_tickers)
-        activated_component_lag = _accepted_activation_component_lag(
+        accepted_component_divergence = _accepted_activation_component_divergence(
             db,
             universe_id=universe_id,
             target=target,
@@ -191,10 +204,10 @@ def roll_forward_sp500_coverage(
             unexpected_components=unexpected_components,
         )
         unresolved_missing_components = (
-            [] if activated_component_lag is not None else missing_components
+            [] if accepted_component_divergence is not None else missing_components
         )
         unresolved_unexpected_components = (
-            [] if activated_component_lag is not None else unexpected_components
+            [] if accepted_component_divergence is not None else unexpected_components
         )
 
         cik_mismatches: list[dict[str, str]] = []
@@ -255,7 +268,10 @@ def roll_forward_sp500_coverage(
             "reviewed_successor_lineage_matches": successor_lineage_matches[:100],
             "future_effective_releases": future_changes[:100],
             "candidate_release_parse_errors": candidate_errors[:100],
-            "accepted_activation_component_lag": activated_component_lag,
+            # Keep the historical JSON key so accepted activation plans and
+            # review tooling remain schema-compatible. The nested mode makes
+            # the no-expiry policy explicit for new attestations.
+            "accepted_activation_component_lag": accepted_component_divergence,
         }
         mismatch_count = (
             len(unresolved_missing_components)
@@ -265,12 +281,12 @@ def roll_forward_sp500_coverage(
         )
         accepted = not blocking_candidates and mismatch_count == 0
         status = "accepted_no_change" if accepted else "blocked_review_required"
-        if accepted and activated_component_lag is not None:
+        if accepted and accepted_component_divergence is not None:
             detail = (
                 "No new constituent change is effective through the requested date. "
-                "The independent component file still reflects the exact pre-activation "
-                "set, and its bounded lag is reconciled by an immutable activation "
-                "receipt plus dated post-event holdings evidence."
+                "The community component file still reflects the receipt's exact "
+                "pre-activation set; the divergence is reconciled by that immutable "
+                "activation receipt plus dated post-event IVV holdings evidence."
             )
         elif accepted and future_changes:
             detail = (
@@ -339,6 +355,7 @@ def roll_forward_sp500_coverage(
             official_release_count=len(releases),
             relevant_release_count=len(blocking_candidates),
             identity_mismatch_count=mismatch_count,
+            accepted_activation_component_lag=accepted_component_divergence,
             rows_extended=counts,
             detail=detail,
         )
@@ -951,7 +968,43 @@ def _blocked_detail(
     return "; ".join(parts) + ". Manual event review is required; no dates were extended."
 
 
-def _accepted_activation_component_lag(
+def _latest_accepted_component_divergence(
+    store: Store,
+    *,
+    universe_id: str,
+    through: date,
+) -> dict[str, object] | None:
+    """Return the newest accepted attestation's visible component-source mode."""
+
+    rows = store.query(
+        """
+        SELECT mismatch_detail_json
+        FROM universe_coverage_attestations
+        WHERE universe_id = ?
+          AND status = 'accepted_no_change'
+          AND requested_coverage_through <= ?
+        ORDER BY requested_coverage_through DESC, checked_at DESC, created_at DESC
+        LIMIT 1
+        """,
+        (universe_id, through),
+    )
+    if not rows:
+        return None
+    try:
+        mismatch = json.loads(str(rows[0]["mismatch_detail_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("latest universe attestation mismatch detail is invalid") from exc
+    if not isinstance(mismatch, dict):
+        raise ValueError("latest universe attestation mismatch detail is invalid")
+    reconciliation = mismatch.get("accepted_activation_component_lag")
+    if reconciliation is None:
+        return None
+    if not isinstance(reconciliation, dict):
+        raise ValueError("latest universe component reconciliation is invalid")
+    return dict(reconciliation)
+
+
+def _accepted_activation_component_divergence(
     store: Store,
     *,
     universe_id: str,
@@ -961,14 +1014,15 @@ def _accepted_activation_component_lag(
     missing_components: list[str],
     unexpected_components: list[str],
 ) -> dict[str, object] | None:
-    """Reconcile one short-lived, receipt-proved component-provider lag.
+    """Reconcile one exact, receipt-proved community-source divergence.
 
-    The independent component file remains the normal current-set gate.  For at
-    most seven calendar days after a governed activation, it may still expose the
-    exact pre-event set.  We accept that lag only when the immutable receipt
-    hashes both complete sets, its event rows explain every difference, and its
-    dated post-event IVV evidence confirms every addition and deletion.  Any
-    extra or missing symbol continues to fail closed.
+    The community component file remains the normal current-set cross-check. It
+    may expose the exact pre-event set only when an immutable accepted activation
+    receipt hashes both complete sets, its event rows explain every difference,
+    and dated post-event IVV evidence confirms every addition and deletion. The
+    rule has no clock-based expiry: exact pre/post set identity naturally limits
+    it to one outstanding event. Any later event or unrelated difference changes
+    those sets and continues to fail closed.
     """
 
     if not missing_components and not unexpected_components:
@@ -987,10 +1041,18 @@ def _accepted_activation_component_lag(
             payload = json.loads(str(row["activation_payload_json"]))
             receipt = payload["receipt"]
             changes = payload["change_rows"]
-            reconciliation = payload["post_event_reconciliation"]["review"]
+            post_event_reconciliation = payload["post_event_reconciliation"]
+            reconciliation = post_event_reconciliation["review"]
             effective = date.fromisoformat(str(receipt["effective_date"]))
             holdings_as_of = date.fromisoformat(str(reconciliation["as_of"]))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            not isinstance(receipt, dict)
+            or not isinstance(changes, list)
+            or not isinstance(post_event_reconciliation, dict)
+            or not isinstance(reconciliation, dict)
+        ):
             continue
         if (
             receipt.get("activation_id") != row["activation_id"]
@@ -1000,11 +1062,20 @@ def _accepted_activation_component_lag(
                 "governed-sp500-constituent-activation."
             )
             or not effective <= holdings_as_of <= target
-            or (target - effective).days > MAX_ACTIVATED_COMPONENT_LAG_DAYS
+            or post_event_reconciliation.get("source_url") != IVV_HOLDINGS_URL
+            or reconciliation.get("fund") != "IVV"
             or _canonical_list_sha256(component_tickers)
             != receipt.get("before_member_set_sha256")
             or _canonical_list_sha256(reviewed_tickers)
             != receipt.get("after_member_set_sha256")
+        ):
+            continue
+        if any(
+            not isinstance(change, dict)
+            or change.get("action") not in {"addition", "deletion"}
+            or not isinstance(change.get("ticker"), str)
+            or str(change.get("effective_date")) != effective.isoformat()
+            for change in changes
         ):
             continue
         additions = sorted(
@@ -1017,9 +1088,12 @@ def _accepted_activation_component_lag(
             for change in changes
             if isinstance(change, dict) and change.get("action") == "deletion"
         )
-        holdings_tickers = {
-            str(ticker).upper() for ticker in reconciliation.get("tickers", [])
-        }
+        holdings = reconciliation.get("tickers")
+        if not isinstance(holdings, list) or any(
+            not isinstance(ticker, str) or not ticker.strip() for ticker in holdings
+        ):
+            continue
+        holdings_tickers = {ticker.upper() for ticker in holdings}
         if (
             not additions
             or len(additions) != len(deletions)
@@ -1030,6 +1104,8 @@ def _accepted_activation_component_lag(
         ):
             continue
         return {
+            "mode": COMPONENT_DIVERGENCE_MODE,
+            "reconciliation_basis": COMPONENT_RECONCILIATION_BASIS,
             "activation_id": str(row["activation_id"]),
             "effective_date": effective.isoformat(),
             "holdings_as_of": holdings_as_of.isoformat(),

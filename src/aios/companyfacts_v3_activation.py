@@ -50,9 +50,9 @@ from aios.companyfacts_replay import (
 from aios.ingest.edgar import (
     COMPANYFACTS_NEXT_PARSER_VERSION,
     COMPANYFACTS_PARSER_VERSION,
+    COMPANYFACTS_REVENUE_POLICY_PARSER_VERSION,
     canonical_sec_fundamental_row_sha256,
-    parse_sec_companyfacts_response,
-    parse_sec_companyfacts_response_v3,
+    replay_sec_companyfacts_response,
 )
 from aios.operations import BackupResult, create_local_backup, verify_local_backup
 from aios.raw_snapshots import canonical_parsed_rows_sha256
@@ -241,6 +241,12 @@ def _read_activation_plan(path: Path, expected_plan_sha256: str) -> dict[str, An
         raise ValueError("companyfacts v3 activation plan failed integrity check")
     if stored_hash != expected_plan_sha256:
         raise ValueError("companyfacts v3 activation plan does not match the expected hash")
+    if (
+        payload.get("policy_version") != ACTIVATION_POLICY_VERSION
+        or payload.get("source_parser_version") != COMPANYFACTS_PARSER_VERSION
+        or payload.get("target_parser_version") != COMPANYFACTS_NEXT_PARSER_VERSION
+    ):
+        raise ValueError("companyfacts v3 activation plan has an invalid policy transition")
     return payload
 
 
@@ -267,11 +273,23 @@ def _verify_live_cas(root: Path, database: Path, plan: dict[str, Any]) -> None:
 def _apply_activation_transaction(
     *, store: Store, root: Path, plan: dict[str, Any], plan_sha256: str
 ) -> CompanyFactsV3ActivationResult:
+    source_parser_version = str(plan["source_parser_version"])
+    target_parser_version = str(plan["target_parser_version"])
+    if (source_parser_version, target_parser_version) not in {
+        (COMPANYFACTS_PARSER_VERSION, COMPANYFACTS_NEXT_PARSER_VERSION),
+        (
+            COMPANYFACTS_NEXT_PARSER_VERSION,
+            COMPANYFACTS_REVENUE_POLICY_PARSER_VERSION,
+        ),
+    }:
+        raise ValueError("unsupported governed Company Facts parser transition")
+    target_label = target_parser_version.removeprefix("sec-companyfacts-")
+    activation_label = f"companyfacts {target_label}"
     if store.query(
         "SELECT 1 FROM companyfacts_v3_activations WHERE activation_plan_sha256 = ?",
         (plan_sha256,),
     ):
-        raise ValueError("this companyfacts v3 activation plan is already activated")
+        raise ValueError(f"this {activation_label} activation plan is already activated")
 
     activation_run_id = plan["activation_run_id"]
     decision_as_of = plan["as_of"]
@@ -290,32 +308,38 @@ def _apply_activation_transaction(
                 raise ValueError(f"activation evidence vanished for {issuer_id}")
             payload = verified_companyfacts_payload_bytes(root, evidence)
 
-            v2_rows = parse_sec_companyfacts_response(payload)
-            v3_rows = parse_sec_companyfacts_response_v3(payload)
-            v3_provider_hash = canonical_parsed_rows_sha256(v3_rows)
+            source_rows, _source_metadata = replay_sec_companyfacts_response(
+                payload,
+                parser_version=source_parser_version,
+            )
+            target_rows, _target_metadata = replay_sec_companyfacts_response(
+                payload,
+                parser_version=target_parser_version,
+            )
+            target_provider_hash = canonical_parsed_rows_sha256(target_rows)
             expected = plan["expected_after"][issuer_id]
             if (
-                len(v3_rows) != expected["provider_row_count"]
-                or v3_provider_hash != expected["provider_rows_sha256"]
+                len(target_rows) != expected["provider_row_count"]
+                or target_provider_hash != expected["provider_rows_sha256"]
             ):
                 raise ValueError(
-                    f"activation CAS rejected: v3 replay for {issuer_id} no longer "
+                    f"activation CAS rejected: {target_label} replay for {issuer_id} no longer "
                     "matches the reviewed plan"
                 )
 
-            v2_by_key = {_storage_key(row): row for row in v2_rows}
-            v3_by_key = {_storage_key(row): row for row in v3_rows}
-            removed_keys = sorted(set(v2_by_key) - set(v3_by_key))
+            source_by_key = {_storage_key(row): row for row in source_rows}
+            target_by_key = {_storage_key(row): row for row in target_rows}
+            removed_keys = sorted(set(source_by_key) - set(target_by_key))
             to_upsert = [
                 row
-                for key, row in v3_by_key.items()
-                if key not in v2_by_key or _economics(v2_by_key[key]) != _economics(row)
+                for key, row in target_by_key.items()
+                if key not in source_by_key or _economics(source_by_key[key]) != _economics(row)
             ]
             expected_delta = expected["delta"]
             if (
-                len(to_upsert) - len(v3_by_key.keys() - v2_by_key.keys())
+                len(to_upsert) - len(target_by_key.keys() - source_by_key.keys())
                 != expected_delta["changed_storage_keys"]
-                or len(v3_by_key.keys() - v2_by_key.keys())
+                or len(target_by_key.keys() - source_by_key.keys())
                 != expected_delta["added_storage_keys"]
                 or len(removed_keys) != expected_delta["removed_storage_keys"]
             ):
@@ -359,7 +383,7 @@ def _apply_activation_transaction(
                     "security_id": None,
                     "ingest_run_id": activation_run_id,
                     "source_snapshot_id": evidence["snapshot_id"],
-                    "source_rowset_sha256": v3_provider_hash,
+                    "source_rowset_sha256": target_provider_hash,
                     "source_row_sha256": canonical_sec_fundamental_row_sha256(row),
                     "source_fact_locator": row.get("source_fact_locator"),
                     "period_end": row["period_end"],
@@ -418,7 +442,7 @@ def _apply_activation_transaction(
                 (str(row["period_end"]), str(row["as_of_date"]), str(row["metric"])): row
                 for row in live_rows
             }
-            expected_by_key = {**v2_by_key, **v3_by_key}
+            expected_by_key = {**source_by_key, **target_by_key}
             for key in removed_keys:
                 expected_by_key.pop(key, None)
             if set(live_by_key) != set(expected_by_key) or any(
@@ -427,12 +451,12 @@ def _apply_activation_transaction(
             ):
                 raise ValueError(
                     f"activation write for {issuer_id} does not match the "
-                    "intended v3 relation"
+                    f"intended {target_label} relation"
                 )
 
-            counts["added"] += len(v3_by_key.keys() - v2_by_key.keys())
+            counts["added"] += len(target_by_key.keys() - source_by_key.keys())
             counts["removed"] += len(removed_keys)
-            counts["changed"] += len(to_upsert) - len(v3_by_key.keys() - v2_by_key.keys())
+            counts["changed"] += len(to_upsert) - len(target_by_key.keys() - source_by_key.keys())
             counts["issuers"] += 1
 
         generation_id = f"fundamental-generation-{uuid4().hex}"
@@ -444,7 +468,12 @@ def _apply_activation_transaction(
             SELECT ?, COALESCE(MAX(version_sequence), 0), ?, CAST(? AS DATE), ?
             FROM fundamental_versions
             """,
-            (generation_id, ACTIVATION_GENERATION_PURPOSE, decision_as_of, activated_at),
+            (
+                generation_id,
+                f"companyfacts_{target_label.replace('-', '_')}_activation",
+                decision_as_of,
+                activated_at,
+            ),
         )
         version_sequence_boundary = int(
             store.query(
@@ -455,7 +484,7 @@ def _apply_activation_transaction(
         )
 
         store.record_ingest(
-            source=f"governed-companyfacts-v3-activation:{plan_sha256[:16]}",
+            source=(f"governed-companyfacts-{target_label}-activation:{plan_sha256[:16]}"),
             table_name="fundamentals",
             rows_inserted=counts["added"] + counts["changed"],
             rows_rejected=counts["removed"],
@@ -465,7 +494,7 @@ def _apply_activation_transaction(
             run_id=activation_run_id,
         )
 
-        activation_id = f"cfv3-activation-{uuid4().hex}"
+        activation_id = f"cf{target_label}-activation-{uuid4().hex}"
         activation_payload = {
             "activation_id": activation_id,
             "plan_sha256": plan_sha256,
@@ -478,7 +507,7 @@ def _apply_activation_transaction(
             "version_sequence_boundary": version_sequence_boundary,
             "backup_manifest_sha256": plan["backup"]["manifest_sha256"],
             "actor": plan["actor"],
-            "policy_version": ACTIVATION_POLICY_VERSION,
+            "policy_version": plan["policy_version"],
             "activated_at": activated_at.isoformat(),
             "safety": {
                 "paper_mutated": False,
@@ -505,12 +534,12 @@ def _apply_activation_transaction(
                 activation_run_id,
                 decision_as_of,
                 _canonical(plan["issuer_ids"]),
-                COMPANYFACTS_PARSER_VERSION,
-                COMPANYFACTS_NEXT_PARSER_VERSION,
+                source_parser_version,
+                target_parser_version,
                 _canonical(activation_payload),
                 plan["backup"]["manifest_sha256"],
                 plan["actor"],
-                ACTIVATION_POLICY_VERSION,
+                plan["policy_version"],
                 _canonical(counts),
                 generation_id,
                 version_sequence_boundary,

@@ -40,6 +40,7 @@ from aios.dashboard_components import (  # noqa: E402
     render_control_list,
     render_metric_strip,
     render_pipeline_stepper,
+    render_specimen_list,
     section_header,
 )
 from aios.dashboard_copy import (  # noqa: E402
@@ -489,7 +490,6 @@ def _checks_by_key(report: dict) -> dict[str, dict]:
 
 
 def _page_header(
-    eyebrow: str,
     title: str,
     note: str,
     *,
@@ -497,7 +497,6 @@ def _page_header(
 ) -> None:
     """Compatibility wrapper around the shared page-header component."""
     page_header(
-        eyebrow,
         title,
         note,
         metadata=chips or (),
@@ -1051,7 +1050,7 @@ def _render_coverage_chart(report: dict) -> None:
         orientation="h",
         text="Observed",
         color="Status",
-        color_discrete_map={"Pass": "#437426", "Warn": "#805C1F", "Fail": "#A73D39"},
+        color_discrete_map={"Pass": "#265B19", "Warn": "#5A4815", "Fail": "#7F2C28"},
         hover_data={"Coverage %": ":.1f", "Observed": True, "Status": True},
     )
     figure.add_vline(x=95, line_dash="dot", line_color="#73726C")
@@ -1109,8 +1108,7 @@ def _render_overview(report: dict) -> None:
     targets = proposal.get("targets", []) if isinstance(proposal, dict) else []
 
     _page_header(
-        "AIOS Home",
-        "Investment Command Center",
+        "Overview",
         "Know what is safe, what needs attention, and the next permitted action.",
         chips=[
             (
@@ -1205,32 +1203,18 @@ def _render_overview(report: dict) -> None:
                     st.info("No reviewed paper-trial proposal is available.")
                 else:
                     identity_labels = load_identity_labels(report["certified_research_through"])
-                    target_table = pd.DataFrame(
+                    render_specimen_list(
                         [
                             {
-                                "Rank": row["factor_rank"],
-                                "Company": company_symbol_label(
-                                    identity_labels.get(row["ticker"]), row["ticker"]
-                                ),
-                                "Score": round(row["qv_score"], 1),
-                                "Target": f"{row['target_weight']:.1%}",
-                                "Business group": row["sector"],
+                                "rank": row["factor_rank"],
+                                "name": identity_labels.get(row["ticker"]) or row["ticker"],
+                                "symbol": row["ticker"],
+                                "sector": row["sector"],
+                                "target": f"{row['target_weight']:.1%}",
+                                "score": round(row["qv_score"], 1),
                             }
                             for row in targets[:5]
                         ]
-                    )
-                    st.dataframe(
-                        target_table,
-                        hide_index=True,
-                        width="stretch",
-                        height=270,
-                        row_height=44,
-                        column_config={
-                            "Rank": st.column_config.NumberColumn(width="small", format="%d"),
-                            "Company": st.column_config.TextColumn(width="large"),
-                            "Score": st.column_config.NumberColumn(width="small", format="%.1f"),
-                            "Target": st.column_config.TextColumn(width="small"),
-                        },
                     )
                     st.caption(
                         f"Showing 5 of {len(targets)} simulation-only targets. "
@@ -1424,7 +1408,7 @@ def _render_ranked_universe(
             "Company": "Company",
             "Ticker": "Symbol",
             grade_col: "Grade",
-            score_col: "Overall",
+            score_col: "Overall Score",
             "Quality": "Quality",
             "Value": "Value",
             "Momentum": "Trend",
@@ -1449,7 +1433,7 @@ def _render_ranked_universe(
         "Rank",
         "Company",
         "Symbol",
-        "Overall",
+        "Overall Score",
         "Quality",
         "Value",
         "Grade",
@@ -1470,7 +1454,7 @@ def _render_ranked_universe(
             "Company": st.column_config.TextColumn(width="large"),
             "Symbol": st.column_config.TextColumn(width="small"),
             "Grade": st.column_config.TextColumn(width="small"),
-            "Overall": st.column_config.NumberColumn(width="small", format="%.1f"),
+            "Overall Score": st.column_config.NumberColumn(width="small", format="%.1f"),
             "Quality": st.column_config.NumberColumn(width="small", format="%.1f"),
             "Value": st.column_config.NumberColumn(width="small", format="%.1f"),
             "Trend": st.column_config.NumberColumn(width="small", format="%.1f"),
@@ -1513,7 +1497,7 @@ def _render_research_coverage(
                     "Company": "Company",
                     "Ticker": "Symbol",
                     grade_col: "Grade",
-                    score_col: "Overall",
+                    score_col: "Overall Score",
                 }
             )
             st.dataframe(shortlist, hide_index=True, width="stretch")
@@ -1652,7 +1636,6 @@ def _render_system_control(report: dict) -> None:
     """Render a source-backed operator workspace without fabricated telemetry."""
     _page_header(
         "Operations",
-        "Operations & System Health",
         "Start with active exceptions, then verify automation, data flow, safeguards, "
         "and alert delivery from source-backed local evidence.",
         chips=[
@@ -1713,32 +1696,53 @@ def _render_system_control(report: dict) -> None:
         first_critical_case = critical_cases[0]
         case_label = "case" if critical_case_count == 1 else "cases"
         review_verb = "requires" if critical_case_count == 1 else "require"
-        st.error(
-            f"{critical_case_count} critical data-quality {case_label} {review_verb} review. "
-            f"First issue: {first_critical_case.get('title') or 'Untitled data-quality case'}. "
-            "Next action: inspect its governed evidence using the command below."
-        )
         case_id = str(first_critical_case.get("case_id") or "").strip()
-        if case_id:
-            with st.expander("Technical inspection command"):
-                st.code(f"aios anomaly-show {case_id}", language="bash")
+        render_action_notice(
+            label="Action needed",
+            title=f"{critical_case_count} critical data-quality {case_label} {review_verb} review",
+            detail=(
+                f"First issue: {first_critical_case.get('title') or 'Untitled data-quality case'}. "
+                "Inspect its governed evidence using the command below."
+            ),
+            tone="danger",
+            technical_command=f"aios anomaly-show {case_id}" if case_id else None,
+            key="system_notice",
+        )
     elif critical_incidents:
         first_critical = critical_incidents[0]
         incident_label = "incident" if critical_count == 1 else "incidents"
         review_verb = "requires" if critical_count == 1 else "require"
-        st.error(
-            f"{critical_count} critical operating {incident_label} {review_verb} review. "
-            f"First issue: {first_critical.get('title') or 'Untitled operating incident'}. "
-            "Next action: inspect the first incident using the technical command below."
-        )
         incident_id = str(first_critical.get("incident_id") or "").strip()
-        if incident_id:
-            with st.expander("Technical inspection command"):
-                st.code(f"aios alert-show {incident_id}", language="bash")
+        render_action_notice(
+            label="Action needed",
+            title=f"{critical_count} critical operating {incident_label} {review_verb} review",
+            detail=(
+                f"First issue: {first_critical.get('title') or 'Untitled operating incident'}. "
+                "Inspect the first incident using the technical command below."
+            ),
+            tone="danger",
+            technical_command=f"aios alert-show {incident_id}" if incident_id else None,
+            key="system_notice",
+        )
     elif daily_cycle and daily_cycle.get("state") in {"failed", "interrupted"}:
-        st.error(f"The latest guarded daily workflow did not finish safely. {next_review}")
+        render_action_notice(
+            label="Action needed",
+            title="The latest guarded daily workflow did not finish safely",
+            detail=next_review,
+            tone="danger",
+            key="system_notice",
+        )
     else:
-        st.info(f"Next required human review: {next_review}")
+        render_action_notice(
+            label="Next review",
+            title=next_review,
+            detail=(
+                "Ordered by priority across research, safeguards, and alert delivery — "
+                "this is the one item to check next."
+            ),
+            tone="info",
+            key="system_notice",
+        )
 
     _render_kpi_grid(
         [
@@ -2050,104 +2054,9 @@ def _render_system_control(report: dict) -> None:
         )
 
     section_header(
-        "Research experiments",
-        "Every registered backtest binds exact code, data and policy identity "
-        "before its metrics are trusted. Comparison never picks a winner; "
-        "activation still goes through the existing forward-restart gate.",
-    )
-    try:
-        experiments = load_research_experiments()
-    except Exception as exc:
-        st.error("Research experiment registry could not be read.")
-        with st.expander("Technical detail"):
-            st.code(str(exc))
-        experiments = []
-    if experiments:
-
-        def _pct(value: object) -> str:
-            return f"{value:.1%}" if isinstance(value, (int, float)) else "unknown"
-
-        experiment_table = pd.DataFrame(
-            [
-                {
-                    "Recorded": pd.to_datetime(
-                        doc.get("recorded_at"), errors="coerce"
-                    ).strftime("%b %d, %Y %H:%M UTC"),
-                    "Experiment ID": doc["experiment_id"],
-                    "Purpose": str(doc.get("purpose", "")).title(),
-                    "Factor model": doc.get("parameters", {}).get("factor_model", "unknown"),
-                    "Universe": doc.get("parameters", {}).get("universe_id", "unknown"),
-                    "Regime return": _pct(
-                        doc.get("metrics", {}).get("regime", {}).get("cumulative_return")
-                    ),
-                    "Baseline return": _pct(
-                        doc.get("metrics", {}).get("baseline", {}).get("cumulative_return")
-                    ),
-                    "Policy": (
-                        f"{doc.get('policy', {}).get('name', 'unknown')} · "
-                        f"{doc.get('policy', {}).get('version', 'unknown')}"
-                        if doc.get("policy")
-                        else "unversioned"
-                    ),
-                    "Commit": (
-                        f"{doc.get('git', {}).get('commit_sha', 'unknown')[:8]}"
-                        f"{' (dirty)' if doc.get('git', {}).get('dirty') else ''}"
-                    ),
-                }
-                for doc in sorted(
-                    experiments, key=lambda d: d.get("recorded_at", ""), reverse=True
-                )
-            ]
-        )
-        st.dataframe(experiment_table, hide_index=True, width="stretch", height=280)
-        st.caption(
-            "Compare two or more with `aios compare-experiments ID ID...`; "
-            "register a new one with `aios backtest-qv --register-experiment "
-            "--experiment-purpose exploratory|frozen|holdout`."
-        )
-    else:
-        st.info("No research experiment has been registered yet.")
-
-    section_header(
-        "Data pipeline",
-        "Recent source outcomes stay visible so a failed or partial ingest cannot hide.",
-    )
-    ingests = operations.get("ingests", [])
-    if ingests:
-        ingest_table = pd.DataFrame(ingests)
-        ingest_table["finished_at"] = pd.to_datetime(
-            ingest_table["finished_at"], errors="coerce"
-        ).dt.strftime("%b %d, %Y %H:%M")
-        ingest_table["status"] = ingest_table["status"].fillna("unknown").str.title()
-        ingest_table = ingest_table.rename(
-            columns={
-                "source": "Source",
-                "table_name": "Dataset",
-                "rows_inserted": "Rows added",
-                "rows_rejected": "Rows rejected",
-                "finished_at": "Finished",
-                "status": "Status",
-                "error": "Failure detail",
-            }
-        )[
-            [
-                "Finished",
-                "Source",
-                "Dataset",
-                "Status",
-                "Rows added",
-                "Rows rejected",
-                "Failure detail",
-            ]
-        ]
-        st.dataframe(ingest_table, hide_index=True, width="stretch", height=470)
-    else:
-        st.info("No ingest outcomes have been recorded.")
-
-    section_header(
-        "Incidents & alert delivery",
-        "Incidents are the authoritative local record. Channel-neutral alert copies are "
-        "stored separately and can never replace or hide that history.",
+        "Incidents",
+        "The authoritative local record. Acknowledge and resolve only through the CLI; "
+        "this table never repairs source data or changes paper state.",
     )
     if operations.get("incident_error"):
         st.error("Local incident history could not be opened.")
@@ -2178,111 +2087,218 @@ def _render_system_control(report: dict) -> None:
     else:
         st.success("No local operating incidents have been recorded.")
 
-    notification_summary = operations.get("notification_summary", {})
-    notifications = operations.get("notifications", [])
-    held_count = int(notification_summary.get("held", 0))
-    waiting_count = int(notification_summary.get("pending", 0)) + int(
-        notification_summary.get("leased", 0)
-    )
-    dead_letter_count = int(notification_summary.get("dead_letter", 0))
-    notification_route = operations.get("notification_route")
-    email_enabled = notification_route is not None and notification_route.get("state") == "enabled"
-    email_config_matches = bool(operations.get("email_config_matches"))
-    email_scheduler = operations.get("email_scheduler", {})
-    email_worker_enabled = bool(email_scheduler.get("enabled"))
-    email_worker_verified = bool(email_scheduler.get("runtime_verified"))
-    alert_status, waiting_status = st.columns(2)
-    alert_status.metric(
-        "Email alerts",
-        (
-            "On"
-            if email_enabled
-            and email_config_matches
-            and email_worker_enabled
-            and email_worker_verified
-            else "Off"
-        ),
-    )
-    waiting_status.metric("Messages waiting", waiting_count)
+    with st.expander("Diagnostics — experiments, data pipeline, and alert delivery"):
+        section_header(
+            "Research experiments",
+            "Every registered backtest binds exact code, data and policy identity "
+            "before its metrics are trusted. Comparison never picks a winner; "
+            "activation still goes through the existing forward-restart gate.",
+        )
+        try:
+            experiments = load_research_experiments()
+        except Exception as exc:
+            st.error("Research experiment registry could not be read.")
+            with st.popover("Technical detail"):
+                st.code(str(exc))
+            experiments = []
+        if experiments:
 
-    if operations.get("notification_error"):
-        st.error("Alert-delivery history could not be opened. Incident history remains available.")
-        with st.expander("Technical detail"):
-            st.code(operations["notification_error"])
-    else:
-        if (
-            email_enabled
-            and email_config_matches
-            and email_worker_enabled
-            and email_worker_verified
-        ):
-            st.success(
-                "Email is enabled for new incident changes. Existing held messages "
-                f"remain local ({held_count} held)."
-            )
-        elif email_enabled and email_config_matches and not email_worker_enabled:
-            st.error(
-                "The email route is enabled, but its optional delivery timer is off. "
-                "No queued message will be sent automatically. Run `aios email-status`."
-            )
-        elif email_enabled and email_config_matches:
-            st.warning(
-                "Email is configured and enabled, but this dashboard could not verify "
-                "the delivery timer. Check `aios email-status` in a desktop terminal."
-            )
-        elif email_enabled:
-            st.error(
-                "Email is enabled, but the current local SMTP configuration no longer "
-                "matches the activated route. Delivery fails closed. Run `aios email-status`."
-            )
-        else:
-            st.info(
-                "External email is off. Incidents are still saved locally, and "
-                f"{held_count} alert copy/copies are deliberately held on this computer."
-            )
-        if waiting_count:
-            st.warning(
-                f"{waiting_count} message(s) are waiting to retry. Local incident history is safe."
-            )
-        if dead_letter_count:
-            st.error(
-                f"{dead_letter_count} message(s) could not be delivered after the "
-                "bounded retry policy. Run `aios notifications --needs-review`."
-            )
-        if notifications:
-            state_labels = {
-                "held": "Held locally",
-                "pending": "Waiting to retry",
-                "leased": "Sending now",
-                "delivered": "Sent",
-                "dead_letter": "Needs review",
-            }
-            notification_table = pd.DataFrame(
+            def _pct(value: object) -> str:
+                return f"{value:.1%}" if isinstance(value, (int, float)) else "unknown"
+
+            experiment_table = pd.DataFrame(
                 [
                     {
-                        "Created": pd.to_datetime(row["created_at"], errors="coerce").strftime(
-                            "%b %d, %Y %H:%M UTC"
+                        "Recorded": pd.to_datetime(
+                            doc.get("recorded_at"), errors="coerce"
+                        ).strftime("%b %d, %Y %H:%M UTC"),
+                        "Experiment ID": doc["experiment_id"],
+                        "Purpose": str(doc.get("purpose", "")).title(),
+                        "Factor model": doc.get("parameters", {}).get("factor_model", "unknown"),
+                        "Universe": doc.get("parameters", {}).get("universe_id", "unknown"),
+                        "Regime return": _pct(
+                            doc.get("metrics", {}).get("regime", {}).get("cumulative_return")
                         ),
-                        "State": state_labels.get(row["state"], row["state"]),
-                        "Event": str(row["event_type"]).replace("_", " ").title(),
-                        "Severity": str(row["severity"]).title(),
-                        "Summary": row["title"],
-                        "Attempts": row["attempt_count"],
-                        "Notification ID": row["notification_id"],
+                        "Baseline return": _pct(
+                            doc.get("metrics", {}).get("baseline", {}).get("cumulative_return")
+                        ),
+                        "Policy": (
+                            f"{doc.get('policy', {}).get('name', 'unknown')} · "
+                            f"{doc.get('policy', {}).get('version', 'unknown')}"
+                            if doc.get("policy")
+                            else "unversioned"
+                        ),
+                        "Commit": (
+                            f"{doc.get('git', {}).get('commit_sha', 'unknown')[:8]}"
+                            f"{' (dirty)' if doc.get('git', {}).get('dirty') else ''}"
+                        ),
                     }
-                    for row in notifications
+                    for doc in sorted(
+                        experiments, key=lambda d: d.get("recorded_at", ""), reverse=True
+                    )
                 ]
             )
-            st.dataframe(
-                notification_table,
-                hide_index=True,
-                width="stretch",
-                height=300,
-            )
+            st.dataframe(experiment_table, hide_index=True, width="stretch", height=280)
             st.caption(
-                "Inspect one message with `aios notification-show NOTIFICATION_REF`. "
-                "Sending and retry controls stay outside this read-only dashboard."
+                "Compare two or more with `aios compare-experiments ID ID...`; "
+                "register a new one with `aios backtest-qv --register-experiment "
+                "--experiment-purpose exploratory|frozen|holdout`."
             )
+        else:
+            st.info("No research experiment has been registered yet.")
+
+        section_header(
+            "Data pipeline",
+            "Recent source outcomes stay visible so a failed or partial ingest cannot hide.",
+        )
+        ingests = operations.get("ingests", [])
+        if ingests:
+            ingest_table = pd.DataFrame(ingests)
+            ingest_table["finished_at"] = pd.to_datetime(
+                ingest_table["finished_at"], errors="coerce"
+            ).dt.strftime("%b %d, %Y %H:%M")
+            ingest_table["status"] = ingest_table["status"].fillna("unknown").str.title()
+            ingest_table = ingest_table.rename(
+                columns={
+                    "source": "Source",
+                    "table_name": "Dataset",
+                    "rows_inserted": "Rows added",
+                    "rows_rejected": "Rows rejected",
+                    "finished_at": "Finished",
+                    "status": "Status",
+                    "error": "Failure detail",
+                }
+            )[
+                [
+                    "Finished",
+                    "Source",
+                    "Dataset",
+                    "Status",
+                    "Rows added",
+                    "Rows rejected",
+                    "Failure detail",
+                ]
+            ]
+            st.dataframe(ingest_table, hide_index=True, width="stretch", height=470)
+        else:
+            st.info("No ingest outcomes have been recorded.")
+
+        section_header(
+            "Alert delivery",
+            "Channel-neutral alert copies are stored separately from incident history "
+            "and can never replace or hide it.",
+        )
+        notification_summary = operations.get("notification_summary", {})
+        notifications = operations.get("notifications", [])
+        held_count = int(notification_summary.get("held", 0))
+        waiting_count = int(notification_summary.get("pending", 0)) + int(
+            notification_summary.get("leased", 0)
+        )
+        dead_letter_count = int(notification_summary.get("dead_letter", 0))
+        notification_route = operations.get("notification_route")
+        email_enabled = (
+            notification_route is not None and notification_route.get("state") == "enabled"
+        )
+        email_config_matches = bool(operations.get("email_config_matches"))
+        email_scheduler = operations.get("email_scheduler", {})
+        email_worker_enabled = bool(email_scheduler.get("enabled"))
+        email_worker_verified = bool(email_scheduler.get("runtime_verified"))
+        alert_status, waiting_status = st.columns(2)
+        alert_status.metric(
+            "Email alerts",
+            (
+                "On"
+                if email_enabled
+                and email_config_matches
+                and email_worker_enabled
+                and email_worker_verified
+                else "Off"
+            ),
+        )
+        waiting_status.metric("Messages waiting", waiting_count)
+
+        if operations.get("notification_error"):
+            st.error(
+                "Alert-delivery history could not be opened. "
+                "Incident history remains available."
+            )
+            with st.popover("Technical detail"):
+                st.code(operations["notification_error"])
+        else:
+            if (
+                email_enabled
+                and email_config_matches
+                and email_worker_enabled
+                and email_worker_verified
+            ):
+                st.success(
+                    "Email is enabled for new incident changes. Existing held messages "
+                    f"remain local ({held_count} held)."
+                )
+            elif email_enabled and email_config_matches and not email_worker_enabled:
+                st.error(
+                    "The email route is enabled, but its optional delivery timer is off. "
+                    "No queued message will be sent automatically. Run `aios email-status`."
+                )
+            elif email_enabled and email_config_matches:
+                st.warning(
+                    "Email is configured and enabled, but this dashboard could not verify "
+                    "the delivery timer. Check `aios email-status` in a desktop terminal."
+                )
+            elif email_enabled:
+                st.error(
+                    "Email is enabled, but the current local SMTP configuration no longer "
+                    "matches the activated route. Delivery fails closed. Run `aios email-status`."
+                )
+            else:
+                st.info(
+                    "External email is off. Incidents are still saved locally, and "
+                    f"{held_count} alert copy/copies are deliberately held on this computer."
+                )
+            if waiting_count:
+                st.warning(
+                    f"{waiting_count} message(s) are waiting to retry. "
+                    "Local incident history is safe."
+                )
+            if dead_letter_count:
+                st.error(
+                    f"{dead_letter_count} message(s) could not be delivered after the "
+                    "bounded retry policy. Run `aios notifications --needs-review`."
+                )
+            if notifications:
+                state_labels = {
+                    "held": "Held locally",
+                    "pending": "Waiting to retry",
+                    "leased": "Sending now",
+                    "delivered": "Sent",
+                    "dead_letter": "Needs review",
+                }
+                notification_table = pd.DataFrame(
+                    [
+                        {
+                            "Created": pd.to_datetime(
+                                row["created_at"], errors="coerce"
+                            ).strftime("%b %d, %Y %H:%M UTC"),
+                            "State": state_labels.get(row["state"], row["state"]),
+                            "Event": str(row["event_type"]).replace("_", " ").title(),
+                            "Severity": str(row["severity"]).title(),
+                            "Summary": row["title"],
+                            "Attempts": row["attempt_count"],
+                            "Notification ID": row["notification_id"],
+                        }
+                        for row in notifications
+                    ]
+                )
+                st.dataframe(
+                    notification_table,
+                    hide_index=True,
+                    width="stretch",
+                    height=300,
+                )
+                st.caption(
+                    "Inspect one message with `aios notification-show NOTIFICATION_REF`. "
+                    "Sending and retry controls stay outside this read-only dashboard."
+                )
 
 
 # ----------------------------------------------------------------------
@@ -2342,7 +2358,11 @@ st.sidebar.divider()
 st.sidebar.markdown('<div class="aios-nav-label">Navigate</div>', unsafe_allow_html=True)
 raw_view = _query_value("view")
 requested_view_slug = raw_view if raw_view in _VIEWS_BY_SLUG else "today"
-default_workspace = "research" if requested_view_slug == "company" else requested_view_slug
+# Company Detail is a drill-down from Research, not a top-level workspace. Leave the
+# nav radio unselected while on it instead of pre-selecting Research: a radio option
+# that is already selected does not fire on click, so pre-selecting it would make
+# clicking "Research" from Company Detail a dead click with no way back via the sidebar.
+default_workspace = None if requested_view_slug == "company" else requested_view_slug
 workspace_marker = "_aios_workspace_route"
 if "workspace" not in st.session_state or st.session_state.get(workspace_marker) != raw_view:
     st.session_state["workspace"] = default_workspace
@@ -2355,8 +2375,7 @@ workspace_slug = st.sidebar.radio(
     key="workspace",
     label_visibility="collapsed",
 )
-workspace_slug = str(workspace_slug or default_workspace)
-if workspace_slug != default_workspace:
+if workspace_slug is not None and workspace_slug != default_workspace:
     view_slug = workspace_slug
     st.query_params["view"] = view_slug
     st.session_state[workspace_marker] = view_slug
@@ -2396,7 +2415,6 @@ if view == VIEW_HOME:
 # ----------------------------------------------------------------------
 elif view == VIEW_RANKINGS:
     _page_header(
-        "Research",
         "Research Universe",
         "Screen the reviewed market, compare factor trade-offs, and open a company "
         "only when its evidence deserves deeper work.",
@@ -2557,7 +2575,6 @@ elif view == VIEW_RANKINGS:
 # ----------------------------------------------------------------------
 elif view == VIEW_DETAILS:
     _page_header(
-        "Research / Company evidence",
         "Company Detail",
         "Trace one company from its relative score to the evidence and explicit gaps "
         "behind that result.",
@@ -2847,7 +2864,6 @@ elif view == VIEW_DETAILS:
 # ----------------------------------------------------------------------
 elif view == VIEW_PAPER:
     _page_header(
-        "Simulation-only portfolio",
         "Paper Trial",
         "Follow the governed proposal, holdings, modeled costs, and daily account value "
         "without connecting to a broker.",
@@ -2857,8 +2873,10 @@ elif view == VIEW_PAPER:
         ],
     )
     st.caption(
-        "Read-only dashboard. A local record is possible only through the separately "
-        "confirmed CLI workflow after every prospective governance check passes."
+        "Read-only except for one deliberate action: recording a simulated fill, below, "
+        "when its review passes. That action runs the exact same governed checks as the "
+        "CLI `paper-execute` command. Every other change — creating a proposal, starting a "
+        "trial, adjusting policy — happens only through the CLI."
     )
     try:
         monitor = load_paper_monitor()
@@ -3012,7 +3030,7 @@ elif view == VIEW_PAPER:
                         "Stock symbol": row["ticker"],
                         "Simulated target": f"{row['target_weight']:.1%}",
                         "Broad business group": row["sector"],
-                        "Research score": round(row["qv_score"], 1),
+                        "Overall Score": round(row["qv_score"], 1),
                     }
                     for row in proposal["targets"]
                 ]
@@ -3147,7 +3165,6 @@ elif view == VIEW_SYSTEM:
 # ----------------------------------------------------------------------
 elif view == VIEW_METHOD:
     _page_header(
-        "How AIOS Works",
         "Methodology & Sources",
         "Understand the scoring model, point-in-time protections, source boundaries, and "
         "current operating limits.",

@@ -51,6 +51,7 @@ COMPANYFACTS_LEGACY_PARSER_VERSION = "sec-companyfacts-v2"
 COMPANYFACTS_STORAGE_SAFE_V1_PARSER_VERSION = "sec-companyfacts-v2-storage-safe-v1"
 COMPANYFACTS_PARSER_VERSION = "sec-companyfacts-v2-storage-safe-v2"
 COMPANYFACTS_NEXT_PARSER_VERSION = "sec-companyfacts-v3"
+COMPANYFACTS_REVENUE_POLICY_PARSER_VERSION = "sec-companyfacts-v4"
 DEI_ENTITY_SHARES_CONCEPT = "EntityCommonStockSharesOutstanding"
 SUBMISSIONS_CAPTURE_PARSER_VERSION = "sec-submissions-capture-v1"
 SUBMISSIONS_PARSER_VERSION = "sec-submissions-v2"
@@ -116,6 +117,54 @@ METRIC_CONCEPTS: dict[str, list[str]] = {
     ],
 }
 
+# Revenue v4 is intentionally issuer-scoped. These identities are the reviewed
+# cohort from the retained 2026-08-13 Company Facts replay. Broadly appending
+# any of these concepts would silently change unrelated issuers and would make
+# the historical v2/v3 contracts unreplayable.
+_REVENUE_BASE_CONCEPTS = tuple(METRIC_CONCEPTS["revenue"])
+_REVENUE_ASSESSED_TAX_CIKS = frozenset(
+    {
+        900_075,  # CPRT
+        9_389,  # BALL
+        1_035_443,  # ARE
+        1_086_222,  # AKAM
+        1_174_922,  # WYNN
+        1_374_310,  # CBOE
+        1_513_761,  # NCLH
+        1_535_527,  # CRWD
+        1_637_459,  # KHC
+        45_012,  # HAL
+        48_465,  # HRL
+        52_988,  # J
+        728_535,  # JBHT
+        878_927,  # ODFL
+        91_419,  # SJM
+        109_198,  # TJX
+    }
+)
+_REVENUE_UTILITY_CIKS = frozenset({72_903, 753_308, 936_340, 1_326_160})
+_REVENUE_EQUITY_RESIDENTIAL_CIK = 906_107
+_REVENUE_VALERO_CIK = 1_035_002
+_REVENUE_SUPPRESSED_CIKS = frozenset(
+    {
+        35_527,  # FITB: components only
+        72_971,  # WFC: net-of-interest basis
+        886_982,  # GS: net-of-interest basis
+        895_421,  # MS: net-of-interest basis
+        92_230,  # TFC: components only
+        1_281_761,  # RF: components only
+        1_601_712,  # SYF: components only
+        1_841_666,  # APA: extension taxonomy only
+    }
+)
+_ASSESSED_TAX_REVENUE_CONCEPT = "RevenueFromContractWithCustomerIncludingAssessedTax"
+_UTILITY_REVENUE_CONCEPT = "RegulatedAndUnregulatedOperatingRevenue"
+_REIT_LEASE_REVENUE_CONCEPT = "OperatingLeaseLeaseIncome"
+_VLO_EXCISE_TAX_CONCEPT = "ExciseAndSalesTaxes"
+_VLO_DERIVED_REVENUE_CONCEPT = (
+    "RevenueFromContractWithCustomerIncludingAssessedTaxLessExciseAndSalesTaxes"
+)
+
 # Company Facts groups concepts by taxonomy. Concepts default to `us-gaap`;
 # this deliberately narrow override is the only cross-taxonomy selection.
 # Do not add weighted-average share concepts here: they represent a period
@@ -123,6 +172,36 @@ METRIC_CONCEPTS: dict[str, list[str]] = {
 _METRIC_CONCEPT_TAXONOMIES: dict[tuple[str, str], str] = {
     ("shares_out", DEI_ENTITY_SHARES_CONCEPT): "dei",
 }
+
+
+def _v4_metric_concepts(metric: str, cik: int) -> list[str]:
+    """Return the reviewed v4 concept policy without mutating older parsers."""
+
+    if metric != "revenue":
+        return list(METRIC_CONCEPTS[metric])
+    if cik in _REVENUE_SUPPRESSED_CIKS:
+        return []
+    if cik in _REVENUE_UTILITY_CIKS:
+        return [_UTILITY_REVENUE_CONCEPT, *_REVENUE_BASE_CONCEPTS]
+    if cik in _REVENUE_ASSESSED_TAX_CIKS:
+        return [*_REVENUE_BASE_CONCEPTS, _ASSESSED_TAX_REVENUE_CONCEPT]
+    if cik == _REVENUE_EQUITY_RESIDENTIAL_CIK:
+        return [*_REVENUE_BASE_CONCEPTS, _REIT_LEASE_REVENUE_CONCEPT]
+    return list(_REVENUE_BASE_CONCEPTS)
+
+
+def _v4_revenue_policy_label(cik: int) -> str:
+    if cik in _REVENUE_SUPPRESSED_CIKS:
+        return "suppressed_incomparable_or_unavailable"
+    if cik in _REVENUE_UTILITY_CIKS:
+        return "reviewed_utility_total"
+    if cik in _REVENUE_ASSESSED_TAX_CIKS:
+        return "reviewed_assessed_tax_total"
+    if cik == _REVENUE_EQUITY_RESIDENTIAL_CIK:
+        return "reviewed_reit_lease_total"
+    if cik == _REVENUE_VALERO_CIK:
+        return "reviewed_assessed_tax_less_excise"
+    return "base_concept_precedence"
 
 
 def _cik_zero_padded(cik: int) -> str:
@@ -625,6 +704,8 @@ def _merge_concepts(
     concepts: list[str],
     *,
     taxonomy_aware: bool,
+    annotate_concept_priority: bool = False,
+    priority_offset: int = 0,
 ) -> tuple[str | None, list[dict[str, Any]]]:
     """Merge ALL candidate concepts into one provider-row list.
 
@@ -643,7 +724,7 @@ def _merge_concepts(
     seen: set[tuple[str | None, str | None, str | None]] = set()
     merged: list[dict[str, Any]] = []
     used_concept: str | None = None
-    for concept in concepts:
+    for concept_index, concept in enumerate(concepts):
         taxonomy = (
             _METRIC_CONCEPT_TAXONOMIES.get((metric, concept), "us-gaap")
             if taxonomy_aware
@@ -674,23 +755,24 @@ def _merge_concepts(
                 ]
         for r in concept_rows:
             if taxonomy_aware:
-                merged.append(
-                    {
-                        **r,
-                        _SOURCE_FACT_LOCATOR_KEY: {
-                            "taxonomy": taxonomy,
-                            "concept": concept,
-                            "accession": str(r.get("accn") or "").strip(),
-                            "form": str(r.get("form") or "").strip(),
-                            "start": r.get("start"),
-                            "end": r.get("end"),
-                            "filed": r.get("filed"),
-                            "fiscal_period": r.get("fp"),
-                            "fiscal_year": r.get("fy"),
-                            "frame": r.get("frame"),
-                        },
-                    }
-                )
+                merged_row = {
+                    **r,
+                    _SOURCE_FACT_LOCATOR_KEY: {
+                        "taxonomy": taxonomy,
+                        "concept": concept,
+                        "accession": str(r.get("accn") or "").strip(),
+                        "form": str(r.get("form") or "").strip(),
+                        "start": r.get("start"),
+                        "end": r.get("end"),
+                        "filed": r.get("filed"),
+                        "fiscal_period": r.get("fp"),
+                        "fiscal_year": r.get("fy"),
+                        "frame": r.get("frame"),
+                    },
+                }
+                if annotate_concept_priority:
+                    merged_row[_CONCEPT_PRIORITY_KEY] = priority_offset + concept_index
+                merged.append(merged_row)
                 continue
             key = (r.get("accn"), r.get("end"), r.get("start"))
             if key in seen:
@@ -698,6 +780,102 @@ def _merge_concepts(
             seen.add(key)
             merged.append(r)
     return used_concept, merged
+
+
+def _v4_valero_revenue_rows(
+    namespaces: dict[str, dict[str, Any]],
+    *,
+    priority: int,
+) -> list[dict[str, Any]]:
+    """Derive reviewed VLO revenue net of assessed excise and sales taxes."""
+
+    _gross_concept, gross_rows = _merge_concepts(
+        namespaces,
+        "revenue",
+        [_ASSESSED_TAX_REVENUE_CONCEPT],
+        taxonomy_aware=True,
+    )
+    _tax_concept, tax_rows = _merge_concepts(
+        namespaces,
+        "revenue",
+        [_VLO_EXCISE_TAX_CONCEPT],
+        taxonomy_aware=True,
+    )
+
+    def context_key(row: dict[str, Any]) -> tuple[Any, ...]:
+        return tuple(
+            row.get(field)
+            for field in (
+                "accn",
+                "start",
+                "end",
+                "filed",
+                "form",
+                "fp",
+                "fy",
+                "unit",
+            )
+        )
+
+    def unique_economics(
+        rows: list[dict[str, Any]],
+    ) -> dict[tuple[Any, ...], dict[str, Any]]:
+        grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+        for row in rows:
+            grouped.setdefault(context_key(row), []).append(row)
+        selected: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for key, candidates in grouped.items():
+            values = {float(candidate["val"]) for candidate in candidates}
+            if len(values) != 1:
+                continue
+            selected[key] = min(
+                candidates,
+                key=lambda candidate: json.dumps(
+                    candidate,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ),
+            )
+        return selected
+
+    gross_by_context = unique_economics(gross_rows)
+    tax_by_context = unique_economics(tax_rows)
+    derived: list[dict[str, Any]] = []
+    for key in sorted(
+        gross_by_context.keys() & tax_by_context.keys(),
+        key=lambda item: tuple(str(value) for value in item),
+    ):
+        gross = gross_by_context[key]
+        tax = tax_by_context[key]
+        net_revenue = float(gross["val"]) - float(tax["val"])
+        if net_revenue < 0:
+            continue
+        derived.append(
+            {
+                **gross,
+                "val": net_revenue,
+                _CONCEPT_PRIORITY_KEY: priority,
+                _SOURCE_FACT_LOCATOR_KEY: {
+                    "taxonomy": "derived:us-gaap",
+                    "concept": _VLO_DERIVED_REVENUE_CONCEPT,
+                    "accession": str(gross.get("accn") or "").strip(),
+                    "form": str(gross.get("form") or "").strip(),
+                    "start": gross.get("start"),
+                    "end": gross.get("end"),
+                    "filed": gross.get("filed"),
+                    "fiscal_period": gross.get("fp"),
+                    "fiscal_year": gross.get("fy"),
+                    "frame": gross.get("frame"),
+                    "inputs": [
+                        gross[_SOURCE_FACT_LOCATOR_KEY],
+                        tax[_SOURCE_FACT_LOCATOR_KEY],
+                    ],
+                },
+            }
+        )
+    return derived
 
 
 # Metrics that represent a FLOW over a period (YTD-cumulative in EDGAR).
@@ -736,6 +914,7 @@ _INTERIM_FACT_FORMS = {
     "8-K/A",
 }
 _SOURCE_FACT_LOCATOR_KEY = "_source_fact_locator"
+_CONCEPT_PRIORITY_KEY = "_concept_priority"
 _FUNDAMENTAL_STORAGE_KEY_FIELDS = (
     "cik",
     "period_end",
@@ -757,6 +936,8 @@ def _expected_metric_unit(metric: str) -> str:
 def _metric_context_rows(
     metric: str,
     raw_rows: list[dict[str, Any]],
+    *,
+    prefer_concept_precedence: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
     """Select exact v3 contexts before they can collide in storage.
 
@@ -832,7 +1013,23 @@ def _metric_context_rows(
             if annual
             else min(int(span) for span, _row in spanned)
         )
-        selected.extend(row for span, row in spanned if span == target_span)
+        context_rows = [row for span, row in spanned if span == target_span]
+        if prefer_concept_precedence:
+            priorities = [
+                int(row[_CONCEPT_PRIORITY_KEY])
+                for row in context_rows
+                if _CONCEPT_PRIORITY_KEY in row
+            ]
+            if priorities:
+                preferred = min(priorities)
+                preferred_rows = [
+                    row
+                    for row in context_rows
+                    if int(row.get(_CONCEPT_PRIORITY_KEY, preferred)) == preferred
+                ]
+                rejected += len(context_rows) - len(preferred_rows)
+                context_rows = preferred_rows
+        selected.extend(context_rows)
     return selected, rejected
 
 
@@ -844,6 +1041,7 @@ def _select_metric_storage_rows(
     rows: list[dict[str, Any]],
     *,
     preserve_legacy_winner: bool = False,
+    prefer_concept_precedence: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
     """Produce at most one unambiguous row for every database key.
 
@@ -865,6 +1063,20 @@ def _select_metric_storage_rows(
     rejected_conflicts = 0
     for key in sorted(grouped, key=lambda item: tuple(str(value) for value in item)):
         candidates = grouped[key]
+        if prefer_concept_precedence:
+            priorities = [
+                int(candidate[_CONCEPT_PRIORITY_KEY])
+                for candidate in candidates
+                if _CONCEPT_PRIORITY_KEY in candidate
+            ]
+            if priorities:
+                preferred = min(priorities)
+                candidates = [
+                    candidate
+                    for candidate in candidates
+                    if int(candidate.get(_CONCEPT_PRIORITY_KEY, preferred)) == preferred
+                ]
+
         def economic_value(candidate: dict[str, Any]) -> tuple[Any, ...]:
             return (
                 candidate.get("fiscal_period"),
@@ -909,6 +1121,7 @@ def _select_metric_storage_rows(
             ),
         ).copy()
         selected_row.pop(_SOURCE_FACT_LOCATOR_KEY, None)
+        selected_row.pop(_CONCEPT_PRIORITY_KEY, None)
         if source_locators:
             selected_row["source_fact_locator"] = json.dumps(
                 [json.loads(locator) for locator in source_locators],
@@ -985,6 +1198,8 @@ def _companyfacts_provider_rows(
     taxonomy_aware: bool = False,
     storage_safe: bool = False,
     preserve_legacy_winner: bool = False,
+    revenue_policy_v4: bool = False,
+    prefer_concept_precedence: bool = False,
 ) -> tuple[list[dict[str, Any]], int, int, int]:
     """Parse the identity-neutral, PIT-safe rows consumed from Company Facts."""
     facts = _validate_companyfacts_payload(payload, cik)
@@ -1002,18 +1217,36 @@ def _companyfacts_provider_rows(
     rejected_future_periods = 0
     rejected_contexts = 0
 
-    for metric, concepts in METRIC_CONCEPTS.items():
+    for metric, legacy_concepts in METRIC_CONCEPTS.items():
+        prefer_metric_concept_precedence = (
+            prefer_concept_precedence and metric == "revenue"
+        )
+        concepts = _v4_metric_concepts(metric, cik) if revenue_policy_v4 else legacy_concepts
+        if not concepts:
+            continue
         _concept, raw_rows = _merge_concepts(
             namespaces,
             metric,
             concepts,
             taxonomy_aware=taxonomy_aware,
+            annotate_concept_priority=prefer_metric_concept_precedence,
         )
+        if revenue_policy_v4 and metric == "revenue" and cik == _REVENUE_VALERO_CIK:
+            raw_rows.extend(
+                _v4_valero_revenue_rows(
+                    namespaces,
+                    priority=-1,
+                )
+            )
         if not raw_rows:
             continue
 
         if taxonomy_aware:
-            raw_rows, context_rejections = _metric_context_rows(metric, raw_rows)
+            raw_rows, context_rejections = _metric_context_rows(
+                metric,
+                raw_rows,
+                prefer_concept_precedence=prefer_metric_concept_precedence,
+            )
             rejected_contexts += context_rejections
             if not raw_rows:
                 continue
@@ -1066,6 +1299,8 @@ def _companyfacts_provider_rows(
                 provider_row[_SOURCE_FACT_LOCATOR_KEY] = raw_row[
                     _SOURCE_FACT_LOCATOR_KEY
                 ]
+            if prefer_metric_concept_precedence:
+                provider_row[_CONCEPT_PRIORITY_KEY] = raw_row[_CONCEPT_PRIORITY_KEY]
             rows.append(provider_row)
 
     rejected_storage_conflicts = 0
@@ -1073,6 +1308,7 @@ def _companyfacts_provider_rows(
         rows, rejected_storage_conflicts = _select_metric_storage_rows(
             rows,
             preserve_legacy_winner=preserve_legacy_winner,
+            prefer_concept_precedence=prefer_concept_precedence,
         )
     return (
         rows,
@@ -1107,18 +1343,32 @@ def replay_sec_companyfacts_response(
         taxonomy_aware = False
         storage_safe = False
         preserve_legacy_winner = False
+        revenue_policy_v4 = False
+        prefer_concept_precedence = False
     elif parser_version == COMPANYFACTS_STORAGE_SAFE_V1_PARSER_VERSION:
         taxonomy_aware = False
         storage_safe = True
         preserve_legacy_winner = False
+        revenue_policy_v4 = False
+        prefer_concept_precedence = False
     elif parser_version == COMPANYFACTS_PARSER_VERSION:
         taxonomy_aware = False
         storage_safe = True
         preserve_legacy_winner = True
+        revenue_policy_v4 = False
+        prefer_concept_precedence = False
     elif parser_version == COMPANYFACTS_NEXT_PARSER_VERSION:
         taxonomy_aware = True
         storage_safe = True
         preserve_legacy_winner = False
+        revenue_policy_v4 = False
+        prefer_concept_precedence = False
+    elif parser_version == COMPANYFACTS_REVENUE_POLICY_PARSER_VERSION:
+        taxonomy_aware = True
+        storage_safe = True
+        preserve_legacy_winner = False
+        revenue_policy_v4 = True
+        prefer_concept_precedence = True
     else:
         raise ValueError(
             f"unsupported SEC Company Facts parser version: {parser_version}"
@@ -1134,6 +1384,8 @@ def replay_sec_companyfacts_response(
         taxonomy_aware=taxonomy_aware,
         storage_safe=storage_safe,
         preserve_legacy_winner=preserve_legacy_winner,
+        revenue_policy_v4=revenue_policy_v4,
+        prefer_concept_precedence=prefer_concept_precedence,
     )
     metadata = {
         "parser_version": parser_version,
@@ -1141,6 +1393,8 @@ def replay_sec_companyfacts_response(
         "rows_rejected_context": rejected_contexts,
         "rows_rejected_storage_conflict": rejected_storage_conflicts,
     }
+    if revenue_policy_v4:
+        metadata["revenue_policy"] = _v4_revenue_policy_label(cik)
     metadata["rejection_codes"] = _fundamental_rejection_codes(metadata)
     metadata["rows_rejected"] = (
         rejected_future_periods
@@ -1180,6 +1434,15 @@ def parse_sec_companyfacts_response_v3(payload: bytes) -> list[dict[str, Any]]:
     rows, _metadata = replay_sec_companyfacts_response(
         payload,
         parser_version=COMPANYFACTS_NEXT_PARSER_VERSION,
+    )
+    return rows
+
+
+def parse_sec_companyfacts_response_v4(payload: bytes) -> list[dict[str, Any]]:
+    """Replay the reviewed issuer-scoped revenue and precedence policy."""
+    rows, _metadata = replay_sec_companyfacts_response(
+        payload,
+        parser_version=COMPANYFACTS_REVENUE_POLICY_PARSER_VERSION,
     )
     return rows
 

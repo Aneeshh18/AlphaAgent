@@ -144,9 +144,12 @@ def test_yfinance_fetch_fails_closed_after_bounded_empty_retries(monkeypatch) ->
 
     assert rows == []
     assert attempts == prices.settings.yfinance_max_attempts
+    # Derived from the configured attempt count rather than hardcoded, so
+    # tuning `yfinance_max_attempts` cannot silently invalidate this contract.
+    # One exponential backoff sleep separates each pair of attempts.
     assert sleeps == [
-        prices.settings.yfinance_retry_base_sec,
-        prices.settings.yfinance_retry_base_sec * 2,
+        prices.settings.yfinance_retry_base_sec * (2**exponent)
+        for exponent in range(prices.settings.yfinance_max_attempts - 1)
     ]
 
 
@@ -1475,13 +1478,19 @@ def test_identity_price_ingest_preserves_transition_and_coverage(monkeypatch, tm
         _install_reference_rows(store)
         store.upsert_fundamentals([_fundamental(100, issuer_id=ISSUER_ID, security_id=SECURITY_ID)])
 
+        captured: dict[str, str] = {}
+
+        def fake_fetch_provider_prices(*_args, yfinance_parser_version, **_kwargs):
+            captured["parser_version"] = yfinance_parser_version
+            return [
+                {"ticker": "NEW", "date": "2024-06-28", "close": 99.0},
+                {"ticker": "NEW", "date": "2024-07-01", "close": 100.0},
+            ]
+
         monkeypatch.setattr(
             prices,
             "fetch_provider_prices",
-            lambda *_args, **_kwargs: [
-                {"ticker": "NEW", "date": "2024-06-28", "close": 99.0},
-                {"ticker": "NEW", "date": "2024-07-01", "close": 100.0},
-            ],
+            fake_fetch_provider_prices,
         )
         inserted = prices.ingest_security_prices(
             SECURITY_ID,
@@ -1489,9 +1498,11 @@ def test_identity_price_ingest_preserves_transition_and_coverage(monkeypatch, tm
             start="2024-01-01",
             end="2025-01-01",
             store=store,
+            yfinance_parser_version=prices.YFINANCE_CORPORATE_ACTION_PARSER_VERSION,
         )
 
         assert inserted == 2
+        assert captured["parser_version"] == prices.YFINANCE_CORPORATE_ACTION_PARSER_VERSION
         stored = store.query(
             "SELECT ticker, date, security_id, provider_symbol FROM prices ORDER BY date"
         )

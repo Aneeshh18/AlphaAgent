@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
+from datetime import date
 
 import pytest
 
 from aios.operator_preflight import (
     CAPABILITY_KEYS,
     OperatorAction,
+    _load_universe_evidence,
     build_operator_preflight,
 )
 
@@ -106,6 +108,52 @@ def test_preflight_is_deterministic_scoped_and_checksum_protected() -> None:
         separators=(",", ":"),
     ).encode()
     assert observed == hashlib.sha256(canonical).hexdigest()
+
+
+def test_preflight_surfaces_receipt_bound_component_divergence() -> None:
+    reconciliation = {
+        "mode": "receipt_bound_component_divergence",
+        "reconciliation_basis": "accepted_activation_receipt+dated_ivv_holdings",
+        "activation_id": "uca-event-test",
+        "effective_date": "2026-07-25",
+        "holdings_as_of": "2026-07-25",
+        "additions": ["GAM"],
+        "deletions": ["BBB"],
+        "lag_days": 20,
+    }
+
+    class AttestationStore:
+        def query(self, _sql, _params):
+            return [
+                {
+                    "attestation_id": "uca-review-test",
+                    "requested_coverage_through": date(2026, 8, 14),
+                    "component_source_url": "https://example.test/components.csv",
+                    "mismatch_detail_json": json.dumps(
+                        {"accepted_activation_component_lag": reconciliation}
+                    ),
+                }
+            ]
+
+    universe_evidence = _load_universe_evidence(
+        AttestationStore(),
+        date(2026, 8, 14),
+    )
+    result = build_operator_preflight(
+        _readiness(),
+        _monitor(),
+        _operations(),
+        universe_evidence=universe_evidence,
+    )
+
+    assert result.universe_evidence == universe_evidence
+    assert result.to_envelope()["universe_evidence"] == {
+        "attestation_id": "uca-review-test",
+        "coverage_through": "2026-08-14",
+        "component_source_url": "https://example.test/components.csv",
+        "component_source_mode": "reconciled_divergence",
+        "accepted_activation_component_lag": reconciliation,
+    }
 
 
 def test_open_window_routes_to_one_exact_read_only_review_command() -> None:

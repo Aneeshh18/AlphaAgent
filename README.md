@@ -92,7 +92,7 @@ cp .env.example .env
 
 # Optional: create and verify a timestamped database + paper-state backup
 .venv/bin/aios backup
-.venv/bin/aios restore-drill backups/aios-YYYYMMDDTHHMMSSZ
+.venv/bin/aios restore-drill backups/aios-YYYYMMDDTHHMMSSZ-XXXXXXXX
 # Restore requires a verified backup and an explicit --confirm-restore flag
 # When release notes require a local schema upgrade, use the single guarded
 # workflow; it backs up first, rehearses on exact copies, then migrates live:

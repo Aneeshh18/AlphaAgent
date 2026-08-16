@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
+from math import isfinite
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -1181,7 +1182,11 @@ class AlertStore:
         timestamp = _timestamp(now)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            incident_id = self._resolve_incident_id(connection, incident_id)
+            incident_id = self._resolve_incident_id(
+                connection,
+                incident_id,
+                allow_prefix=False,
+            )
             row = connection.execute(
                 "SELECT * FROM incidents WHERE incident_id = ?", (incident_id,)
             ).fetchone()
@@ -1248,7 +1253,11 @@ class AlertStore:
         timestamp = _timestamp(now)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            incident_id = self._resolve_incident_id(connection, incident_id)
+            incident_id = self._resolve_incident_id(
+                connection,
+                incident_id,
+                allow_prefix=False,
+            )
             row = connection.execute(
                 "SELECT * FROM incidents WHERE incident_id = ?", (incident_id,)
             ).fetchone()
@@ -1334,7 +1343,11 @@ class AlertStore:
         timestamp = _timestamp(now)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            incident_id = self._resolve_incident_id(connection, incident_id)
+            incident_id = self._resolve_incident_id(
+                connection,
+                incident_id,
+                allow_prefix=False,
+            )
             row = connection.execute(
                 "SELECT * FROM incidents WHERE incident_id = ?", (incident_id,)
             ).fetchone()
@@ -3290,12 +3303,20 @@ class AlertStore:
         if str(case["fingerprint"]) in {str(value) for value in fingerprints}:
             raise ValueError("anomaly verification scan still detects this fingerprint")
         if required:
-            if case_rule != "sec_fundamentals_coverage_missing@1.0.0":
+            if case_rule == "sec_fundamentals_coverage_missing@1.0.0":
+                _validate_anomaly_clearance_proof(scan_evidence, case)
+            elif case_rule == "price_action_mismatch@1.0.0":
+                _validate_price_action_clearance_proof(
+                    scan_evidence,
+                    case,
+                    finding_source_boundary=finding_scan["source_boundary_at"],
+                    verification_source_boundary=scan["source_boundary_at"],
+                )
+            else:
                 raise ValueError(
                     "corrected anomaly resolution has no registered "
                     f"clearance-proof contract for rule: {case_rule}"
                 )
-            _validate_anomaly_clearance_proof(scan_evidence, case)
         return normalized
 
     def enqueue_notification(
@@ -4485,10 +4506,26 @@ class AlertStore:
         return str(rows[0]["notification_id"])
 
     @staticmethod
-    def _resolve_incident_id(connection: sqlite3.Connection, reference: str) -> str:
+    def _resolve_incident_id(
+        connection: sqlite3.Connection,
+        reference: str,
+        *,
+        allow_prefix: bool = True,
+    ) -> str:
         value = reference.strip()
         if not value:
             raise ValueError("incident reference is required")
+        if not allow_prefix:
+            row = connection.execute(
+                "SELECT incident_id FROM incidents WHERE incident_id = ?",
+                (value,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(
+                    "incident mutations require the exact full incident_id; "
+                    "inspect the incident and retry"
+                )
+            return str(row["incident_id"])
         rows = connection.execute(
             """
             SELECT incident_id FROM incidents
@@ -5419,6 +5456,137 @@ def _validate_anomaly_clearance_proof(
     actual_sha256 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     if actual_sha256 != claimed_sha256:
         raise ValueError("anomaly clearance proof checksum does not match")
+
+
+def _validate_price_action_clearance_proof(
+    scan_evidence: Any,
+    case: sqlite3.Row,
+    *,
+    finding_source_boundary: Any,
+    verification_source_boundary: Any,
+) -> None:
+    if not isinstance(scan_evidence, dict):
+        raise ValueError("price correction scan evidence must be an object")
+    proofs = scan_evidence.get("clearance_proofs")
+    proof = proofs.get(str(case["fingerprint"])) if isinstance(proofs, dict) else None
+    if not isinstance(proof, dict):
+        raise ValueError(
+            "price correction verification lacks a source-provenanced "
+            "clearance proof for this case"
+        )
+    identity = {
+        "rule_id": str(case["rule_id"]),
+        "rule_version": str(case["rule_version"]),
+        "scope": str(case["scope"]),
+        "subject_type": str(case["subject_type"]),
+        "subject_id": str(case["subject_id"]),
+    }
+    if any(proof.get(key) != value for key, value in identity.items()):
+        raise ValueError("price clearance proof identity does not match the case")
+    if proof.get("coverage_state") != "verified_source_pair_no_longer_triggers":
+        raise ValueError("price clearance proof does not certify a verified source pair")
+
+    subject_security, separator, subject_date = str(case["subject_id"]).rpartition("@")
+    if not separator:
+        raise ValueError("price clearance case subject is invalid")
+    previous = proof.get("previous_row")
+    current = proof.get("current_row")
+    if not isinstance(previous, dict) or not isinstance(current, dict):
+        raise ValueError("price clearance proof lacks the verified price pair")
+    if (
+        current.get("security_id") != subject_security
+        or current.get("date") != subject_date
+        or previous.get("security_id") != subject_security
+        or str(previous.get("date") or "") >= subject_date
+        or current.get("actions_complete") is not True
+        or current.get("close_split_adjusted") not in {True, False}
+    ):
+        raise ValueError("price clearance proof pair does not match the case")
+    try:
+        previous_close = float(previous["close"])
+        current_close = float(current["close"])
+        split_ratio = float(current["split_ratio"])
+        dividends = float(current["dividends"])
+        threshold = float(proof["move_threshold"])
+        claimed_change = float(proof["close_change_fraction"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("price clearance proof has invalid economics") from exc
+    if (
+        not all(
+            isfinite(value)
+            for value in (
+                previous_close,
+                current_close,
+                split_ratio,
+                dividends,
+                threshold,
+                claimed_change,
+            )
+        )
+        or previous_close <= 0
+        or current_close <= 0
+        or split_ratio <= 0
+        or dividends < 0
+        or not 0 < threshold < 1
+    ):
+        raise ValueError("price clearance proof economics are out of range")
+    actual_change = (current_close - previous_close) / previous_close
+    if abs(actual_change - claimed_change) > 1e-12:
+        raise ValueError("price clearance proof move does not match its rows")
+    if abs(actual_change) >= threshold and split_ratio == 1.0 and dividends == 0.0:
+        raise ValueError("price clearance proof still triggers the anomaly rule")
+
+    finding_boundary = _anomaly_moment(
+        finding_source_boundary,
+        label="price finding source boundary",
+    )
+    verification_boundary = _anomaly_moment(
+        verification_source_boundary,
+        label="price verification source boundary",
+    )
+    for name in ("previous_source_snapshot", "current_source_snapshot"):
+        snapshot = proof.get(name)
+        if not isinstance(snapshot, dict):
+            raise ValueError("price clearance proof lacks exact provider snapshots")
+        if snapshot.get("dataset") != "daily-prices":
+            raise ValueError("price clearance proof snapshot dataset is invalid")
+        _anomaly_text("price clearance snapshot id", snapshot.get("snapshot_id"))
+        _anomaly_text("price clearance run id", snapshot.get("run_id"))
+        _anomaly_text("price clearance role", snapshot.get("role"))
+        _anomaly_text("price clearance parser", snapshot.get("parser_version"))
+        _anomaly_sha256("price clearance payload", snapshot.get("payload_sha256"))
+        _anomaly_sha256(
+            "price clearance parsed rows", snapshot.get("parsed_rows_sha256")
+        )
+        _anomaly_sha256(
+            "price clearance matched row", snapshot.get("matched_row_sha256")
+        )
+        parsed_count = snapshot.get("parsed_row_count")
+        if (
+            isinstance(parsed_count, bool)
+            or not isinstance(parsed_count, int)
+            or parsed_count < 1
+        ):
+            raise ValueError("price clearance parsed row count must be positive")
+        snapshot_time = _anomaly_moment(
+            snapshot.get("received_at"),
+            label="price clearance snapshot received_at",
+        )
+        if snapshot_time > verification_boundary:
+            raise ValueError("price clearance snapshot exceeds the verification boundary")
+        if name == "current_source_snapshot" and snapshot_time <= finding_boundary:
+            raise ValueError("price correction source snapshot does not postdate the finding")
+
+    claimed_sha256 = _anomaly_sha256(
+        "price clearance proof",
+        proof.get("proof_sha256"),
+    )
+    proof_body = dict(proof)
+    proof_body.pop("proof_sha256", None)
+    canonical = _anomaly_json(proof_body, label="price clearance proof")
+    actual_sha256 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if actual_sha256 != claimed_sha256:
+        raise ValueError("price clearance proof checksum does not match")
 
 
 def _anomaly_text(label: str, value: Any) -> str:

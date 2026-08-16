@@ -9,8 +9,10 @@ import json
 import os
 import stat
 import zlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +37,11 @@ from aios.ingest.edgar import (
     canonical_sec_fundamental_row_sha256,
     replay_sec_companyfacts_response,
 )
-from aios.raw_snapshots import canonical_parsed_rows_sha256
+from aios.raw_snapshots import (
+    canonical_parsed_rows_sha256,
+    read_verified_raw_snapshot,
+    replay_verified_raw_snapshot,
+)
 from aios.sec_rejections import (
     accepted_sec_fundamental_outcome,
     decode_rejection_codes,
@@ -67,7 +73,7 @@ MAPPING_RULE_VERSION = "1.0.0"
 MAPPING_SCOPE_PREFIX = "us-equity-mappings"
 
 SHARES_RULE_ID = "share_count_jump"
-SHARES_RULE_VERSION = "1.0.0"
+SHARES_RULE_VERSION = "2.0.0"
 SHARES_SCOPE_PREFIX = "us-equity-shares"
 SHARES_METRIC = "shares_out"
 SHARES_JUMP_THRESHOLD = 0.30
@@ -2100,6 +2106,8 @@ def scan_price_action_mismatch(
     maximum_members: int = 550,
     lookback_sessions: int = PRICE_LOOKBACK_SESSIONS,
     move_threshold: float = PRICE_MOVE_THRESHOLD,
+    project_root: Path | None = None,
+    clearance_subject_ids: Sequence[str] = (),
 ) -> AnomalyScan:
     """Detect large close-to-close moves that no corporate action explains.
 
@@ -2270,6 +2278,14 @@ def scan_price_action_mismatch(
         )
 
     source_boundary_at = _price_source_boundary(store, decision_date)
+    clearance_proofs = _price_action_clearance_proofs(
+        store=store,
+        scope=scope,
+        subject_ids=clearance_subject_ids,
+        decision_date=decision_date,
+        move_threshold=move_threshold,
+        project_root=project_root or settings.project_root,
+    )
     return _build_scan(
         scope=scope,
         rule_id=PRICE_RULE_ID,
@@ -2291,8 +2307,269 @@ def scan_price_action_mismatch(
             "move_threshold": move_threshold,
             "unexplained_moves": len(observations),
             "examined_set_sha256": _sha(examined_boundary),
+            "clearance_proofs": clearance_proofs,
+            "clearance_proof_count": len(clearance_proofs),
         },
     )
+
+
+def _price_action_clearance_proofs(
+    *,
+    store: Store,
+    scope: str,
+    subject_ids: Sequence[str],
+    decision_date: date,
+    move_threshold: float,
+    project_root: Path,
+) -> dict[str, dict[str, Any]]:
+    """Prove that prior price findings cleared through retained source rows."""
+
+    proofs: dict[str, dict[str, Any]] = {}
+    for subject_id in sorted(set(str(value).strip() for value in subject_ids)):
+        if not subject_id or "@" not in subject_id:
+            continue
+        security_id, current_date_text = subject_id.rsplit("@", 1)
+        try:
+            current_date = date.fromisoformat(current_date_text)
+        except ValueError:
+            continue
+        if current_date > decision_date:
+            continue
+        pair = store.query(
+            """
+            SELECT security_id, ticker, provider_symbol, date, close, dividends,
+                   split_ratio, actions_complete, close_split_adjusted,
+                   split_normalization_factor, source
+            FROM prices
+            WHERE security_id = ? AND date <= CAST(? AS DATE)
+            ORDER BY date DESC
+            LIMIT 2
+            """,
+            (security_id, current_date.isoformat()),
+        )
+        if len(pair) != 2 or _as_date(pair[0]["date"]) != current_date:
+            continue
+        current, previous = pair
+        current_close = _positive_close(current, security_id)
+        previous_close = _positive_close(previous, security_id)
+        split_ratio = float(current.get("split_ratio") or 0)
+        dividends = float(current.get("dividends") or 0)
+        change = (current_close - previous_close) / previous_close
+        if (
+            current.get("actions_complete") is not True
+            or current.get("close_split_adjusted") not in {True, False}
+            or not all(
+                isfinite(value)
+                for value in (split_ratio, dividends, change, move_threshold)
+            )
+            or split_ratio <= 0
+            or dividends < 0
+            or (
+                abs(change) >= move_threshold
+                and split_ratio == 1.0
+                and dividends == 0.0
+            )
+        ):
+            continue
+
+        current_source = _verified_price_source_row(
+            store=store,
+            stored_row=current,
+            decision_date=decision_date,
+            project_root=project_root,
+        )
+        previous_source = _verified_price_source_row(
+            store=store,
+            stored_row=previous,
+            decision_date=decision_date,
+            project_root=project_root,
+        )
+        if current_source is None or previous_source is None:
+            continue
+        fingerprint = anomaly_fingerprint(
+            rule_id=PRICE_RULE_ID,
+            rule_version=PRICE_RULE_VERSION,
+            scope=scope,
+            subject_type="security_session",
+            subject_id=subject_id,
+        )
+        proof_body = {
+            "rule_id": PRICE_RULE_ID,
+            "rule_version": PRICE_RULE_VERSION,
+            "scope": scope,
+            "subject_type": "security_session",
+            "subject_id": subject_id,
+            "coverage_state": "verified_source_pair_no_longer_triggers",
+            "move_threshold": move_threshold,
+            "close_change_fraction": change,
+            "previous_row": _canonical_price_clearance_row(previous),
+            "current_row": _canonical_price_clearance_row(current),
+            "previous_source_snapshot": previous_source,
+            "current_source_snapshot": current_source,
+        }
+        proofs[fingerprint] = {
+            **proof_body,
+            "proof_sha256": _sha(proof_body),
+        }
+    return proofs
+
+
+def _verified_price_source_row(
+    *,
+    store: Store,
+    stored_row: dict[str, Any],
+    decision_date: date,
+    project_root: Path,
+) -> dict[str, Any] | None:
+    source = str(stored_row.get("source") or "").lower()
+    provider = source.split(":", 1)[0]
+    if provider not in {"yfinance", "tiingo"}:
+        return None
+    provider_symbol = str(
+        stored_row.get("provider_symbol") or stored_row.get("ticker") or ""
+    ).strip().upper()
+    if not provider_symbol:
+        return None
+    exact_role = f"prices:{provider_symbol}"
+    role_prefix = f"prices:{provider}:{provider_symbol}:%"
+    snapshots = store.query(
+        """
+        SELECT linked.run_id, linked.role, snapshot.snapshot_id,
+               snapshot.provider, snapshot.dataset, snapshot.artifact_kind,
+               snapshot.request_fingerprint, snapshot.adapter_name,
+               snapshot.adapter_version, snapshot.parser_version,
+               snapshot.payload_sha256, snapshot.parsed_row_count,
+               snapshot.parsed_rows_sha256, snapshot.received_at
+        FROM ingest_raw_snapshots AS linked
+        JOIN raw_snapshots AS snapshot USING (snapshot_id)
+        WHERE snapshot.provider = ?
+          AND snapshot.dataset = 'daily-prices'
+          AND CAST(snapshot.received_at AS DATE) <= CAST(? AS DATE)
+          AND (linked.role = ? OR linked.role LIKE ?)
+        ORDER BY snapshot.received_at DESC, snapshot.snapshot_id DESC
+        """,
+        (provider, decision_date.isoformat(), exact_role, role_prefix),
+    )
+    target_date = _as_date(stored_row["date"])
+    for snapshot in snapshots:
+        try:
+            verified = read_verified_raw_snapshot(
+                store=store,
+                expected_run_id=str(snapshot["run_id"]),
+                expected_role=str(snapshot["role"]),
+                snapshot_id=str(snapshot["snapshot_id"]),
+                expected_provider=provider,
+                expected_dataset="daily-prices",
+                expected_artifact_kind=str(snapshot["artifact_kind"]),
+                expected_parser_version=str(snapshot["parser_version"]),
+                expected_request_fingerprint=str(snapshot["request_fingerprint"]),
+                expected_adapter_name=str(snapshot["adapter_name"]),
+                expected_adapter_version=str(snapshot["adapter_version"]),
+                project_root=project_root,
+            )
+            replayed = replay_verified_raw_snapshot(verified)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            continue
+        for provider_row in replayed:
+            if _as_date(provider_row["date"]) != target_date:
+                continue
+            normalized = _normalized_replayed_price_row(
+                provider_row,
+                provider=provider,
+                security_id=str(stored_row["security_id"]),
+                provider_symbol=provider_symbol,
+            )
+            if not _price_clearance_rows_match(stored_row, normalized):
+                continue
+            matched = _canonical_price_clearance_row(normalized)
+            return {
+                "snapshot_id": str(snapshot["snapshot_id"]),
+                "run_id": str(snapshot["run_id"]),
+                "role": str(snapshot["role"]),
+                "provider": provider,
+                "dataset": "daily-prices",
+                "parser_version": str(snapshot["parser_version"]),
+                "received_at": _utc_raw_snapshot_time(
+                    snapshot["received_at"]
+                ).isoformat(),
+                "payload_sha256": str(snapshot["payload_sha256"]),
+                "parsed_row_count": int(snapshot["parsed_row_count"]),
+                "parsed_rows_sha256": str(snapshot["parsed_rows_sha256"]),
+                "matched_row_sha256": _sha(matched),
+            }
+    return None
+
+
+def _normalized_replayed_price_row(
+    row: dict[str, Any],
+    *,
+    provider: str,
+    security_id: str,
+    provider_symbol: str,
+) -> dict[str, Any]:
+    normalized = {
+        **row,
+        "security_id": security_id,
+        "provider_symbol": provider_symbol,
+    }
+    if provider == "tiingo":
+        normalized.update(
+            {
+                "actions_complete": True,
+                "close_split_adjusted": False,
+                "split_normalization_factor": 1.0,
+                "source": "tiingo",
+            }
+        )
+    elif "provider_price_continuity_factor" in normalized:
+        from aios.corporate_actions import project_yfinance_action
+
+        normalized = project_yfinance_action(
+            normalized,
+            security_id=security_id,
+            provider_symbol=provider_symbol,
+        )
+    return normalized
+
+
+def _canonical_price_clearance_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "security_id": str(row["security_id"]),
+        "date": _as_date(row["date"]).isoformat(),
+        "close": float(row["close"]),
+        "dividends": float(row.get("dividends") or 0),
+        "split_ratio": float(row.get("split_ratio") or 0),
+        "actions_complete": row.get("actions_complete") is True,
+        "close_split_adjusted": row.get("close_split_adjusted"),
+        "split_normalization_factor": (
+            float(row["split_normalization_factor"])
+            if row.get("split_normalization_factor") is not None
+            else None
+        ),
+        "provider_symbol": str(row.get("provider_symbol") or ""),
+        "source": str(row.get("source") or ""),
+    }
+
+
+def _price_clearance_rows_match(
+    stored: dict[str, Any],
+    replayed: dict[str, Any],
+) -> bool:
+    left = _canonical_price_clearance_row(stored)
+    right = _canonical_price_clearance_row(replayed)
+    for field in ("close", "dividends", "split_ratio", "split_normalization_factor"):
+        left_value = left.pop(field)
+        right_value = right.pop(field)
+        if left_value is None or right_value is None:
+            if left_value is not right_value:
+                return False
+        elif (
+            not isfinite(float(left_value))
+            or not isfinite(float(right_value))
+            or abs(float(left_value) - float(right_value)) > 1e-12
+        ):
+            return False
+    return left == right
 
 
 def _positive_close(row: dict[str, Any], security_id: str) -> float:
@@ -2300,7 +2577,7 @@ def _positive_close(row: dict[str, Any], security_id: str) -> float:
     if value is None:
         raise ValueError(f"price row lacks a close: {security_id}@{row.get('date')}")
     close = float(value)
-    if not close > 0:
+    if not isfinite(close) or not close > 0:
         raise ValueError(
             f"price row has a non-positive close: {security_id}@{row.get('date')}"
         )
@@ -2809,14 +3086,17 @@ def scan_share_count_jump(
     jump_threshold: float = SHARES_JUMP_THRESHOLD,
     lookback_filings: int = SHARES_LOOKBACK_FILINGS,
 ) -> AnomalyScan:
-    """Detect implausible share-count movement between consecutive filings.
+    """Detect implausible share-count movement in filing-vintage order.
 
     Share count drives market cap, so a bad value silently corrupts every Value
     factor built on it. Genuine causes exist — splits, large issuance, buybacks
     — but a move past the threshold between two consecutive point-in-time
-    filings is worth a human look. The rule does NOT look up the corresponding
-    corporate action: confirming one is the operator's first suggested check,
-    and co-reporting reviewed splits belongs to a later rule version.
+    filings is worth a human look. Company Facts restates historical periods on
+    later filings in the share basis prevailing on that filing date. Comparing
+    rows in period-end order therefore mixes incompatible vintages around stock
+    splits. Version 2 compares one latest-period representative per filing date
+    in filing-date order, then separately checks back-period rows within each
+    single filing vintage where the basis is homogeneous.
 
     Two stored values need no threshold to be wrong. A non-positive share count
     is impossible for a listed company and is reported directly, and it is kept
@@ -2824,9 +3104,10 @@ def scan_share_count_jump(
     fake jump in the surrounding series.
 
     The rule never repairs a value and never guesses a split from the ratio.
-    Expect a large historical backlog on first run: the comparison spans the
-    issuer's whole retained filing history, and a retroactive post-split
-    restatement of an old period is a genuine, reviewable difference.
+    The rule deliberately does not normalize with ``prices.split_ratio``. That
+    provider field can encode price-continuity distributions rather than legal
+    share multipliers, so using it would turn an unreviewed corporate action
+    into an automatic data repair.
     """
 
     decision_date = _as_date(as_of)
@@ -2853,20 +3134,33 @@ def scan_share_count_jump(
         ticker = tickers[0]
         window = store.query(
             """
-            SELECT period_end, as_of_date, value
-            FROM fundamentals
-            WHERE issuer_id = ?
-              AND metric = ?
-              AND as_of_date <= CAST(? AS DATE)
-              AND period_end <= as_of_date
-              AND value IS NOT NULL
-            ORDER BY period_end DESC, as_of_date DESC
-            LIMIT ?
+            WITH eligible AS (
+                SELECT period_end, as_of_date, value
+                FROM fundamentals
+                WHERE issuer_id = ?
+                  AND metric = ?
+                  AND as_of_date <= CAST(? AS DATE)
+                  AND period_end <= as_of_date
+                  AND value IS NOT NULL
+            ),
+            recent_vintages AS (
+                SELECT as_of_date
+                FROM eligible
+                GROUP BY as_of_date
+                ORDER BY as_of_date DESC
+                LIMIT ?
+            )
+            SELECT DISTINCT eligible.period_end, eligible.as_of_date, eligible.value
+            FROM eligible
+            JOIN recent_vintages USING (as_of_date)
+            ORDER BY eligible.as_of_date, eligible.period_end, eligible.value
             """,
             (issuer_id, SHARES_METRIC, decision_date.isoformat(), lookback_filings),
         )
-        history = list(reversed(window))
-        if len(history) < 2:
+        vintages: dict[date, list[dict[str, Any]]] = {}
+        for row in window:
+            vintages.setdefault(_as_date(row["as_of_date"]), []).append(row)
+        if len(window) < 2:
             # Nothing comparable is claimed for this issuer.
             continue
         examined_issuers += 1
@@ -2875,105 +3169,89 @@ def scan_share_count_jump(
                 "issuer_id": issuer_id,
                 "ticker": ticker,
                 "tickers": list(tickers),
-                "observations": len(history),
+                "filing_vintages": len(vintages),
+                "observations": len(window),
             }
         )
 
         # A stored non-positive count is itself the anomaly. Report it, and
         # keep it out of the ratio comparison so one bad row cannot divide by
         # zero or manufacture a fake jump in the surrounding series.
-        usable: list[dict[str, Any]] = []
-        for row in history:
-            if _share_value(row, issuer_id) > 0:
-                usable.append(row)
+        usable_by_vintage: dict[date, list[dict[str, Any]]] = {}
+        for known_on in sorted(vintages):
+            usable_by_vintage[known_on] = []
+            for row in vintages[known_on]:
+                if _share_value(row, issuer_id) > 0:
+                    usable_by_vintage[known_on].append(row)
+                    continue
+                observations.append(
+                    _invalid_share_count_observation(
+                        scope=scope,
+                        issuer_id=issuer_id,
+                        ticker=ticker,
+                        tickers=tickers,
+                        row=row,
+                        decision_date=decision_date,
+                    )
+                )
+
+        representatives: list[dict[str, Any]] = []
+        for known_on in sorted(usable_by_vintage):
+            usable = usable_by_vintage[known_on]
+            if not usable:
                 continue
-            observations.append(
-                _invalid_share_count_observation(
+            latest_period = max(_as_date(row["period_end"]) for row in usable)
+            candidates = [
+                row
+                for row in usable
+                if _as_date(row["period_end"]) == latest_period
+            ]
+            representatives.append(
+                min(candidates, key=lambda row: float(row["value"]))
+            )
+
+        for previous, current in zip(
+            representatives,
+            representatives[1:],
+            strict=False,
+        ):
+            finding = _share_count_jump_observation(
+                scope=scope,
+                issuer_id=issuer_id,
+                ticker=ticker,
+                tickers=tickers,
+                previous=previous,
+                current=current,
+                decision_date=decision_date,
+                jump_threshold=jump_threshold,
+                comparison_mode="inter_vintage",
+            )
+            if finding is not None:
+                observations.append(finding)
+
+        for known_on in sorted(usable_by_vintage):
+            usable = sorted(
+                usable_by_vintage[known_on],
+                key=lambda row: (_as_date(row["period_end"]), float(row["value"])),
+            )
+            for pair_index, (previous, current) in enumerate(
+                zip(usable, usable[1:], strict=False),
+                start=1,
+            ):
+                finding = _share_count_jump_observation(
                     scope=scope,
                     issuer_id=issuer_id,
                     ticker=ticker,
                     tickers=tickers,
-                    row=row,
+                    previous=previous,
+                    current=current,
                     decision_date=decision_date,
+                    jump_threshold=jump_threshold,
+                    comparison_mode="intra_vintage",
+                    pair_index=pair_index,
                 )
-            )
-
-        for previous, current in zip(usable, usable[1:], strict=False):
-            previous_shares = _share_value(previous, issuer_id)
-            current_shares = _share_value(current, issuer_id)
-            change = (current_shares - previous_shares) / previous_shares
-            if abs(change) < jump_threshold:
-                continue
-
-            current_period = _as_date(current["period_end"])
-            previous_period = _as_date(previous["period_end"])
-            # One fiscal period is restated across several knowable dates, so
-            # the period alone is not a unique case identity: two jumps inside
-            # the same period would collide into one fingerprint and the ledger
-            # would reject the whole scan.
-            subject_id = (
-                f"{issuer_id}@{current_period.isoformat()}"
-                f"#{_as_date(current['as_of_date']).isoformat()}"
-            )
-            observations.append(
-                AnomalyObservation(
-                    fingerprint=anomaly_fingerprint(
-                        rule_id=SHARES_RULE_ID,
-                        rule_version=SHARES_RULE_VERSION,
-                        scope=scope,
-                        subject_type="issuer_period",
-                        subject_id=subject_id,
-                    ),
-                    rule_id=SHARES_RULE_ID,
-                    rule_version=SHARES_RULE_VERSION,
-                    scope=scope,
-                    subject_type="issuer_period",
-                    subject_id=subject_id,
-                    severity="high" if abs(change) >= 0.5 else "medium",
-                    confidence=CONFIDENCE_REPORTED_SOURCE,
-                    title=(
-                        f"{ticker} share count moved {change:.1%} into "
-                        f"{current_period.isoformat()}"
-                    ),
-                    summary=(
-                        "Reported shares outstanding changed sharply between two "
-                        "consecutive point-in-time filings. Confirm a split, "
-                        "issuance or buyback explains it before trusting any "
-                        "market-cap or per-share factor built on this value."
-                    ),
-                    old_value={
-                        "period_end": previous_period.isoformat(),
-                        "as_of_date": _as_date(previous["as_of_date"]).isoformat(),
-                        "shares_out": previous_shares,
-                    },
-                    new_value={
-                        "period_end": current_period.isoformat(),
-                        "as_of_date": _as_date(current["as_of_date"]).isoformat(),
-                        "shares_out": current_shares,
-                        "change_fraction": change,
-                        "implied_ratio": current_shares / previous_shares,
-                    },
-                    evidence={
-                        "issuer_id": issuer_id,
-                        "ticker": ticker,
-                        "tickers": list(tickers),
-                        "metric": SHARES_METRIC,
-                        "jump_threshold": jump_threshold,
-                        "decision_evidence_as_of": decision_date.isoformat(),
-                        "rule_bundle_version": RULE_BUNDLE_VERSION,
-                    },
-                    suggested_checks=(
-                        "Check the issuer's filing for a split, offering or "
-                        "buyback covering this period.",
-                        "Confirm the SEC cover-page share count was parsed with "
-                        "the right unit and scale.",
-                        "Re-check any market-cap or per-share factor computed "
-                        "from the newer value.",
-                        "Never rescale a stored share count to make the series "
-                        "look smooth.",
-                    ),
-                )
-            )
+                if finding is not None:
+                    observations.append(finding)
 
     source_boundary_at = _reference_source_boundary(store, decision_date)
     return _build_scan(
@@ -2991,12 +3269,105 @@ def scan_share_count_jump(
             "metric": SHARES_METRIC,
             "jump_threshold": jump_threshold,
             "lookback_filings": lookback_filings,
+            "comparison_policy": "filing_vintage_ordered",
             "share_count_jumps": len(observations),
             "examined_set_sha256": _sha(examined_boundary),
         },
     )
 
 
+def _share_count_jump_observation(
+    *,
+    scope: str,
+    issuer_id: str,
+    ticker: str,
+    tickers: tuple[str, ...],
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    decision_date: date,
+    jump_threshold: float,
+    comparison_mode: str,
+    pair_index: int | None = None,
+) -> AnomalyObservation | None:
+    """Build one v2 share jump after the caller establishes a common basis."""
+
+    previous_shares = _share_value(previous, issuer_id)
+    current_shares = _share_value(current, issuer_id)
+    change = (current_shares - previous_shares) / previous_shares
+    if abs(change) < jump_threshold:
+        return None
+
+    current_period = _as_date(current["period_end"])
+    previous_period = _as_date(previous["period_end"])
+    current_vintage = _as_date(current["as_of_date"])
+    previous_vintage = _as_date(previous["as_of_date"])
+    if comparison_mode == "inter_vintage":
+        subject_id = f"{issuer_id}@{current_vintage.isoformat()}"
+    elif comparison_mode == "intra_vintage" and pair_index is not None:
+        subject_id = (
+            f"{issuer_id}@{current_vintage.isoformat()}"
+            f"#{current_period.isoformat()}#intra-{pair_index}"
+        )
+    else:  # pragma: no cover - internal callers are explicit
+        raise ValueError("invalid share-count comparison mode")
+
+    return AnomalyObservation(
+        fingerprint=anomaly_fingerprint(
+            rule_id=SHARES_RULE_ID,
+            rule_version=SHARES_RULE_VERSION,
+            scope=scope,
+            subject_type="issuer_filing_vintage",
+            subject_id=subject_id,
+        ),
+        rule_id=SHARES_RULE_ID,
+        rule_version=SHARES_RULE_VERSION,
+        scope=scope,
+        subject_type="issuer_filing_vintage",
+        subject_id=subject_id,
+        severity="high" if abs(change) >= 0.5 else "medium",
+        confidence=CONFIDENCE_REPORTED_SOURCE,
+        title=(
+            f"{ticker} share count moved {change:.1%} into "
+            f"filing vintage {current_vintage.isoformat()}"
+        ),
+        summary=(
+            "Reported shares outstanding changed sharply between observations "
+            "that share a valid comparison basis. Confirm a split, issuance or "
+            "buyback explains it before trusting market-cap or per-share factors."
+        ),
+        old_value={
+            "period_end": previous_period.isoformat(),
+            "as_of_date": previous_vintage.isoformat(),
+            "shares_out": previous_shares,
+        },
+        new_value={
+            "period_end": current_period.isoformat(),
+            "as_of_date": current_vintage.isoformat(),
+            "shares_out": current_shares,
+            "change_fraction": change,
+            "implied_ratio": current_shares / previous_shares,
+        },
+        evidence={
+            "issuer_id": issuer_id,
+            "ticker": ticker,
+            "tickers": list(tickers),
+            "metric": SHARES_METRIC,
+            "jump_threshold": jump_threshold,
+            "comparison_mode": comparison_mode,
+            "decision_evidence_as_of": decision_date.isoformat(),
+            "rule_bundle_version": RULE_BUNDLE_VERSION,
+        },
+        suggested_checks=(
+            "Check the issuer's filing for a split, offering or buyback covering "
+            "these filing vintages.",
+            "Confirm the SEC cover-page share count was parsed with the right "
+            "unit and scale.",
+            "Re-check any market-cap or per-share factor computed from the newer "
+            "value.",
+            "Never use an unreviewed provider price-adjustment factor to rescale "
+            "a stored share count.",
+        ),
+    )
 def _invalid_share_count_observation(
     *,
     scope: str,
@@ -3711,6 +4082,7 @@ def run_detectors(
     coverage_baseline: dict[str, Any] | None = None,
     factor_baseline: dict[str, Any] | None = None,
     factor_model: str = "qv",
+    price_clearance_subject_ids: Sequence[str] = (),
 ) -> tuple[AnomalyScan, ...]:
     """Run the selected detectors and return one independent scan per rule.
 
@@ -3745,6 +4117,8 @@ def run_detectors(
                     store=store,
                     as_of=as_of,
                     universe_id=universe_id,
+                    project_root=project_root,
+                    clearance_subject_ids=price_clearance_subject_ids,
                 )
             )
         elif rule_id == COVERAGE_RULE_ID:

@@ -69,6 +69,19 @@ class VerifiedRawSnapshot:
         return json.loads(self._metadata_json)
 
 
+def replay_verified_raw_snapshot(
+    snapshot: VerifiedRawSnapshot,
+) -> list[dict[str, Any]]:
+    """Return replayed rows from an already checksum-verified snapshot."""
+
+    if not isinstance(snapshot, VerifiedRawSnapshot):
+        raise TypeError("a verified raw snapshot is required")
+    replayed = _require_snapshot_replay_evidence(snapshot.metadata, snapshot.payload)
+    if replayed is None:
+        raise ValueError("raw snapshot has no reviewed replay parser")
+    return [dict(row) for row in replayed]
+
+
 def capture_raw_snapshot(
     payload: bytes,
     *,
@@ -126,6 +139,7 @@ def capture_raw_snapshot(
             "sec-companyfacts-v2-storage-safe-v1",
             "sec-companyfacts-v2-storage-safe-v2",
             "sec-companyfacts-v3",
+            "sec-companyfacts-v4",
         }
         and parsed_rows_rejected is None
     ):
@@ -140,13 +154,15 @@ def capture_raw_snapshot(
         if (parsed_rows_rejected == 0) != (encoded_rejection_codes is None):
             raise ValueError("raw snapshot rejection count and codes are inconsistent")
 
+    requested_utc = _as_utc(requested_at)
+    received_utc = _as_utc(received_at)
     root = (project_root or settings.project_root).resolve()
     raw_root = _resolve_raw_root(root)
     payload_sha256 = hashlib.sha256(payload).hexdigest()
     db = store or get_store()
     existing_payload = db.raw_payload_record(payload_sha256)
     extension = _extension(content_type)
-    captured_date = _as_utc(received_at).date().isoformat()
+    captured_date = received_utc.date().isoformat()
     relative = (
         Path(existing_payload["relative_path"])
         if existing_payload
@@ -190,8 +206,10 @@ def capture_raw_snapshot(
             "provider": normalized_provider,
             "dataset": normalized_dataset,
             "artifact_kind": artifact_kind,
-            "requested_at": _as_utc(requested_at),
-            "received_at": _as_utc(received_at),
+            # DuckDB TIMESTAMP has no zone. Strip only after normalizing to UTC
+            # so the persisted wall time retains the documented UTC basis.
+            "requested_at": requested_utc.replace(tzinfo=None),
+            "received_at": received_utc.replace(tzinfo=None),
             "http_status": http_status,
             "content_type": content_type,
             "request_fingerprint": request_fingerprint,
@@ -875,6 +893,10 @@ def _replay_snapshot(
         from aios.ingest.prices import parse_yfinance_normalized_export
 
         return parse_yfinance_normalized_export(payload)
+    if key == ("yfinance", "daily-prices", "yfinance-normalized-v4"):
+        from aios.ingest.prices import parse_yfinance_normalized_export_v4
+
+        return parse_yfinance_normalized_export_v4(payload)
     if key == ("fred", "series-vintages", "fred-normalized-v1"):
         from aios.ingest.fred import parse_fred_normalized_export
 
@@ -919,6 +941,10 @@ def _replay_snapshot(
         from aios.ingest.edgar import parse_sec_companyfacts_response_v3
 
         return parse_sec_companyfacts_response_v3(payload)
+    if key == ("sec-edgar", "companyfacts", "sec-companyfacts-v4"):
+        from aios.ingest.edgar import parse_sec_companyfacts_response_v4
+
+        return parse_sec_companyfacts_response_v4(payload)
     if key == ("sec-edgar", "submissions", "sec-submissions-v2"):
         from aios.ingest.edgar import parse_sec_submissions_response
 
@@ -974,6 +1000,7 @@ def _replay_snapshot_rejections(
             "sec-companyfacts-v2-storage-safe-v2",
         ),
         ("sec-edgar", "companyfacts", "sec-companyfacts-v3"),
+        ("sec-edgar", "companyfacts", "sec-companyfacts-v4"),
     }:
         return None
     from aios.ingest.edgar import replay_sec_companyfacts_response

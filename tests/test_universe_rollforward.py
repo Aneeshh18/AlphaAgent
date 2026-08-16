@@ -7,10 +7,13 @@ from aios.ingest.http_client import RawSnapshotContext
 from aios.raw_snapshots import canonical_request_fingerprint, capture_raw_snapshot
 from aios.storage.store import Store
 from aios.universe_rollforward import (
+    COMPONENT_DIVERGENCE_MODE,
+    COMPONENT_RECONCILIATION_BASIS,
     COMPONENT_SNAPSHOT_URL,
     OFFICIAL_ARCHIVE_URL,
-    _accepted_activation_component_lag,
+    _accepted_activation_component_divergence,
     _canonical_list_sha256,
+    _set_sha256,
     parse_component_snapshot,
     parse_press_archive,
     parse_sp500_constituent_changes,
@@ -49,12 +52,17 @@ def _activation_lag_payload() -> dict:
             "after_member_set_sha256": _canonical_list_sha256(after),
         },
         "change_rows": [
-            {"action": "addition", "ticker": "GAM"},
-            {"action": "deletion", "ticker": "BBB"},
+            {"action": "addition", "effective_date": "2026-07-25", "ticker": "GAM"},
+            {"action": "deletion", "effective_date": "2026-07-25", "ticker": "BBB"},
         ],
         "post_event_reconciliation": {
+            "source_url": (
+                "https://www.ishares.com/us/products/239726/"
+                "ishares-core-s-p-500-etf/latest-holdings.csv"
+            ),
             "review": {
                 "as_of": "2026-07-25",
+                "fund": "IVV",
                 "tickers": ["AAA", "GAM"],
             }
         },
@@ -110,9 +118,9 @@ def _change_detail_html(*, effective_date: str = "July 25, 2026") -> bytes:
     """.encode()
 
 
-def test_exact_immutable_activation_reconciles_short_component_lag() -> None:
+def test_exact_immutable_activation_reconciles_component_divergence() -> None:
     payload = _activation_lag_payload()
-    result = _accepted_activation_component_lag(
+    result = _accepted_activation_component_divergence(
         _ActivationReceiptStore(payload),  # type: ignore[arg-type]
         universe_id="sp500",
         target=datetime(2026, 7, 27, tzinfo=UTC).date(),
@@ -123,6 +131,8 @@ def test_exact_immutable_activation_reconciles_short_component_lag() -> None:
     )
 
     assert result == {
+        "mode": COMPONENT_DIVERGENCE_MODE,
+        "reconciliation_basis": COMPONENT_RECONCILIATION_BASIS,
         "activation_id": "uca-event-test",
         "effective_date": "2026-07-25",
         "holdings_as_of": "2026-07-25",
@@ -134,7 +144,7 @@ def test_exact_immutable_activation_reconciles_short_component_lag() -> None:
 
 def test_activation_receipt_never_hides_an_extra_component_difference() -> None:
     payload = _activation_lag_payload()
-    result = _accepted_activation_component_lag(
+    result = _accepted_activation_component_divergence(
         _ActivationReceiptStore(payload),  # type: ignore[arg-type]
         universe_id="sp500",
         target=datetime(2026, 7, 27, tzinfo=UTC).date(),
@@ -147,9 +157,28 @@ def test_activation_receipt_never_hides_an_extra_component_difference() -> None:
     assert result is None
 
 
-def test_activation_receipt_component_lag_expires_fail_closed() -> None:
+def test_exact_receipt_bound_component_divergence_persists_after_seven_days() -> None:
     payload = _activation_lag_payload()
-    result = _accepted_activation_component_lag(
+    result = _accepted_activation_component_divergence(
+        _ActivationReceiptStore(payload),  # type: ignore[arg-type]
+        universe_id="sp500",
+        target=datetime(2026, 8, 2, tzinfo=UTC).date(),
+        reviewed_tickers={"AAA", "GAM"},
+        component_tickers={"AAA", "BBB"},
+        missing_components=["GAM"],
+        unexpected_components=["BBB"],
+    )
+
+    assert result is not None
+    assert result["mode"] == COMPONENT_DIVERGENCE_MODE
+    assert result["lag_days"] == 8
+
+
+def test_component_divergence_requires_dated_ivv_evidence() -> None:
+    payload = _activation_lag_payload()
+    payload["post_event_reconciliation"]["review"]["fund"] = "OTHER"
+
+    result = _accepted_activation_component_divergence(
         _ActivationReceiptStore(payload),  # type: ignore[arg-type]
         universe_id="sp500",
         target=datetime(2026, 8, 2, tzinfo=UTC).date(),
@@ -160,6 +189,145 @@ def test_activation_receipt_component_lag_expires_fail_closed() -> None:
     )
 
     assert result is None
+
+
+def _insert_receipt_bound_component_attestation(store: Store) -> None:
+    payload = _activation_lag_payload()
+    common_tickers = {f"T{index:03d}" for index in range(502)}
+    before_tickers = common_tickers | {"BBB"}
+    after_tickers = common_tickers | {"GAM"}
+    payload["receipt"]["before_member_set_sha256"] = _canonical_list_sha256(
+        before_tickers
+    )
+    payload["receipt"]["after_member_set_sha256"] = _canonical_list_sha256(
+        after_tickers
+    )
+    before_hash = payload["receipt"]["before_member_set_sha256"]
+    after_hash = payload["receipt"]["after_member_set_sha256"]
+    store.upsert_universe_membership(
+        [
+            {
+                "universe_id": "sp500",
+                "ticker": ticker,
+                "effective_start": "2026-07-25",
+                "known_date": "2026-07-22",
+                "source": "test-receipt-bound-component-divergence",
+            }
+            for ticker in sorted(after_tickers)
+        ]
+    )
+    store.execute(
+        """
+        INSERT INTO universe_constituent_change_activations
+        (activation_id, event_id, plan_sha256, activation_payload_sha256,
+         activation_run_id, fundamental_run_id, price_run_id,
+         source_attestation_id, schema_version, universe_id,
+         announcement_date, effective_date, prior_coverage_through,
+         target_coverage_through, official_detail_snapshot_id,
+         component_snapshot_id, before_member_set_sha256,
+         after_member_set_sha256, before_state_sha256, after_state_sha256,
+         change_rows_sha256, activation_payload_json,
+         backup_manifest_sha256, actor, policy_version, counts_json,
+         activated_at, status)
+        VALUES
+        ('uca-event-test', 'event-test', ?, ?, 'activation-run-test',
+         'fundamental-run-test', 'price-run-test', 'source-attestation-test',
+         1, 'sp500', DATE '2026-07-22', DATE '2026-07-25',
+         DATE '2026-07-24', DATE '2026-07-25', 'official-snapshot-test',
+         'component-snapshot-test', ?, ?, ?, ?, ?, ?, ?, 'test-owner',
+         'governed-sp500-constituent-activation.v1', '{}',
+         TIMESTAMP '2026-07-25 12:00:00', 'accepted')
+        """,
+        (
+            "1" * 64,
+            "2" * 64,
+            before_hash,
+            after_hash,
+            "3" * 64,
+            "4" * 64,
+            "5" * 64,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            "6" * 64,
+        ),
+    )
+    reconciliation = _accepted_activation_component_divergence(
+        _ActivationReceiptStore(payload),  # type: ignore[arg-type]
+        universe_id="sp500",
+        target=datetime(2026, 8, 2, tzinfo=UTC).date(),
+        reviewed_tickers=after_tickers,
+        component_tickers=before_tickers,
+        missing_components=["GAM"],
+        unexpected_components=["BBB"],
+    )
+    assert reconciliation is not None
+    mismatch = {
+        "missing_from_component_snapshot": ["GAM"],
+        "unexpected_in_component_snapshot": ["BBB"],
+        "reference_identity_issues": [],
+        "cik_mismatches": [],
+        "reviewed_successor_lineage_matches": [],
+        "future_effective_releases": [],
+        "candidate_release_parse_errors": [],
+        "accepted_activation_component_lag": reconciliation,
+    }
+    store.execute(
+        """
+        INSERT INTO universe_coverage_attestations
+        (attestation_id, run_id, universe_id, prior_coverage_through,
+         requested_coverage_through, checked_at, completed_new_york_date,
+         status, official_source_url, component_source_url,
+         official_release_count, relevant_release_count, reviewed_member_count,
+         component_count, reviewed_member_set_sha256, component_set_sha256,
+         identity_match_count, identity_mismatch_count, candidate_releases_json,
+         mismatch_detail_json, membership_rows_extended, security_rows_extended,
+         owner_rows_extended, cik_rows_extended, provider_rows_extended, detail)
+        VALUES
+        ('uca-review-test', 'review-run-test', 'sp500', DATE '2026-08-01',
+         DATE '2026-08-02', TIMESTAMP '2026-08-03 00:00:00',
+         DATE '2026-08-02', 'accepted_no_change',
+         'https://press.spglobal.com/index.php?s=2429&l=100',
+         'https://raw.githubusercontent.com/fja05680/sp500/master/sp500.csv',
+         100, 0, 503, 503, ?, ?, 503, 0, '[]', ?, 503, 503, 503, 500, 503,
+         'Receipt-bound component divergence accepted.')
+        """,
+        (
+            _set_sha256(after_tickers),
+            _set_sha256(before_tickers),
+            json.dumps(mismatch, sort_keys=True, separators=(",", ":")),
+        ),
+    )
+
+
+def test_persistent_validator_accepts_day_eight_receipt_bound_divergence(tmp_path) -> None:
+    store = Store(tmp_path / "persistent-component-divergence.duckdb")
+    try:
+        _insert_receipt_bound_component_attestation(store)
+        quality = {row["check"]: row for row in store.data_quality_report()}
+    finally:
+        store.close()
+
+    assert quality["universe_attestation_invalid_rows"]["count"] == 0
+
+
+def test_persistent_validator_rejects_tampered_ivv_holdings(tmp_path) -> None:
+    store = Store(tmp_path / "tampered-component-divergence.duckdb")
+    try:
+        _insert_receipt_bound_component_attestation(store)
+        row = store.query(
+            "SELECT activation_payload_json FROM universe_constituent_change_activations"
+        )[0]
+        payload = json.loads(row["activation_payload_json"])
+        payload["post_event_reconciliation"]["review"]["tickers"].append("BBB")
+        store.execute(
+            "UPDATE universe_constituent_change_activations "
+            "SET activation_payload_json = ?",
+            (json.dumps(payload, sort_keys=True, separators=(",", ":")),),
+        )
+        quality = {row["check"]: row for row in store.data_quality_report()}
+    finally:
+        store.close()
+
+    assert quality["universe_attestation_invalid_rows"]["count"] == 1
 
 
 def _multi_index_change_detail_html() -> bytes:

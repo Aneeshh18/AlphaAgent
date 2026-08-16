@@ -9,6 +9,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
+import aios.operations as operations_module
 from aios.alerts import (
     Alert,
     AlertSeverity,
@@ -228,6 +229,29 @@ def test_local_backup_includes_database_and_paper_but_excludes_secrets(tmp_path)
     )
     assert not (result.path / ".env").exists()
     assert verify_local_backup(result.path) == result
+
+
+def test_automatic_backup_names_do_not_collide_within_one_second(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 7, 21, 12, 0, tzinfo=tz or UTC)
+
+    monkeypatch.setattr(operations_module, "datetime", FixedDateTime)
+    project = tmp_path / "project"
+    database = project / "data" / "aios.duckdb"
+    database.parent.mkdir(parents=True)
+    _create_valid_database(database)
+
+    first = create_local_backup(project, database, application_version="test")
+    second = create_local_backup(project, database, application_version="test")
+
+    assert first.path != second.path
+    assert first.path.name.startswith("aios-20260721T120000Z-")
+    assert second.path.name.startswith("aios-20260721T120000Z-")
 
 
 def test_backup_verification_fails_after_file_tampering(tmp_path) -> None:

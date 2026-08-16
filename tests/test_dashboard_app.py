@@ -545,9 +545,9 @@ def test_dashboard_workspaces_and_research_surfaces_render_without_exceptions() 
     app.run()
     assert not app.exception
     home_html = "\n".join(str(element.value) for element in app.markdown)
-    assert "AIOS Home" in home_html
+    assert "AIOS" in home_html
     assert "Research" in home_html
-    assert "Investment Command Center" in home_html
+    assert "Overview" in home_html
     assert "Priority action" in home_html
     assert "Current proposal targets" in home_html
     assert "Open reviews" in home_html
@@ -559,7 +559,7 @@ def test_dashboard_workspaces_and_research_surfaces_render_without_exceptions() 
     assert not app.exception
     assert app.sidebar.radio("workspace").value == "method"
     assert app.query_params["view"] == ["method"]
-    assert any("How AIOS Works" in str(item.value) for item in app.markdown)
+    assert any("Methodology" in str(item.value) for item in app.markdown)
 
     app.sidebar.radio("workspace").set_value("today").run(timeout=120)
     assert not app.exception
@@ -597,14 +597,17 @@ def test_dashboard_workspaces_and_research_surfaces_render_without_exceptions() 
     for slug, title in (
         ("company", "Company Detail"),
         ("paper", "Paper Trial"),
-        ("system", "System Health"),
-        ("method", "How AIOS Works"),
+        ("system", "Operations"),
+        ("method", "Methodology"),
     ):
         app.query_params["view"] = [slug]
         app.run(timeout=120)
         assert not app.exception
         assert app.query_params["view"] == [slug]
-        expected_nav = "research" if slug == "company" else slug
+        # Company Detail is a drill-down, not a top-level workspace: the nav radio
+        # stays unselected there rather than falsely pre-selecting Research, because a
+        # pre-selected radio option does not fire on click (no way back via the sidebar).
+        expected_nav = None if slug == "company" else slug
         assert app.sidebar.radio("workspace").value == expected_nav
         assert any(title in str(item.value) for item in app.markdown), slug
         if slug == "system":

@@ -43,6 +43,7 @@ TIINGO_EOD_URL = "https://api.tiingo.com/tiingo/daily/{symbol}/prices"
 YFINANCE_EXPORT_SCHEMA_VERSION = 1
 YFINANCE_V2_PARSER_VERSION = "yfinance-normalized-v2"
 YFINANCE_PARSER_VERSION = "yfinance-normalized-v3"
+YFINANCE_CORPORATE_ACTION_PARSER_VERSION = "yfinance-normalized-v4"
 YFINANCE_OHLC_ENVELOPE_REPAIR_SOURCE = "yfinance:ohlc-envelope-v1"
 YFINANCE_MAX_OHLC_ENVELOPE_REPAIR_BPS = 100.0
 STOOQ_CAPTURE_PARSER_VERSION = "stooq-daily-csv-capture-v1"
@@ -59,6 +60,7 @@ def fetch_yfinance(
     start: str | None = None,
     end: str | None = None,
     *,
+    parser_version: str = YFINANCE_PARSER_VERSION,
     store: Store | None = None,
     ingest_run_id: str | None = None,
     project_root: Path | None = None,
@@ -70,6 +72,11 @@ def fetch_yfinance(
     required to recover the price that was actually quoted on each date. The
     extra rows fetched only for that normalization scan are never returned.
     """
+    if parser_version not in {
+        YFINANCE_PARSER_VERSION,
+        YFINANCE_CORPORATE_ACTION_PARSER_VERSION,
+    }:
+        raise ValueError(f"unsupported fresh yfinance parser version {parser_version!r}")
     try:
         import yfinance as yf
     except ImportError as e:  # pragma: no cover
@@ -190,7 +197,11 @@ def fetch_yfinance(
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
-    bounded = parse_yfinance_normalized_export(payload)
+    bounded = (
+        parse_yfinance_normalized_export_v4(payload)
+        if parser_version == YFINANCE_CORPORATE_ACTION_PARSER_VERSION
+        else parse_yfinance_normalized_export(payload)
+    )
     if store is not None:
         capture_raw_snapshot(
             payload,
@@ -213,7 +224,7 @@ def fetch_yfinance(
             ),
             adapter_name="aios-yfinance-library",
             adapter_version="1",
-            parser_version=YFINANCE_PARSER_VERSION,
+            parser_version=parser_version,
             content_type="application/vnd.aios.yfinance-normalized+json",
             parsed_rows=bounded,
             ingest_run_id=ingest_run_id,
@@ -257,6 +268,36 @@ def parse_yfinance_normalized_export_v1(payload: bytes) -> list[dict[str, Any]]:
         reject_nonpositive_splits=True,
         repair_ohlc_envelope=False,
     )
+
+
+def parse_yfinance_normalized_export_v4(payload: bytes) -> list[dict[str, Any]]:
+    """Replay Yahoo evidence without treating its price factor as a split.
+
+    ``auto_adjust=False`` exports contemporaneous OHLC values.  Yahoo's
+    ``Stock Splits`` field is retained as provider price-continuity evidence,
+    while ``split_ratio`` stays neutral until an identity-bound legal action
+    review projects it after provider-symbol relabeling.
+    """
+
+    rows = _parse_yfinance_normalized_export(
+        payload,
+        reject_nonpositive_splits=False,
+        repair_ohlc_envelope=True,
+    )
+    for row in rows:
+        provider_factor = float(row["split_ratio"])
+        row["provider_price_continuity_factor"] = provider_factor
+        row["split_ratio"] = 1.0
+        row["actions_complete"] = provider_factor == 1.0
+        row["close_split_adjusted"] = False
+        row["split_normalization_factor"] = 1.0
+        row["corporate_action_review_id"] = None
+        row["corporate_action_review_status"] = (
+            "provider_reported_none"
+            if provider_factor == 1.0
+            else "unreviewed_provider_action"
+        )
+    return rows
 
 
 def _parse_yfinance_normalized_export(
@@ -691,6 +732,7 @@ def fetch_prices(
     store: Store | None = None,
     ingest_run_id: str | None = None,
     project_root: Path | None = None,
+    yfinance_parser_version: str = YFINANCE_PARSER_VERSION,
 ) -> list[dict]:
     """Try yfinance, configured Tiingo, then Stooq on empty/failure."""
     try:
@@ -698,6 +740,7 @@ def fetch_prices(
             ticker,
             start=start,
             end=end,
+            parser_version=yfinance_parser_version,
             store=store,
             ingest_run_id=ingest_run_id,
             project_root=project_root,
@@ -747,6 +790,7 @@ def fetch_provider_prices(
     store: Store | None = None,
     ingest_run_id: str | None = None,
     project_root: Path | None = None,
+    yfinance_parser_version: str = YFINANCE_PARSER_VERSION,
 ) -> list[dict]:
     """Fetch one explicitly reviewed provider mapping without cross-provider fallback."""
     provider = provider.lower()
@@ -755,6 +799,7 @@ def fetch_provider_prices(
             provider_symbol,
             start=start,
             end=end,
+            parser_version=yfinance_parser_version,
             store=store,
             ingest_run_id=ingest_run_id,
             project_root=project_root,
@@ -828,15 +873,22 @@ def relabel_provider_price_rows(
                 "provider price cannot be mapped to exactly one market ticker: "
                 f"{security_id}@{row_date}"
             )
-        output.append(
-            {
-                **row,
-                "ticker": active_tickers.pop(),
-                "security_id": security_id,
-                "provider_symbol": provider_symbol,
-                "source": str(row.get("source") or provider),
-            }
-        )
+        relabeled = {
+            **row,
+            "ticker": active_tickers.pop(),
+            "security_id": security_id,
+            "provider_symbol": provider_symbol,
+            "source": str(row.get("source") or provider),
+        }
+        if provider == "yfinance" and "provider_price_continuity_factor" in relabeled:
+            from aios.corporate_actions import project_yfinance_action
+
+            relabeled = project_yfinance_action(
+                relabeled,
+                security_id=security_id,
+                provider_symbol=provider_symbol,
+            )
+        output.append(relabeled)
     return output
 
 
@@ -847,6 +899,7 @@ def ingest_security_prices(
     start: str | None = None,
     end: str | None = None,
     store: Store | None = None,
+    yfinance_parser_version: str = YFINANCE_PARSER_VERSION,
 ) -> int:
     """Fetch prices through reviewed mappings and store dated market tickers."""
     db = store or get_store()
@@ -900,6 +953,7 @@ def ingest_security_prices(
                 segment_end.isoformat(),
                 store=db,
                 ingest_run_id=run_id,
+                yfinance_parser_version=yfinance_parser_version,
             )
             assignments = db.security_ticker_assignments(
                 security_id,
@@ -936,6 +990,7 @@ def ingest_prices(
     end: str | None = None,
     *,
     store: Store | None = None,
+    yfinance_parser_version: str = YFINANCE_PARSER_VERSION,
 ) -> int:
     """Fetch + store daily prices for one ticker. Returns rows stored."""
     store = store or get_store()
@@ -955,6 +1010,7 @@ def ingest_prices(
             end=end,
             store=store,
             ingest_run_id=run_id,
+            yfinance_parser_version=yfinance_parser_version,
         )
         n = store.upsert_prices(rows) if rows else 0
         store.record_ingest(

@@ -123,8 +123,8 @@ def test_dashboard_separates_safe_certification_from_raw_source_freshness() -> N
 def test_dashboard_overview_is_source_backed_and_not_presented_as_live_trading() -> None:
     dashboard = Path("src/aios/dashboard.py").read_text(encoding="utf-8")
 
-    assert "AIOS Home" in dashboard
-    assert "Investment Command Center" in dashboard
+    assert "AIOS" in dashboard
+    assert "Overview" in dashboard
     assert "Research readiness" in dashboard
     assert "Paper-trial progress" in dashboard
     assert "Current proposal targets" in dashboard
@@ -177,16 +177,16 @@ def test_dashboard_preserves_debuggable_workspace_state_in_the_url() -> None:
     assert "_aios_url_seen_" in dashboard
 
 
-def test_dashboard_uses_warm_institutional_theme_with_light_navigation() -> None:
+def test_dashboard_uses_bone_specimen_theme_with_light_navigation() -> None:
     config = Path(".streamlit/config.toml").read_text(encoding="utf-8")
 
     assert 'base = "light"' in config
-    assert 'backgroundColor = "#FAF9F5"' in config
-    assert 'primaryColor = "#A84F30"' in config
+    assert 'backgroundColor = "#F0ECE1"' in config
+    assert 'primaryColor = "#3C4A2A"' in config
     assert "baseFontSize = 17" in config
     assert "[theme.sidebar]" in config
-    assert 'backgroundColor = "#F5F4ED"' in config
-    assert 'borderColor = "#D9D6CC"' in config
+    assert 'backgroundColor = "#E8E2D2"' in config
+    assert 'borderColor = "#B3A890"' in config
 
 
 def test_dashboard_visual_system_keeps_columns_symmetric_and_status_colors_semantic() -> None:
@@ -197,9 +197,9 @@ def test_dashboard_visual_system_keeps_columns_symmetric_and_status_colors_seman
     assert "@media (max-width: 1280px)" not in dashboard
     assert "apply_design_system()" in dashboard
     assert 'Path(__file__).with_name("dashboard.css")' in components
-    assert "--aios-canvas: #faf9f5" in stylesheet
-    assert "--aios-clay: #c96442" in stylesheet
-    assert "--aios-success: #265b19" in stylesheet
+    assert "--aios-canvas: #f0ece1" in stylesheet
+    assert "--aios-clay: #52633c" in stylesheet
+    assert "--aios-success: #2f6b3f" in stylesheet
     assert "html {\n    font-size: 17px" in stylesheet
     assert "linear-gradient(" not in stylesheet
     assert "radial-gradient(" not in stylesheet
@@ -259,7 +259,8 @@ def test_system_control_reads_real_independent_case_and_incident_history() -> No
     assert "External email is off. Incidents are still saved locally" in dashboard
     assert '"Email alerts"' in dashboard
     assert "email_worker_enabled" in dashboard
-    assert "Incidents & alert delivery" in dashboard
+    assert '"Incidents"' in dashboard
+    assert "Alert delivery" in dashboard
     assert "Data review cases" in dashboard
     assert "aios anomaly-show CASE_REF" in dashboard
     assert "aios alert-show INCIDENT_REF" in dashboard

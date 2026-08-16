@@ -926,7 +926,7 @@ def test_manual_attestation_refuses_stale_evidence_backdating_and_exact_retry(
     assert len(store.events(opened.incident_id)) == event_count
 
 
-def test_manual_attestation_refuses_ambiguous_incident_reference(tmp_path) -> None:
+def test_manual_attestation_refuses_a_partial_incident_reference(tmp_path) -> None:
     store = AlertStore(tmp_path / "ambiguous.sqlite3")
     first = store.emit(_alert(fingerprint="scheduler:first"), now=BASE_TIME)
     second = store.emit(_alert(fingerprint="scheduler:second"), now=BASE_TIME)
@@ -946,11 +946,11 @@ def test_manual_attestation_refuses_ambiguous_incident_reference(tmp_path) -> No
         for incident_id in (first.incident_id, second.incident_id)
     }
 
-    with pytest.raises(ValueError, match="ambiguous"):
+    with pytest.raises(ValueError, match="exact full incident_id"):
         store.attest_legacy_resolution(
-            "inc-",
+            first.incident_id[:12],
             actor="ops@example.test",
-            note="An ambiguous reference must never choose an incident.",
+            note="A partial reference must never choose an incident.",
             outcome="false_positive",
             expected_evidence_sha256=store.get(first.incident_id).evidence_sha256,
             now=BASE_TIME + timedelta(minutes=2),
@@ -981,7 +981,7 @@ def test_alert_attest_resolution_cli_records_one_manual_legacy_proof(
         cli.app,
         [
             "alert-attest-resolution",
-            opened.incident_id[:12],
+            opened.incident_id,
             "--actor",
             "ops@example.test",
             "--note",

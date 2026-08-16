@@ -8,12 +8,23 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import aios.companyfacts_v3_activation as companyfacts_v3_activation
+import aios.companyfacts_v4_activation as companyfacts_v4_activation
+from aios.canonical import canonical_json, canonical_sha256
 from aios.companyfacts_v3_activation import (
     activate_companyfacts_v3,
     prepare_companyfacts_v3_activation,
 )
+from aios.companyfacts_v4_activation import (
+    activate_companyfacts_v4,
+    persist_companyfacts_v4_plan,
+    prepare_companyfacts_v4_activation,
+    preview_companyfacts_v4_replay,
+)
 from aios.ingest.edgar import (
+    COMPANYFACTS_NEXT_PARSER_VERSION,
     COMPANYFACTS_PARSER_VERSION,
+    COMPANYFACTS_REVENUE_POLICY_PARSER_VERSION,
     canonical_sec_fundamental_row_sha256,
     replay_sec_companyfacts_response,
 )
@@ -68,6 +79,46 @@ def _conflicting_payload() -> bytes:
                     "RevenueFromContractWithCustomerExcludingAssessedTax": {
                         "units": {"USD": [clean_fact, conflicting_a, conflicting_b]}
                     }
+                }
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+
+
+def _cross_concept_revenue_payload() -> bytes:
+    context = {
+        "start": "2026-01-01",
+        "end": "2026-03-31",
+        "accn": "0000000001-26-000010",
+        "fy": 2026,
+        "fp": "Q1",
+        "form": "10-Q",
+        "filed": "2026-05-01",
+        "frame": "CY2026Q1",
+    }
+    assets = {
+        "end": "2026-03-31",
+        "val": 20_000.0,
+        "accn": "0000000001-26-000010",
+        "fy": 2026,
+        "fp": "Q1",
+        "form": "10-Q",
+        "filed": "2026-05-01",
+        "frame": "CY2026Q1I",
+    }
+    return json.dumps(
+        {
+            "cik": _CIK,
+            "entityName": "Example Corp",
+            "facts": {
+                "us-gaap": {
+                    "Revenues": {"units": {"USD": [{**context, "val": 8_065.0}]}},
+                    "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                        "units": {"USD": [{**context, "val": 7_053.0}]}
+                    },
+                    "Assets": {"units": {"USD": [assets]}},
                 }
             },
         },
@@ -252,6 +303,65 @@ def _prepare(root: Path, database: Path, *, actor: str = "operator-1") -> Any:
     )
 
 
+def _write_content_addressed_plan(path: Path, payload: dict[str, Any]) -> str:
+    plan_sha256 = canonical_sha256(payload)
+    path.write_text(
+        canonical_json({**payload, "activation_plan_sha256": plan_sha256}) + "\n",
+        encoding="utf-8",
+    )
+    return plan_sha256
+
+
+def test_activation_plan_readers_pin_the_exact_parser_transition(tmp_path: Path) -> None:
+    v3_plan_path = tmp_path / "wrong-v3-transition.json"
+    v3_plan_sha256 = _write_content_addressed_plan(
+        v3_plan_path,
+        {
+            "document_kind": companyfacts_v3_activation.ACTIVATION_PLAN_DOCUMENT_KIND,
+            "schema_version": companyfacts_v3_activation.ACTIVATION_PLAN_SCHEMA_VERSION,
+            "policy_version": companyfacts_v3_activation.ACTIVATION_POLICY_VERSION,
+            "source_parser_version": COMPANYFACTS_NEXT_PARSER_VERSION,
+            "target_parser_version": COMPANYFACTS_REVENUE_POLICY_PARSER_VERSION,
+        },
+    )
+    try:
+        activate_companyfacts_v3(
+            project_root=tmp_path,
+            database_path=tmp_path / "unused.duckdb",
+            plan_path=v3_plan_path,
+            expected_plan_sha256=v3_plan_sha256,
+            actor="operator-1",
+            confirm=True,
+        )
+        raise AssertionError("expected the v3 reader to reject a v4 transition")
+    except ValueError as exc:
+        assert "invalid policy transition" in str(exc)
+
+    v4_plan_path = tmp_path / "wrong-v4-transition.json"
+    v4_plan_sha256 = _write_content_addressed_plan(
+        v4_plan_path,
+        {
+            "document_kind": companyfacts_v4_activation.ACTIVATION_DOCUMENT_KIND,
+            "schema_version": companyfacts_v4_activation.ACTIVATION_SCHEMA_VERSION,
+            "policy_version": companyfacts_v4_activation.ACTIVATION_POLICY_VERSION,
+            "source_parser_version": COMPANYFACTS_PARSER_VERSION,
+            "target_parser_version": COMPANYFACTS_NEXT_PARSER_VERSION,
+        },
+    )
+    try:
+        activate_companyfacts_v4(
+            project_root=tmp_path,
+            database_path=tmp_path / "unused.duckdb",
+            plan_path=v4_plan_path,
+            expected_plan_sha256=v4_plan_sha256,
+            actor="operator-1",
+            confirm=True,
+        )
+        raise AssertionError("expected the v4 reader to reject a v3 transition")
+    except ValueError as exc:
+        assert "integrity check" in str(exc)
+
+
 def test_activation_upserts_and_tombstones_a_conflicting_key(tmp_path: Path) -> None:
     database = tmp_path / "aios.duckdb"
     store = Store(database)
@@ -416,3 +526,83 @@ def test_prepare_refuses_an_ineligible_issuer(tmp_path: Path) -> None:
         raise AssertionError("expected an issuer with no evidence to be refused")
     except ValueError as exc:
         assert "no evidence" in str(exc) or "eligible" in str(exc)
+
+
+def test_v4_activation_restores_revenue_by_reviewed_concept_precedence(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "aios.duckdb"
+    store = Store(database)
+    _seed_issuer(store, tmp_path, payload=_cross_concept_revenue_payload())
+    store.close()
+
+    v3_preparation = _prepare(tmp_path, database)
+    v3_result = activate_companyfacts_v3(
+        project_root=tmp_path,
+        database_path=database,
+        plan_path=v3_preparation.plan_path,
+        expected_plan_sha256=v3_preparation.plan_sha256,
+        actor="operator-1",
+        confirm=True,
+    )
+    assert v3_result.counts["removed"] == 1
+
+    reviewed_store = Store(database, read_only=True)
+    try:
+        review = preview_companyfacts_v4_replay(
+            tmp_path,
+            store=reviewed_store,
+            as_of=_AS_OF,
+            issuer_ids=[_ISSUER_ID],
+        )
+    finally:
+        reviewed_store.close()
+    assert review.eligible_issuers == 1
+    review_path = persist_companyfacts_v4_plan(tmp_path, review)
+    preparation = prepare_companyfacts_v4_activation(
+        project_root=tmp_path,
+        database_path=database,
+        application_version="0.4.0-test",
+        review_plan_path=review_path,
+        review_plan_sha256=review.plan_sha256,
+        actor="operator-1",
+    )
+
+    result = activate_companyfacts_v4(
+        project_root=tmp_path,
+        database_path=database,
+        plan_path=preparation.plan_path,
+        expected_plan_sha256=preparation.plan_sha256,
+        actor="operator-1",
+        confirm=True,
+    )
+
+    assert result.counts == {
+        "added": 1,
+        "removed": 0,
+        "changed": 0,
+        "issuers": 1,
+    }
+    reopened = Store(database, read_only=True)
+    try:
+        revenue = reopened.query(
+            "SELECT value, source_fact_locator FROM fundamentals "
+            "WHERE ticker = ? AND metric = 'revenue'",
+            (_TICKER,),
+        )
+        receipt = reopened.query(
+            "SELECT source_parser_version, target_parser_version, status "
+            "FROM companyfacts_v3_activations WHERE activation_id = ?",
+            (result.activation_id,),
+        )
+    finally:
+        reopened.close()
+    assert [row["value"] for row in revenue] == [8_065.0]
+    assert json.loads(revenue[0]["source_fact_locator"])[0]["concept"] == "Revenues"
+    assert receipt == [
+        {
+            "source_parser_version": "sec-companyfacts-v3",
+            "target_parser_version": "sec-companyfacts-v4",
+            "status": "accepted",
+        }
+    ]
